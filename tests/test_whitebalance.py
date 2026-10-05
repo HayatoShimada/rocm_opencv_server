@@ -105,7 +105,13 @@ def test_bright_neutral_wall_is_left_alone():
 
 
 def test_white_wall_is_left_alone():
-    # 白い壁は、青みがあっても触らない
-    correction = wb.plan(_photo((225, 231, 247)))
+    # 白い壁は、少し青みがあっても触らない
+    correction = wb.plan(_photo((240, 244, 250)))
     assert correction.status == "ok"
     assert "白い壁" in correction.reason
+
+
+def test_bright_bluish_grey_wall_is_corrected():
+    # 明るく写った青白い灰色の壁は、白い壁とみなさず補正する
+    correction = wb.plan(_photo((219, 221, 241)))
+    assert correction.status == "apply"

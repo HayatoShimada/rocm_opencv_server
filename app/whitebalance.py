@@ -36,6 +36,8 @@ MIN_DELTA_E = 2.0
 # 壁の平均（sRGB）がこれ以上なら白い壁とみなし、補正しない
 # （灰色の壁は明るく写っても 215 くらいまで）
 WHITE_WALL_LEVEL = 220
+# 明るくても青みが強い（青と赤の差がこれ以上）なら、白い壁ではなく明るく写った灰色の壁とみなす
+WHITE_WALL_MAX_BLUE = 15
 # リニア RGB の輝度の重み（Rec.709）。色かぶりだけ直すときに明るさを保つ
 LUMINANCE = np.array([0.2126, 0.7152, 0.0722])
 
@@ -95,7 +97,7 @@ def plan(image: np.ndarray) -> Correction:
     if not found:
         return Correction("review", "壁とみなせる範囲がない")
     region, rgb = found
-    if sum(rgb) / 3 >= WHITE_WALL_LEVEL:
+    if sum(rgb) / 3 >= WHITE_WALL_LEVEL and rgb[2] - rgb[0] < WHITE_WALL_MAX_BLUE:
         return Correction("ok", "白い壁（触らない）", region, rgb, (1.0, 1.0, 1.0), 0.0)
     delta = _delta_e(rgb, TARGET_RGB)
     if delta < MIN_DELTA_E:
