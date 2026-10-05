@@ -477,6 +477,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx2" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "python-multipart" },
@@ -493,6 +494,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx2", specifier = ">=2.13.1" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python-headless", specifier = ">=4.10" },
     { name = "python-multipart", specifier = ">=0.0.9" },

@@ -1,8 +1,11 @@
+from dataclasses import replace
+
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from app import main
 from app.main import app
 
 
@@ -69,3 +72,36 @@ def test_jpeg_output(client, png_bytes):
 def test_invalid_image(client):
     res = client.post("/v1/grayscale", files={"file": ("x.png", b"not an image", "image/png")})
     assert res.status_code == 400
+
+
+def test_fit_keeps_aspect_ratio(client):
+    image = np.zeros((300, 1200, 3), dtype=np.uint8)
+    png = cv2.imencode(".png", image)[1].tobytes()
+    res = client.post("/v1/fit?max_side=600", files=_upload(png))
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "image/jpeg"
+    assert _decode(res.content).shape == (150, 600, 3)
+
+
+def test_fit_does_not_enlarge(client, png_bytes):
+    res = client.post("/v1/fit?max_side=2048&format=png", files=_upload(png_bytes))
+    assert _decode(res.content).shape == (64, 96, 3)
+
+
+def test_fit_keeps_alpha_for_png(client):
+    image = np.zeros((400, 200, 4), dtype=np.uint8)
+    png = cv2.imencode(".png", image)[1].tobytes()
+    res = client.post("/v1/fit?max_side=100&format=png", files=_upload(png))
+    assert _decode(res.content).shape == (100, 50, 4)
+
+
+def test_shopify_fit_images_requires_token(client, monkeypatch):
+    monkeypatch.setattr(main, "settings", replace(main.settings, api_token="secret"))
+    res = client.post("/v1/shopify/products/fit-images", json={"productId": "1"})
+    assert res.status_code == 401
+    res = client.post(
+        "/v1/shopify/products/fit-images",
+        json={"productId": "1"},
+        headers={"X-Internal-Token": "wrong"},
+    )
+    assert res.status_code == 401
