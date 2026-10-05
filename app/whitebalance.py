@@ -33,6 +33,8 @@ MIN_WALL_LEVEL = 140.0
 GAIN_RANGE = (0.7, 1.4)
 # 目標との色差（CIE76）がこれ未満なら補正しない（もう一度流しても変わらない）
 MIN_DELTA_E = 2.0
+# リニア RGB の輝度の重み（Rec.709）。色かぶりだけ直すときに明るさを保つ
+LUMINANCE = np.array([0.2126, 0.7152, 0.0722])
 
 Status = Literal["apply", "ok", "review"]
 
@@ -96,9 +98,23 @@ def plan(image: np.ndarray) -> Correction:
     target = srgb_to_linear(np.array(TARGET_RGB) / 255)
     measured = srgb_to_linear(np.array(rgb) / 255)
     gains = tuple(float(v) for v in target / measured)
-    if not all(GAIN_RANGE[0] <= g <= GAIN_RANGE[1] for g in gains):
-        return Correction("review", "補正が大きすぎる", region, rgb, gains, delta)
-    return Correction("apply", "補正する", region, rgb, gains, delta)
+    if all(GAIN_RANGE[0] <= g <= GAIN_RANGE[1] for g in gains):
+        return Correction("apply", "補正する", region, rgb, gains, delta)
+    # 明るさまで合わせると大きすぎる（壁が真っ白・暗い）ときは、明るさはそのままで色かぶりだけ直す
+    scale = float(LUMINANCE @ measured) / float(LUMINANCE @ target)
+    cast_target = target * scale
+    cast_gains = tuple(float(v) for v in cast_target / measured)
+    cast_rgb = tuple(float(v) * 255 for v in linear_to_srgb(cast_target))
+    cast_delta = _delta_e(rgb, cast_rgb)
+    if cast_delta < MIN_DELTA_E:
+        return Correction(
+            "ok", "色かぶりなし（明るさは基準と違う）", region, rgb, (1.0, 1.0, 1.0), cast_delta
+        )
+    if all(GAIN_RANGE[0] <= g <= GAIN_RANGE[1] for g in cast_gains):
+        return Correction(
+            "apply", "色かぶりだけ補正（明るさはそのまま）", region, rgb, cast_gains, cast_delta
+        )
+    return Correction("review", "補正が大きすぎる", region, rgb, gains, delta)
 
 
 # 補正後に白に近い画素（いちばん暗いチャンネルがこれ以上）は、無彩色に寄せる。
