@@ -1,0 +1,23 @@
+services:
+  server:
+    build:
+      context: .
+      args:
+        ROCM_VERSION: "10.0"
+    image: rocm-opencv-server
+    ports:
+      - "8000:8000"
+    # ROCm コンテナから GPU を使うためのデバイスと権限
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # ROCm 10 のイメージには render グループが無いので、ホストの GID を数値で渡す
+    # （`getent group video render` で確認。違う場合は .env で上書きする）
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      USE_OPENCL: "true"
+    restart: unless-stopped
