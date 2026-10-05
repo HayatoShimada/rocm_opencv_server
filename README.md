@@ -99,6 +99,28 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 
 `--apply` では、差し替える前に元の画像を `~/85store-shopify-originals/<日付>/` に保存する。
 
+## 商品写真を「着用・全体・アップ」に分ける（Clef）
+
+Cloudflare Workers AI の Clef（`@cf/cloudflare/clef-flash`）に、写真ごとに2つの質問をする。
+- 人（体の一部を含む）が写っているか
+- 商品の全体が1枚に収まっているか
+
+人が写っていれば「着用」、いなければ「全体」か「アップ」に分ける。画像は Shopify の CDN で幅 512px に縮めて渡す（1枚あたり約450トークン）。
+
+```bash
+# 全商品の画像を分類する（data/photo-labels/predictions.json。差し替えていない画像は取り直さない）
+uv run --env-file .env python -m scripts.shopify_classify_photos
+# 分類が正しいかを確かめる画面（http://127.0.0.1:8010）
+uv run python -m scripts.photo_review
+```
+
+確かめる画面の使い方:
+- 写真ごとに、正しい区分（着用・全体・アップ）を選ぶ。写真にカーソルを置いて 1・2・3 のキーでも選べる。
+- 判定が合っていれば、下の「判定どおり確認済みにする」（Enter）で、そのページをまとめて確認済みにする。
+- 初めは「迷っている順」（確率が 0.5 に近い順）に並ぶ。
+- 上の欄に、確かめた写真での判定の正しさが出る。
+- 確かめた結果は `data/photo-labels/labels.json` に保存する。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -109,6 +131,8 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 | `SHOPIFY_STORE` / `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | なし | Shopify Admin API（Client Credentials） |
 | `FIT_MAX_SIDE` | `2048` | 商品画像の長辺の上限 |
 | `FIT_QUALITY` | `90` | 縮めた画像の JPEG の品質 |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | なし | Workers AI（Clef）。トークンは「Workers AI」の権限で作る |
+| `CLEF_MODEL` | `@cf/cloudflare/clef-flash` | 写真の分類に使うモデル（`@cf/cloudflare/clef` で 27B） |
 
 ## ベンチマーク
 
@@ -128,11 +152,14 @@ app/
   shopify.py     # Shopify の商品画像を縮めて差し替える
   whitebalance.py # 単品の写真のホワイトバランスを基準の壁の色に揃える
   classify.py    # 写真の種類を CLIP で判定する
+  clef.py        # 写真に人・商品の全体が写っているかを Clef（Workers AI）で判定する
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較
 scripts/shopify_fit_images.py # 商品画像を手動で一括で縮める
 scripts/shopify_white_balance.py # 単品の写真のホワイトバランスを揃える
+scripts/shopify_classify_photos.py # 全商品の画像を Clef で分類する
+scripts/photo_review.py # 分類が正しいかを確かめる画面
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。

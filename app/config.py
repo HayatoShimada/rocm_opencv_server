@@ -25,6 +25,10 @@ class Settings:
     # 商品画像の長辺の上限（CMS の productPhotos と同じ 2048）と JPEG の品質
     fit_max_side: int = int(os.getenv("FIT_MAX_SIDE", "2048"))
     fit_quality: int = int(os.getenv("FIT_QUALITY", "90"))
+    # Cloudflare Workers AI（Clef で写真を分類する。トークンは Workers AI の権限）
+    cloudflare_account_id: str = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+    cloudflare_api_token: str = os.getenv("CLOUDFLARE_API_TOKEN", "")
+    clef_model: str = os.getenv("CLEF_MODEL", "@cf/cloudflare/clef-flash")
 
 
 settings = Settings()
