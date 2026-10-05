@@ -33,6 +33,9 @@ MIN_WALL_LEVEL = 140.0
 GAIN_RANGE = (0.7, 1.4)
 # 目標との色差（CIE76）がこれ未満なら補正しない（もう一度流しても変わらない）
 MIN_DELTA_E = 2.0
+# 壁の平均（sRGB）がこれ以上なら白い壁とみなし、補正しない
+# （灰色の壁は明るく写っても 215 くらいまで）
+WHITE_WALL_LEVEL = 220
 # リニア RGB の輝度の重み（Rec.709）。色かぶりだけ直すときに明るさを保つ
 LUMINANCE = np.array([0.2126, 0.7152, 0.0722])
 
@@ -92,6 +95,8 @@ def plan(image: np.ndarray) -> Correction:
     if not found:
         return Correction("review", "壁とみなせる範囲がない")
     region, rgb = found
+    if sum(rgb) / 3 >= WHITE_WALL_LEVEL:
+        return Correction("ok", "白い壁（触らない）", region, rgb, (1.0, 1.0, 1.0), 0.0)
     delta = _delta_e(rgb, TARGET_RGB)
     if delta < MIN_DELTA_E:
         return Correction("ok", "目標に近い", region, rgb, (1.0, 1.0, 1.0), delta)

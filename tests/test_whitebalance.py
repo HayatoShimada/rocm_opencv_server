@@ -89,16 +89,23 @@ def test_dark_uniform_garment_is_not_wall():
 
 
 def test_bright_bluish_wall_fixes_cast_only():
-    # 真っ白に近い青い壁: 明るさまで合わせると暗くしすぎるので、色かぶりだけ直す
-    image = _photo((225, 231, 247))
+    # 暗い青っぽい壁: 明るさまで合わせると大きすぎるので、色かぶりだけ直す
+    image = _photo((175, 178, 200))
     correction = wb.plan(image)
     assert correction.status == "apply"
     assert "色かぶり" in correction.reason
     after = _region_mean(wb.apply_gains(image, correction.gains), wb.REGIONS[0])
     assert after.max() - after.min() <= 3  # ほぼ無彩色（基準の壁がわずかに青寄り）
-    assert abs(after.mean() - np.array([225, 231, 247]).mean()) < 6  # 明るさはほぼそのまま
+    assert abs(after.mean() - np.array([175, 178, 200]).mean()) < 6  # 明るさはほぼそのまま
 
 
 def test_bright_neutral_wall_is_left_alone():
     # 真っ白で色かぶりのない壁は変えない（以前の「白い壁には触らない」）
     assert wb.plan(_photo((248, 248, 248))).status == "ok"
+
+
+def test_white_wall_is_left_alone():
+    # 白い壁は、青みがあっても触らない
+    correction = wb.plan(_photo((225, 231, 247)))
+    assert correction.status == "ok"
+    assert "白い壁" in correction.reason
