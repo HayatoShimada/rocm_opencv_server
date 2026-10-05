@@ -52,6 +52,7 @@ uv run ruff check . && uv run ruff format .
 | GET | `/device` | OpenCL / GPU の情報 |
 | POST | `/v1/grayscale` | |
 | POST | `/v1/resize` | `width`, `height`（必須） |
+| POST | `/v1/fit` | `max_side`（必須）, `quality`（既定 90）。縦横比を保って長辺を収める（拡大しない）。既定の出力は `jpeg` |
 | POST | `/v1/blur` | `ksize`（奇数・既定 5）, `sigma`（既定 0） |
 | POST | `/v1/canny` | `threshold1`（既定 100）, `threshold2`（既定 200） |
 
@@ -61,12 +62,36 @@ POST は `multipart/form-data` の `file` で画像を受け取り、画像を�
 curl -F file=@input.jpg "localhost:8000/v1/canny?threshold1=50" -o edges.png
 ```
 
+## Shopify の商品画像を縮める
+
+長辺が `FIT_MAX_SIDE`（既定 2048）を超える商品画像だけを縮め、Shopify で差し替える（`app/shopify.py`）。差し替えには `fileUpdate` の `originalSource` を使うので、画像の ID・並び順・alt は変わらない。透過のある PNG は PNG のまま、それ以外は JPEG（`FIT_QUALITY`）にする。
+
+- 色: 書き出す画像に ICC は埋め込まないので、sRGB 以外の RGB（Display P3 など）は sRGB に変換する（判定は原色の色度で行う）。2026-10 の時点では、ストアの画像はすべて sRGB だった。
+- 速さ: 時間のほとんどは Shopify とのやりとりと、差し替えた画像の処理待ち（1枚 約4秒）。画像処理は 1枚 0.1秒ほどで、縮小は CPU のほうが速い（GPU との転送が重い）。そのため画像を `--workers` 枚（既定 6）ずつ並列に処理する。
+- alt: `--fill-alt`（API では `fillAlt`）で、空の alt を「商品名（n枚目）」で埋める（85store-cms の保存時と同じ形）。
+
+`.env` に Shopify の認証情報を入れる（`.env.example`）。85store-cms と同じアプリを使う。
+
+**手動で一括実行する**（`--apply` を付けないときは、対象を表示するだけ）:
+
+```bash
+docker compose run --rm server python -m scripts.shopify_fit_images            # 全商品を確認
+docker compose run --rm server python -m scripts.shopify_fit_images --product <ハンドル> --apply
+docker compose run --rm server python -m scripts.shopify_fit_images --fill-alt --apply   # 全商品
+```
+
+**CMS から呼ぶ**: `POST /v1/shopify/products/fit-images`（JSON `{"productId": "gid://shopify/Product/...", "maxSide": 2048, "fillAlt": true}`、ヘッダ `X-Internal-Token: <API_TOKEN>`）。85store-cms が商品の同期・取り込みのあとに呼ぶ。結果は `{checked, resized, alt_filled, errors}`。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `USE_OPENCL` | `true` | `false` で常に CPU 処理 |
 | `MAX_UPLOAD_BYTES` | `20971520` | アップロード上限（20MB） |
+| `API_TOKEN` | なし | `/v1/shopify/...` の認証（`X-Internal-Token`）。空なら使えない |
+| `SHOPIFY_STORE` / `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | なし | Shopify Admin API（Client Credentials） |
+| `FIT_MAX_SIDE` | `2048` | 商品画像の長辺の上限 |
+| `FIT_QUALITY` | `90` | 縮めた画像の JPEG の品質 |
 
 ## ベンチマーク
 
@@ -83,9 +108,11 @@ app/
   main.py        # FastAPI のエンドポイント
   processing.py  # 画像処理（numpy ⇄ UMat の変換を含む）
   gpu.py         # OpenCL の初期化とデバイス情報
+  shopify.py     # Shopify の商品画像を縮めて差し替える
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較
+scripts/shopify_fit_images.py # 商品画像を手動で一括で縮める
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。

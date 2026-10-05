@@ -18,6 +18,10 @@ services:
       - "${RENDER_GID:-992}"
     security_opt:
       - seccomp=unconfined
+    # Shopify の認証情報と API_TOKEN（.env.example を参照）
+    env_file:
+      - path: .env
+        required: false
     environment:
       USE_OPENCL: "true"
     restart: unless-stopped
