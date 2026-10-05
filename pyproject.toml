@@ -15,6 +15,12 @@ dependencies = [
 ]
 
 [dependency-groups]
+# 写真の種類の判定（CLIP）。重いので本体とは分ける（uv sync --group clip）
+clip = [
+    "open-clip-torch>=3.0",
+    "torch[device-gfx1100]==2.13.0+rocm10.0.0",
+    "torchvision[device-gfx1100]==0.28.0+rocm10.0.0",
+]
 dev = [
     "httpx2>=2.13.1",
     "pytest>=8.0",
@@ -30,3 +36,14 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+# PyTorch は AMD 配布の ROCm 10.0 版を使う（コンテナの ROCm と合わせる。RX 7900 XTX = gfx1100）。
+# torch 系は pytorch/whl-next、ROCm 本体（rocm-sdk-*）は core/whl-next にある。
+# torch が依存する ROCm のパッケージ（GPU ごとに分かれている）も取れるよう、PyPI より先に探す
+[[tool.uv.index]]
+name = "rocm-pytorch"
+url = "https://stable.repo.amd.com/rocm/pytorch/whl-next/"
+
+[[tool.uv.index]]
+name = "rocm-core"
+url = "https://stable.repo.amd.com/rocm/core/whl-next/"

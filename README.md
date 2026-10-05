@@ -82,6 +82,23 @@ docker compose run --rm server python -m scripts.shopify_fit_images --fill-alt -
 
 **CMS から呼ぶ**: `POST /v1/shopify/products/fit-images`（JSON `{"productId": "gid://shopify/Product/...", "maxSide": 2048, "fillAlt": true}`、ヘッダ `X-Internal-Token: <API_TOKEN>`）。85store-cms が商品の同期・取り込みのあとに呼ぶ。結果は `{checked, resized, alt_filled, errors}`。
 
+## 単品の写真のホワイトバランスを揃える
+
+単品の商品写真（白い壁にハンガーで掛けたもの）の色かぶりと明るさを、基準の画像の壁の色に揃える（`app/whitebalance.py`）。
+
+- 基準: `amazon-hooded-sweat-parkaused` の1枚目（`0E2A5894.jpg`）の右上の壁（幅・高さの x 75.1〜83.9%・y 4.7〜10.1%）の平均 RGB(205.1, 206.7, 206.9)。それぞれの写真の同じ範囲を測り、リニア RGB でチャンネルごとのゲインを掛ける。範囲に服やハンガーが入っていたら、ほかの候補の位置を使う。
+- ゲインが 0.7〜1.4 を超えるものと、壁が見つからないものは「要確認」にして補正しない。目標との色差（ΔE）が 2 未満なら「補正不要」。
+- 写真の種類（単品・着用・ディテール・その他）は CLIP（`app/classify.py`、ViT-L/14）で判定し、単品だけを補正する。横長の画像と、確からしさが 0.6 未満のものは補正しない。判定は `data/classify-cache.json` に残す（モデル・説明文・画像が変わったら判定し直す）。
+- CLIP は重いので依存グループ `clip` に分けてある。PyTorch は AMD 配布の ROCm 10.0 版（`torch 2.13.0+rocm10.0.0`、gfx1100）。
+
+```bash
+uv sync --group clip
+uv run --env-file .env --group clip python -m scripts.shopify_white_balance            # 確認だけ（data/wb-report/index.html）
+uv run --env-file .env --group clip python -m scripts.shopify_white_balance --product <ハンドル> --apply
+```
+
+`--apply` では、差し替える前に元の画像を `~/85store-shopify-originals/<日付>/` に保存する。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -109,10 +126,13 @@ app/
   processing.py  # 画像処理（numpy ⇄ UMat の変換を含む）
   gpu.py         # OpenCL の初期化とデバイス情報
   shopify.py     # Shopify の商品画像を縮めて差し替える
+  whitebalance.py # 単品の写真のホワイトバランスを基準の壁の色に揃える
+  classify.py    # 写真の種類を CLIP で判定する
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較
 scripts/shopify_fit_images.py # 商品画像を手動で一括で縮める
+scripts/shopify_white_balance.py # 単品の写真のホワイトバランスを揃える
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。
