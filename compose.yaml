@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        ROCM_VERSION: "10.0"
+        ROCM_IMAGE_TAG: "10.0.0-full"
     image: rocm-opencv-server
     ports:
       - "8000:8000"

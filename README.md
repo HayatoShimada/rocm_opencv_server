@@ -5,7 +5,7 @@ AMD GPU（ROCm）で OpenCV の画像処理を実行する HTTP API サーバー
 OpenCV の CUDA モジュールは AMD GPU では使えないため、**OpenCL（T-API / `cv2.UMat`）経由で ROCm の OpenCL ランタイムに処理を流す**構成にしている。OpenCL が使えない環境では同じコードが CPU で動く。
 
 - FastAPI + `opencv-python-headless`
-- ROCm 10.0（`ubuntu:24.04` に `amdrocm-opencl10.0` だけを入れる）
+- ベースイメージ: `rocm/dev-ubuntu-24.04:10.0.0-full`（ROCm 10.0.0 の SDK 一式。HIP / PyTorch への拡張を見込んでいる）
 - 動作確認: Radeon RX 7900 XTX（gfx1100）/ ROCm 10.0.0 / ホストカーネル 7.0
 
 ## 起動（Docker・GPU あり）
@@ -27,11 +27,11 @@ echo "RENDER_GID=$(getent group render | cut -d: -f3)" > .env
 
 ROCm 7.x から構成が変わっているため、`Dockerfile` で以下を吸収している。
 
-- 公式イメージ `rocm/dev-ubuntu-24.04:10.0.0-full` は約 8GB あり、軽量版のタグが無い。OpenCL しか使わないので `ubuntu:24.04` に AMD の apt リポジトリを足し、`amdrocm-opencl10.0` だけを入れている（パッケージ名が `rocm-opencl-runtime` から変わった）
-- ROCm は `/opt/rocm/core-10.0/` に入り、OpenCL の ICD が `/etc/OpenCL/vendors` に登録されない。そのままだと `clGetPlatformIDs(-1001)` になるため、ICD ファイルを自前で置き、`OPENCV_OPENCL_RUNTIME` で ROCm 付属の `libOpenCL.so.1` を指定している
+- `-full` イメージはダウンロード約 8GB、展開後約 29GB ある。ROCm 10 には軽量版のタグが無い。OpenCL だけなら `ubuntu:24.04` に `amdrocm-opencl10.0` を入れる構成で約 2.4GB まで減らせる（パッケージ名は `rocm-opencl-runtime` から変わった）
+- ROCm の実体は `/opt/rocm/core-10.0/` にあり、OpenCL の ICD が `/etc/OpenCL/vendors` に登録されない。そのままだと `clGetPlatformIDs(-1001)` になるため、ICD ファイルを自前で置き、`OPENCV_OPENCL_RUNTIME` で ROCm 付属の `libOpenCL.so.1` を指定している
 - ROCm 10 のイメージには `render` グループが無いので、`group_add` は名前ではなく GID で指定する
 
-ROCm のバージョンはビルド引数 `ROCM_VERSION`（`compose.yaml`）で切り替えられる。
+ROCm のバージョンはビルド引数 `ROCM_IMAGE_TAG`（`compose.yaml`）で切り替えられる。コンテナ内では `clinfo` / `amd-smi` / `hipcc` が使える。
 
 ## ローカル開発（CPU）
 
