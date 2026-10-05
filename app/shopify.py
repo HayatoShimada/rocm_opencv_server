@@ -6,8 +6,10 @@
 
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx2 as httpx
@@ -172,6 +174,7 @@ class Shopify:
         res = self.graphql(FILE_UPDATE, {"files": files})
         _assert_no_user_errors("fileUpdate", res["fileUpdate"]["userErrors"])
         deadline = time.time() + timeout
+        wait = 0.5
         while True:
             node = self.graphql(MEDIA_STATUS, {"id": media_id})["node"]
             if node["fileStatus"] == "READY" and node["image"]:
@@ -180,7 +183,12 @@ class Shopify:
                 raise ShopifyError(f"Shopify で画像の処理に失敗しました: {media_id}")
             if time.time() > deadline:
                 raise ShopifyError(f"Shopify の画像の処理が終わりません: {media_id}")
-            time.sleep(2)
+            time.sleep(wait)
+            wait = min(wait * 2, 2)
+
+    def update_alts(self, files: list[dict]) -> None:
+        res = self.graphql(FILE_UPDATE, {"files": files})
+        _assert_no_user_errors("fileUpdate", res["fileUpdate"]["userErrors"])
 
 
 def _assert_no_user_errors(label: str, errors: list[dict]) -> None:
@@ -198,6 +206,11 @@ def product_search(identifier: str) -> str:
     return f'handle:"{identifier}"'
 
 
+def auto_alt(title: str, index: int) -> str:
+    """alt が空の画像に入れる文言（85store-cms の src/shopify/mapping.ts の autoAlt と同じ形）。"""
+    return f"{title}（{index + 1}枚目）"
+
+
 @dataclass
 class Resized:
     product: str
@@ -213,6 +226,7 @@ class Resized:
 class FitResult:
     checked: int = 0
     resized: list[Resized] = field(default_factory=list)
+    alt_filled: int = 0
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -220,18 +234,34 @@ class FitResult:
 
 
 def fit_image(data: bytes, mime_type: str, max_side: int, quality: int) -> tuple[bytes, str]:
-    """画像を縮めてエンコードし直す。透過のある PNG は PNG のまま、ほかは JPEG にする。"""
+    """画像を縮め、色を sRGB にしてエンコードし直す。透過のある PNG は PNG のまま、ほかは JPEG。
+
+    縮小は CPU で行う（1枚ずつなら GPU との転送のほうが重い。4284x5712 で CPU 5ms・GPU 15ms）。
+    """
+    icc = processing.icc_profile(data)
     if mime_type == "image/png":
         image = processing.decode(data, keep_alpha=True)
         if processing.has_alpha(image):
-            return processing.encode(processing.fit_long_side(image, max_side), "png"), "image/png"
-    fitted = processing.fit_long_side(processing.decode(data), max_side)
-    return processing.encode(fitted, "jpeg", quality), "image/jpeg"
+            fitted = processing.fit_long_side(image, max_side, device=False)
+            return processing.encode(processing.to_srgb(fitted, icc), "png"), "image/png"
+    fitted = processing.fit_long_side(processing.decode(data), max_side, device=False)
+    return processing.encode(processing.to_srgb(fitted, icc), "jpeg", quality), "image/jpeg"
 
 
 def _upload_filename(url: str, mime_type: str) -> str:
     stem = PurePosixPath(urlparse(url).path).stem or "image"
     return f"{stem}.{'png' if mime_type == 'image/png' else 'jpg'}"
+
+
+def _in_parallel(
+    workers: int, fn: Callable, items: list
+) -> Iterator[tuple[Any, Any, BaseException | None]]:
+    """items を並列に処理し、終わった順に (item, 戻り値, 例外) を返す。"""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, item): item for item in items}
+        for future in as_completed(futures):
+            error = future.exception()
+            yield futures[future], None if error else future.result(), error
 
 
 def fit_product_images(
@@ -240,43 +270,74 @@ def fit_product_images(
     max_side: int,
     quality: int,
     apply: bool,
+    fill_alt: bool = False,
+    workers: int = 6,
     log: Callable[[str], None] = lambda _: None,
 ) -> FitResult:
-    """長辺が max_side を超える商品画像だけを縮めて差し替える（apply が False なら数えるだけ）。"""
+    """長辺が max_side を超える商品画像を縮めて差し替え、fill_alt なら空の alt を商品名で埋める。
+
+    apply が False なら数えるだけ。画像は workers 枚ずつ並列に処理する
+    （時間のほとんどは Shopify とのやりとりと、差し替えた画像の処理待ち）。
+    """
     result = FitResult()
+    alts: list[tuple[str, list[dict]]] = []
+    targets: list[tuple[Resized, dict, str]] = []
     for product in shopify.products(search):
-        for media in product["media"]["nodes"]:
+        missing = []
+        for index, media in enumerate(product["media"]["nodes"]):
             image = media.get("image")
             if not image or not image.get("width"):
                 continue
             result.checked += 1
+            if fill_alt and not media.get("alt"):
+                missing.append({"id": media["id"], "alt": auto_alt(product["title"], index)})
             size = (image["width"], image["height"])
-            if max(size) <= max_side:
-                continue
-            item = Resized(product=product["handle"], media_id=media["id"], before=size)
-            result.resized.append(item)
-            label = f"{product['handle']} {media['id']} {size[0]}x{size[1]}"
-            if not apply:
-                log(f"縮める: {label}")
-                continue
-            try:
-                original = shopify.download(image["url"])
-                mime_type = media.get("mimeType") or ""
-                data, mime_type = fit_image(original, mime_type, max_side, quality)
-                resource_url = shopify.stage_upload(
-                    data, _upload_filename(image["url"], mime_type), mime_type
-                )
-                new_image = shopify.replace_image(media["id"], resource_url)
-            except (ShopifyError, processing.ImageError, httpx.HTTPError) as e:
-                result.resized.remove(item)
-                result.errors.append(f"{label}: {e}")
-                log(f"失敗: {label}: {e}")
-                continue
-            item.after = (new_image["width"], new_image["height"])
-            item.url_after = new_image["url"]
-            item.bytes_before, item.bytes_after = len(original), len(data)
-            log(
-                f"縮めた: {label} → {item.after[0]}x{item.after[1]}"
-                f"（{len(original) // 1024}KB → {len(data) // 1024}KB）"
-            )
+            if max(size) > max_side:
+                item = Resized(product=product["handle"], media_id=media["id"], before=size)
+                targets.append((item, image, media.get("mimeType") or ""))
+        if missing:
+            alts.append((product["handle"], missing))
+
+    if not apply:
+        for handle, files in alts:
+            log(f"alt を入れる: {handle} {len(files)} 枚（{files[0]['alt']} など）")
+        for item, _, _ in targets:
+            log(f"縮める: {item.product} {item.media_id} {item.before[0]}x{item.before[1]}")
+        result.alt_filled = sum(len(files) for _, files in alts)
+        result.resized = [item for item, _, _ in targets]
+        return result
+
+    # alt を先に入れる（処理中の画像は更新できないので、差し替えより前に）
+    for (handle, files), _, error in _in_parallel(
+        workers, lambda a: shopify.update_alts(a[1]), alts
+    ):
+        if error:
+            result.errors.append(f"{handle} の alt: {error}")
+            log(f"失敗: {handle} の alt: {error}")
+        else:
+            result.alt_filled += len(files)
+
+    def fit_one(target: tuple[Resized, dict, str]) -> tuple[dict, int, int]:
+        item, image, mime_type = target
+        original = shopify.download(image["url"])
+        data, mime_type = fit_image(original, mime_type, max_side, quality)
+        resource_url = shopify.stage_upload(
+            data, _upload_filename(image["url"], mime_type), mime_type
+        )
+        return shopify.replace_image(item.media_id, resource_url), len(original), len(data)
+
+    for (item, _, _), done, error in _in_parallel(workers, fit_one, targets):
+        label = f"{item.product} {item.media_id} {item.before[0]}x{item.before[1]}"
+        if error:
+            result.errors.append(f"{label}: {error}")
+            log(f"失敗: {label}: {error}")
+            continue
+        new_image, item.bytes_before, item.bytes_after = done
+        item.after = (new_image["width"], new_image["height"])
+        item.url_after = new_image["url"]
+        result.resized.append(item)
+        log(
+            f"縮めた: {label} → {item.after[0]}x{item.after[1]}"
+            f"（{item.bytes_before // 1024}KB → {item.bytes_after // 1024}KB）"
+        )
     return result

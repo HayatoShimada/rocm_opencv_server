@@ -1,11 +1,13 @@
 from dataclasses import replace
+from io import BytesIO
 
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image, ImageCms
 
-from app import main
+from app import main, processing
 from app.main import app
 
 
@@ -105,3 +107,18 @@ def test_shopify_fit_images_requires_token(client, monkeypatch):
         headers={"X-Internal-Token": "wrong"},
     )
     assert res.status_code == 401
+
+
+def test_to_srgb_keeps_srgb_and_untagged_images():
+    image = np.full((8, 8, 3), (10, 200, 30), np.uint8)
+    srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    assert processing.to_srgb(image, None) is image
+    assert processing.to_srgb(image, srgb) is image
+
+
+def test_icc_profile_is_read_from_jpeg():
+    srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    buf = BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, "JPEG", icc_profile=srgb)
+    assert processing.icc_profile(buf.getvalue()) == srgb
+    assert processing.icc_profile(b"not an image") is None

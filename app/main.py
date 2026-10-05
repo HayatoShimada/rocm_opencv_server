@@ -99,11 +99,15 @@ def fit(
 class FitImagesRequest(BaseModel):
     productId: str
     maxSide: int | None = Field(default=None, gt=0, le=16384)
+    fillAlt: bool = False
 
 
 @app.post("/v1/shopify/products/fit-images", dependencies=[Depends(_require_token)])
 def fit_shopify_product_images(body: FitImagesRequest):
-    """商品の画像のうち、長辺が上限を超えるものを縮めて Shopify で差し替える（CMS から呼ぶ）。"""
+    """商品の画像のうち、長辺が上限を超えるものを縮めて Shopify で差し替える（CMS から呼ぶ）。
+
+    fillAlt なら、空の alt も商品名で埋める。
+    """
     try:
         result = shopify.fit_product_images(
             _shopify(),
@@ -111,6 +115,7 @@ def fit_shopify_product_images(body: FitImagesRequest):
             body.maxSide or settings.fit_max_side,
             settings.fit_quality,
             apply=True,
+            fill_alt=body.fillAlt,
         )
     except shopify.ShopifyError as e:
         raise HTTPException(502, str(e)) from e

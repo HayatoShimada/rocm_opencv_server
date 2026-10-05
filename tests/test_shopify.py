@@ -48,7 +48,7 @@ class FakeShopify:
             target["parameters"] = [{"name": "key", "value": "k"}]
             data = {"stagedUploadsCreate": {"stagedTargets": [target], "userErrors": []}}
         elif "fileUpdate" in query:
-            self.updated.append(variables["files"][0])
+            self.updated += variables["files"]
             data = {"fileUpdate": {"files": [], "userErrors": []}}
         else:
             image = {"url": "https://cdn.shopify.com/new.jpg", "width": 2048, "height": 1536}
@@ -83,6 +83,7 @@ def test_dry_run_does_not_upload(client, fake):
 def test_apply_replaces_only_large_images(client, fake):
     result = shopify.fit_product_images(client, None, 2048, 90, apply=True)
     assert fake.updated == [{"id": "big", "originalSource": "https://upload.example/r"}]
+    assert result.alt_filled == 0
     assert result.resized[0].after == (2048, 1536)
     assert result.resized[0].url_after == "https://cdn.shopify.com/new.jpg"
     assert result.errors == []
@@ -93,3 +94,21 @@ def test_fit_image_resizes_to_max_side():
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     assert mime_type == "image/jpeg"
     assert image.shape == (1536, 2048, 3)
+
+
+def test_fill_alt_before_replacing(client, fake):
+    fake.media["small"]["alt"] = "正面"
+    result = shopify.fit_product_images(client, None, 2048, 90, apply=True, fill_alt=True)
+    assert fake.updated[0] == {"id": "big", "alt": "シャツ（1枚目）"}
+    assert fake.updated[1]["id"] == "big" and "originalSource" in fake.updated[1]
+    assert result.alt_filled == 1
+
+
+def test_fit_image_converts_to_srgb(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        shopify.processing, "to_srgb", lambda image, icc: calls.append(icc) or image
+    )
+    monkeypatch.setattr(shopify.processing, "icc_profile", lambda data: b"icc")
+    shopify.fit_image(_jpeg(4000, 3000), "image/jpeg", 2048, 90)
+    assert calls == [b"icc"]
