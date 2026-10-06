@@ -112,3 +112,28 @@ def test_fit_image_converts_to_srgb(monkeypatch):
     monkeypatch.setattr(shopify.processing, "icc_profile", lambda data: b"icc")
     shopify.fit_image(_jpeg(4000, 3000), "image/jpeg", 2048, 90)
     assert calls == [b"icc"]
+
+
+def test_photo_label_uses_view_and_part_when_confident():
+    assert shopify.photo_label("whole", "back", 0.9, "tag", 0.9) == "背面"
+    assert shopify.photo_label("worn", "front", 0.9, "other", 0.0) == "着用"
+    assert shopify.photo_label("worn", "back", 0.9, "other", 0.0) == "着用・背面"
+    assert shopify.photo_label("closeup", "front", 0.9, "tag", 0.5) == "タグのアップ"
+    # 確からしさが低い・どれでもないときは決めつけない
+    assert shopify.photo_label("whole", "back", 0.4, "other", 0.0) == "全体"
+    assert shopify.photo_label("whole", "other", 0.9, "other", 0.0) == "全体"
+    assert shopify.photo_label("closeup", "front", 0.9, "tag", 0.2) == "ディテール"
+    assert shopify.photo_label("closeup", "front", 0.9, "other", 0.9) == "ディテール"
+
+
+def test_auto_alt_label_recognizes_automatic_alts():
+    title = "[River] Wool Check Pants"
+    assert shopify.auto_alt(title, 2) == f"{title}（3枚目）"
+    assert shopify.auto_alt(title, 2, "正面") == f"{title}（正面）"
+    assert shopify.auto_alt_label(f"{title}（3枚目）", title, 2) == ""
+    assert shopify.auto_alt_label(f"{title}（タグのアップ）", title, 2) == "タグのアップ"
+    # 人が入れた alt・位置の違う n枚目・別の商品名・一覧にない語は、自動の alt ではない
+    assert shopify.auto_alt_label("手で入れた説明", title, 2) is None
+    assert shopify.auto_alt_label(f"{title}（2枚目）", title, 2) is None
+    assert shopify.auto_alt_label("別の商品（正面）", title, 2) is None
+    assert shopify.auto_alt_label(f"{title}（裏地のアップ）", title, 2) is None

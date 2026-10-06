@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>写真の分類の確認</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* 背景は店の壁の色（ホワイトバランスの基準 RGB 205, 207, 207）。写真が自分の壁の上に並ぶ */
+  :root {
+    --wall: #cdcfcf;
+    --wall-deep: #bfc1c1;
+    --paper: #f3f3f1;
+    --ink: #24272a;
+    --ink-soft: #5d6266;
+    --worn: #34497a;     /* 着用: デニムの藍 */
+    --whole: #5f6b3a;    /* 全体: オリーブ */
+    --closeup: #7a4a5c;  /* アップ: えんじ */
+    --tag: #f0cf4a;      /* 直したもの: 値札の黄色 */
+    --done: #2f6b4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --wall: #3a3d3e; --wall-deep: #313435; --paper: #25282a;
+      --ink: #eceeee; --ink-soft: #a6abae;
+      --worn: #8ea4dc; --whole: #b6c27f; --closeup: #d39ab0; --done: #7cc3a0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--wall); color: var(--ink);
+    font: 15px/1.6 "Zen Kaku Gothic New", system-ui, sans-serif;
+  }
+  button, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  header {
+    position: sticky; top: 0; z-index: 2; background: var(--paper);
+    border-bottom: 1px solid var(--wall-deep);
+  }
+  .bar { max-width: 1400px; margin: 0 auto; padding: 12px 16px; display: grid; gap: 10px; }
+  .top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 24px; }
+  h1 { font-size: 18px; font-weight: 700; margin: 0; }
+  .progress-text { color: var(--ink-soft); }
+  .progress-text b { color: var(--ink); font-weight: 700; }
+  .meter { height: 4px; background: var(--wall); border-radius: 2px; overflow: hidden; }
+  .meter span { display: block; height: 100%; background: var(--done); transition: width .3s; }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .seg { display: inline-flex; border: 1px solid var(--wall-deep); border-radius: 6px; overflow: hidden; }
+  .seg button {
+    border: 0; background: transparent; padding: 4px 12px; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--wall-deep); }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+  select { background: transparent; border: 1px solid var(--wall-deep); border-radius: 6px; padding: 4px 8px; }
+
+  .accuracy { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; color: var(--ink-soft); }
+  .accuracy b { color: var(--ink); font-weight: 500; }
+
+  main { max-width: 1400px; margin: 0 auto; padding: 20px 16px 120px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 20px 16px; }
+
+  .card { position: relative; }
+  .card .photo {
+    display: block; aspect-ratio: 3 / 4; width: 100%; background: var(--wall-deep);
+    border-radius: 4px; overflow: hidden; outline: 3px solid transparent; outline-offset: 2px;
+  }
+  .card .photo img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .card.reviewed .photo { outline-color: color-mix(in srgb, var(--done) 55%, transparent); }
+  .card.fixed .photo { outline-color: var(--tag); }
+  .card.fixed::after {
+    /* 判定を直した写真には、値札のような印を付ける */
+    content: "直した"; position: absolute; top: 8px; left: -4px; background: var(--tag);
+    color: #24272a; font-size: 12px; font-weight: 700; padding: 1px 8px 1px 6px;
+    clip-path: polygon(0 0, 100% 0, calc(100% - 6px) 50%, 100% 100%, 0 100%);
+  }
+  .card.active .photo { outline-color: var(--ink); }
+
+  .kinds { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 8px; gap: 4px; }
+  .kinds button {
+    position: relative; border: 1px solid transparent; border-radius: 4px; background: var(--paper);
+    padding: 3px 0; cursor: pointer; font-size: 13px; color: var(--ink-soft);
+  }
+  .kinds button[aria-pressed="true"] { color: #fff; font-weight: 700; }
+  .kinds button[data-kind="worn"][aria-pressed="true"] { background: var(--worn); }
+  .kinds button[data-kind="whole"][aria-pressed="true"] { background: var(--whole); }
+  .kinds button[data-kind="closeup"][aria-pressed="true"] { background: var(--closeup); }
+  @media (prefers-color-scheme: dark) { .kinds button[aria-pressed="true"] { color: #1b1d1e; } }
+  /* Clef の判定には下に小さな印 */
+  .kinds button.predicted::after {
+    content: ""; position: absolute; left: 50%; bottom: -5px; width: 4px; height: 4px;
+    margin-left: -2px; border-radius: 50%; background: var(--ink-soft);
+  }
+  .meta { margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--ink-soft); }
+  .meta a { color: inherit; text-decoration: none; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .meta a:hover { text-decoration: underline; }
+  .probs { font-variant-numeric: tabular-nums; }
+
+  .empty { text-align: center; padding: 80px 16px; color: var(--ink-soft); }
+
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0; background: var(--paper);
+    border-top: 1px solid var(--wall-deep);
+  }
+  footer .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+  .pager { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); }
+  .pager button { border: 1px solid var(--wall-deep); background: transparent; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .confirm {
+    margin-left: auto; border: 0; border-radius: 6px; padding: 8px 18px; cursor: pointer;
+    background: var(--done); color: #fff; font-weight: 700;
+  }
+  @media (prefers-color-scheme: dark) { .confirm { color: #1b1d1e; } }
+  .confirm:disabled { opacity: .45; cursor: default; }
+  .hint { font-size: 12px; color: var(--ink-soft); }
+  .status { font-size: 13px; color: var(--ink-soft); min-height: 1em; }
+  @media (max-width: 640px) {
+    header { position: static; }
+    .grid { grid-template-columns: repeat(2, 1fr); }
+    .hint { display: none; }
+    .confirm { width: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) { .meter span { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="top">
+      <h1>写真の分類の確認</h1>
+      <span class="progress-text" id="progress"></span>
+    </div>
+    <div class="meter" aria-hidden="true"><span id="meter" style="width:0"></span></div>
+    <div class="controls">
+      <div class="seg" role="group" aria-label="区分" id="kindFilter">
+        <button data-v="all" aria-pressed="true">すべて</button>
+        <button data-v="worn" aria-pressed="false">着用</button>
+        <button data-v="whole" aria-pressed="false">全体</button>
+        <button data-v="closeup" aria-pressed="false">アップ</button>
+      </div>
+      <div class="seg" role="group" aria-label="確認" id="stateFilter">
+        <button data-v="todo" aria-pressed="true">未確認</button>
+        <button data-v="done" aria-pressed="false">確認済み</button>
+        <button data-v="fixed" aria-pressed="false">直したもの</button>
+        <button data-v="all" aria-pressed="false">すべて</button>
+      </div>
+      <label>並び
+        <select id="sort">
+          <option value="unsure">迷っている順</option>
+          <option value="product">商品の順</option>
+        </select>
+      </label>
+    </div>
+    <div class="accuracy" id="accuracy"></div>
+  </div>
+</header>
+
+<main>
+  <div class="grid" id="grid"></div>
+  <p class="empty" id="empty" hidden></p>
+</main>
+
+<footer>
+  <div class="bar">
+    <div class="pager">
+      <button id="prev" aria-label="前のページ">前へ</button>
+      <span id="pageText"></span>
+      <button id="next" aria-label="次のページ">次へ</button>
+    </div>
+    <span class="hint">写真にカーソルを置いて 1 着用・2 全体・3 アップ。Enter でこのページを確認済みに</span>
+    <span class="status" id="status" role="status"></span>
+    <button class="confirm" id="confirm">このページを判定どおり確認済みにする</button>
+  </div>
+</footer>
+
+<script>
+const PAGE_SIZE = 60;
+const KINDS = { worn: "着用", whole: "全体", closeup: "アップ" };
+let items = [], labels = {}, threshold = 0.5;
+let filter = { kind: "all", state: "todo", sort: "unsure" };
+let page = 0, view = [], activeId = null;
+
+const kindOf = (person, whole) => person ? "worn" : whole ? "whole" : "closeup";
+const predicted = it => kindOf(it.person >= threshold, it.whole >= threshold);
+const current = it => labels[it.id] ? kindOf(labels[it.id].person, labels[it.id].whole) : predicted(it);
+const isFixed = it => labels[it.id] && current(it) !== predicted(it);
+// 0.5 から遠いほど迷っていない
+const unsure = it => Math.min(Math.abs(it.person - threshold), Math.abs(it.whole - threshold));
+
+// 区分から、保存するラベル（人・全体）を作る。着用は「全体」を判定のまま残す
+function labelFor(it, kind) {
+  if (kind === "worn") return { person: true, whole: it.whole >= threshold };
+  return { person: false, whole: kind === "whole" };
+}
+
+async function save(changes) {
+  const status = document.getElementById("status");
+  try {
+    const res = await fetch("/api/labels", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels: changes }),
+    });
+    if (!res.ok) throw new Error(res.status);
+    status.textContent = `${Object.keys(changes).length} 枚を保存しました`;
+  } catch (e) {
+    status.textContent = `保存できませんでした（${e.message}）。サーバーが動いているか確かめてください`;
+  }
+}
+
+function setKind(id, kind) {
+  const it = items.find(i => i.id === id);
+  const label = labelFor(it, kind);
+  labels[id] = { ...label, reviewed_at: new Date().toISOString() };
+  save({ [id]: label });
+  renderCard(id);
+  renderStats();
+}
+
+function rebuild() {
+  view = items.filter(it => {
+    if (filter.kind !== "all" && current(it) !== filter.kind) return false;
+    if (filter.state === "todo") return !labels[it.id];
+    if (filter.state === "done") return !!labels[it.id];
+    if (filter.state === "fixed") return isFixed(it);
+    return true;
+  });
+  if (filter.sort === "unsure") view.sort((a, b) => unsure(a) - unsure(b));
+  else view.sort((a, b) => (a.products[0].handle + a.products[0].position).localeCompare(b.products[0].handle + b.products[0].position, "ja", { numeric: true }));
+  page = Math.min(page, Math.max(0, Math.ceil(view.length / PAGE_SIZE) - 1));
+}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function thumb(url) { return url + (url.includes("?") ? "&" : "?") + "width=360"; }
+
+function cardHTML(it) {
+  const cur = current(it), pred = predicted(it);
+  const p = it.products[0];
+  const more = it.products.length > 1 ? `（ほか ${it.products.length - 1} 商品）` : "";
+  const buttons = Object.entries(KINDS).map(([k, name]) =>
+    `<button data-kind="${k}" aria-pressed="${k === cur}" class="${k === pred ? "predicted" : ""}" title="${k === pred ? "Clef の判定" : ""}">${name}</button>`
+  ).join("");
+  return `
+    <a class="photo" href="${esc(it.url)}" target="_blank" rel="noopener"><img loading="lazy" src="${esc(thumb(it.url))}" alt="${esc(p.title)}（${p.position}枚目）"></a>
+    <div class="kinds" role="group" aria-label="正しい区分">${buttons}</div>
+    <div class="meta">
+      <a href="https://shop.85-store.com/products/${encodeURIComponent(p.handle)}" target="_blank" rel="noopener">${esc(p.title)}・${p.position}枚目${more}</a>
+      <span class="probs">人 ${it.person.toFixed(2)}　全体 ${it.whole.toFixed(2)}</span>
+    </div>`;
+}
+
+function renderCard(id) {
+  const el = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+  if (!el) return;
+  const it = items.find(i => i.id === id);
+  el.classList.toggle("reviewed", !!labels[id]);
+  el.classList.toggle("fixed", !!isFixed(it));
+  el.querySelectorAll(".kinds button").forEach(b => b.setAttribute("aria-pressed", b.dataset.kind === current(it)));
+}
+
+function render() {
+  const grid = document.getElementById("grid");
+  const slice = view.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  grid.innerHTML = "";
+  for (const it of slice) {
+    const el = document.createElement("article");
+    el.className = "card";
+    el.dataset.id = it.id;
+    el.innerHTML = cardHTML(it);
+    el.addEventListener("mouseenter", () => { activeId = it.id; });
+    el.addEventListener("mouseleave", () => { if (activeId === it.id) activeId = null; });
+    el.querySelectorAll(".kinds button").forEach(b => b.addEventListener("click", () => setKind(it.id, b.dataset.kind)));
+    grid.appendChild(el);
+    renderCard(it.id);
+  }
+  const empty = document.getElementById("empty");
+  empty.hidden = slice.length > 0;
+  empty.textContent = filter.state === "todo" ? "この条件の未確認の写真はありません。ほかの区分や「すべて」も見てください。" : "この条件の写真はありません。";
+  const pages = Math.max(1, Math.ceil(view.length / PAGE_SIZE));
+  document.getElementById("pageText").textContent = `${page + 1} / ${pages}（${view.length} 枚）`;
+  document.getElementById("prev").disabled = page === 0;
+  document.getElementById("next").disabled = page >= pages - 1;
+  const todo = slice.filter(it => !labels[it.id]).length;
+  const confirm = document.getElementById("confirm");
+  confirm.disabled = todo === 0;
+  confirm.textContent = todo ? `このページの未確認 ${todo} 枚を、判定どおり確認済みにする` : "このページは確認済み";
+  renderStats();
+}
+
+function renderStats() {
+  const reviewed = items.filter(it => labels[it.id]);
+  document.getElementById("progress").innerHTML = `全 ${items.length} 枚のうち <b>${reviewed.length}</b> 枚を確認済み`;
+  document.getElementById("meter").style.width = items.length ? `${reviewed.length / items.length * 100}%` : "0";
+  if (!reviewed.length) {
+    document.getElementById("accuracy").textContent = "確かめた写真が増えると、ここに判定の正しさが出ます。";
+    return;
+  }
+  const pct = (a, b) => b ? `${Math.round(a / b * 1000) / 10}%` : "—";
+  const right = reviewed.filter(it => current(it) === predicted(it)).length;
+  const person = reviewed.filter(it => (it.person >= threshold) === labels[it.id].person).length;
+  const whole = reviewed.filter(it => !labels[it.id].person && (it.whole >= threshold) === labels[it.id].whole);
+  const wholeAll = reviewed.filter(it => !labels[it.id].person).length;
+  // 区分ごと: 正しくその区分と判定できた割合（再現率）
+  const perKind = Object.entries(KINDS).map(([k, name]) => {
+    const truth = reviewed.filter(it => current(it) === k);
+    return `${name} <b>${pct(truth.filter(it => predicted(it) === k).length, truth.length)}</b>（${truth.length} 枚）`;
+  }).join("　");
+  document.getElementById("accuracy").innerHTML =
+    `判定が合っていた <b>${pct(right, reviewed.length)}</b>　人の有無 <b>${pct(person, reviewed.length)}</b>　全体かアップか <b>${pct(whole.length, wholeAll)}</b>　｜　${perKind}`;
+}
+
+async function confirmPage() {
+  const slice = view.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).filter(it => !labels[it.id]);
+  if (!slice.length) return;
+  const changes = {};
+  const now = new Date().toISOString();
+  for (const it of slice) {
+    const label = labelFor(it, predicted(it));
+    changes[it.id] = label;
+    labels[it.id] = { ...label, reviewed_at: now };
+  }
+  await save(changes);
+  // 未確認だけを見ているときは、確認した分が抜けて次の写真が前に詰まる
+  if (filter.state !== "todo") page += 1;
+  rebuild();
+  render();
+  window.scrollTo({ top: 0 });
+}
+
+function bindSeg(id, key) {
+  const seg = document.getElementById(id);
+  seg.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    seg.querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === b));
+    filter[key] = b.dataset.v;
+    page = 0; rebuild(); render();
+  });
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.closest("select, input")) return;
+  const map = { "1": "worn", "2": "whole", "3": "closeup" };
+  if (map[e.key] && activeId) { setKind(activeId, map[e.key]); return; }
+  if (e.key === "Enter" && !e.target.closest("button, a")) { e.preventDefault(); confirmPage(); }
+});
+
+bindSeg("kindFilter", "kind");
+bindSeg("stateFilter", "state");
+document.getElementById("sort").addEventListener("change", e => { filter.sort = e.target.value; page = 0; rebuild(); render(); });
+document.getElementById("prev").addEventListener("click", () => { page--; render(); window.scrollTo({ top: 0 }); });
+document.getElementById("next").addEventListener("click", () => { page++; render(); window.scrollTo({ top: 0 }); });
+document.getElementById("confirm").addEventListener("click", confirmPage);
+
+fetch("/api/items").then(r => r.json()).then(d => {
+  items = d.items; labels = d.labels; threshold = d.threshold;
+  if (!items.length) {
+    document.getElementById("empty").hidden = false;
+    document.getElementById("empty").textContent = "判定がまだありません。scripts/shopify_classify_photos.py で分類してから開いてください。";
+    return;
+  }
+  rebuild(); render();
+});
+</script>
+</body>
+</html>

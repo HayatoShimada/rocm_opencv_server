@@ -99,6 +99,55 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 
 `--apply` では、差し替える前に元の画像を `~/85store-shopify-originals/<日付>/` に保存する。
 
+## 商品写真を「着用・全体・アップ」に分ける（Clef）
+
+Cloudflare の Clef（判定用のモデル）に、写真ごとに質問をする。既定は、オープンウェイトの Clef-flash（9B）を手元の GPU で動かす（`CLEF_BACKEND=workers-ai` で Workers AI の `@cf/cloudflare/clef-flash`）。どちらも同じ判定になる（32枚で区分・向き・部分が一致、確率の差は 0.012 以内）。
+- 人が服を着ている写真か（手や指だけが写っているものは含めない）
+- 商品の全体が1枚に収まっているか
+
+人が写っていれば「着用」、いなければ「全体」か「アップ」に分ける。画像は Shopify の CDN で幅 512px に縮めて渡す（1枚あたり約450トークン）。
+
+手元の GPU で動かすには、重み（約19GB）を一度ダウンロードしておく。
+
+```bash
+uvx --from 'huggingface_hub[hf_xet]' hf download Cloudflare/clef-flash --local-dir ~/models/clef-flash
+```
+
+| | 手元の GPU（既定） | Workers AI |
+|---|---|---|
+| 速さ（RX 7900 XTX） | 2.5〜2.8 枚/秒（1555枚で約9分） | 12 枚/秒（6並列。約2分） |
+| 読み込み | 約9秒（VRAM 約19〜21GB） | なし |
+| 費用 | 電気代 | 1枚 約0.013円（入力 約1000トークン） |
+
+```bash
+# 全商品の画像を分類する（data/photo-labels/predictions.json。差し替えていない画像は取り直さない）
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_classify_photos
+# 分類が正しいかを確かめる画面（http://127.0.0.1:8010）
+uv run python -m scripts.photo_review
+```
+
+確かめる画面の使い方:
+- 写真ごとに、正しい区分（着用・全体・アップ）を選ぶ。写真にカーソルを置いて 1・2・3 のキーでも選べる。
+- 判定が合っていれば、下の「判定どおり確認済みにする」（Enter）で、そのページをまとめて確認済みにする。
+- 初めは「迷っている順」（確率が 0.5 に近い順）に並ぶ。
+- 上の欄に、確かめた写真での判定の正しさが出る。
+- 確かめた結果は `data/photo-labels/labels.json` に保存する。
+
+### 写真の区分を alt に入れる
+
+Clef には、向き（正面・背面・横）と、アップで写している部分（タグ・ロゴやプリント・生地・ボタンやジッパー・襟元・袖口や裾・ポケット・傷や汚れ）も聞いている。それを使って、自動の alt を「商品名（正面）」「商品名（タグのアップ）」の形にする。
+- 確からしさが低い向き・部分は使わず、「全体」「着用」「ディテール」とだけ書く。
+- 区分の語は 85store-cms の `AUTO_ALT_LABELS` と同じ（`app/shopify.py` の `ALT_LABELS`）。CMS は、この形の alt を自動の alt として扱い、商品名を変えたら付け直す。
+
+```bash
+uv run --env-file .env python -m scripts.shopify_photo_alts          # 書き換える数と例を出す
+uv run --env-file .env python -m scripts.shopify_photo_alts --apply  # Shopify の alt を書き換える
+```
+
+- 書き換えるのは、alt が空か、自動の alt（n枚目・区分）の画像だけ。
+- 人が入れた alt と、ほかの商品と共有している画像には触らない。
+- `--apply` では、前の alt を `~/85store-shopify-originals/alts-<日時>.json` に保存する。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -109,6 +158,10 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 | `SHOPIFY_STORE` / `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | なし | Shopify Admin API（Client Credentials） |
 | `FIT_MAX_SIDE` | `2048` | 商品画像の長辺の上限 |
 | `FIT_QUALITY` | `90` | 縮めた画像の JPEG の品質 |
+| `CLEF_BACKEND` | `local` | 写真の分類を動かす場所（`local` = 手元の GPU、`workers-ai`） |
+| `CLEF_MODEL_PATH` | `~/models/clef-flash` | 手元で動かすときの Clef-flash の重み |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | なし | Workers AI（`CLEF_BACKEND=workers-ai`）。トークンは「Workers AI」の権限で作る |
+| `CLEF_MODEL` | `@cf/cloudflare/clef-flash` | Workers AI で使うモデル（`@cf/cloudflare/clef` で 27B） |
 
 ## ベンチマーク
 
@@ -128,11 +181,15 @@ app/
   shopify.py     # Shopify の商品画像を縮めて差し替える
   whitebalance.py # 単品の写真のホワイトバランスを基準の壁の色に揃える
   classify.py    # 写真の種類を CLIP で判定する
+  clef.py        # 写真の区分を Clef（手元の GPU か Workers AI）で判定する
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較
 scripts/shopify_fit_images.py # 商品画像を手動で一括で縮める
 scripts/shopify_white_balance.py # 単品の写真のホワイトバランスを揃える
+scripts/shopify_classify_photos.py # 全商品の画像を Clef で分類する
+scripts/photo_review.py # 分類が正しいかを確かめる画面
+scripts/shopify_photo_alts.py # 写真の区分を付けた alt にする
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。
