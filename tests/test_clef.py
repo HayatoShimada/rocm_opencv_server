@@ -17,15 +17,20 @@ def test_classify_sends_image_and_reads_answers():
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["body"] = json.loads(request.content)
-        answers = {"person": {"type": "noul", "noul": 0.9}, "whole": {"type": "noul", "noul": 0.2}}
+        answers = {
+            "person": {"type": "noul", "noul": 0.9},
+            "whole": {"type": "noul", "noul": 0.2},
+            "view": {"type": "choice", "choice": "back", "confidence": 0.8, "probabilities": {}},
+            "part": {"type": "choice", "choice": "tag", "confidence": 0.4, "probabilities": {}},
+        }
         return httpx.Response(200, json={"success": True, "result": {"answers": answers}})
 
     labels = _client(handler).classify(b"\xff\xd8\xff", "image/jpeg")
     assert seen["url"].endswith("/accounts/acc/ai/run/@cf/cloudflare/clef-flash")
     assert seen["body"]["model"] == "clef-flash"
-    assert set(seen["body"]["questions"]) == {"person", "whole"}
+    assert set(seen["body"]["questions"]) == {"person", "whole", "view", "part"}
     assert seen["body"]["images"][0] == {"content_type": "image/jpeg", "base64": "/9j/"}
-    assert labels == clef.PhotoLabels(person=0.9, whole=0.2)
+    assert labels == clef.PhotoLabels(0.9, 0.2, "back", 0.8, "tag", 0.4)
     assert labels.kind == "worn"
 
 

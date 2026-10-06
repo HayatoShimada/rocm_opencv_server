@@ -121,6 +121,21 @@ uv run python -m scripts.photo_review
 - 上の欄に、確かめた写真での判定の正しさが出る。
 - 確かめた結果は `data/photo-labels/labels.json` に保存する。
 
+### 写真の区分を alt に入れる
+
+Clef には、向き（正面・背面・横）と、アップで写している部分（タグ・ロゴやプリント・生地・ボタンやジッパー・襟元・袖口や裾・ポケット・傷や汚れ）も聞いている。それを使って、自動の alt を「商品名（正面）」「商品名（タグのアップ）」の形にする。
+- 確からしさが低い向き・部分は使わず、「全体」「着用」「ディテール」とだけ書く。
+- 区分の語は 85store-cms の `AUTO_ALT_LABELS` と同じ（`app/shopify.py` の `ALT_LABELS`）。CMS は、この形の alt を自動の alt として扱い、商品名を変えたら付け直す。
+
+```bash
+uv run --env-file .env python -m scripts.shopify_photo_alts          # 書き換える数と例を出す
+uv run --env-file .env python -m scripts.shopify_photo_alts --apply  # Shopify の alt を書き換える
+```
+
+- 書き換えるのは、alt が空か、自動の alt（n枚目・区分）の画像だけ。
+- 人が入れた alt と、ほかの商品と共有している画像には触らない。
+- `--apply` では、前の alt を `~/85store-shopify-originals/alts-<日時>.json` に保存する。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -160,6 +175,7 @@ scripts/shopify_fit_images.py # 商品画像を手動で一括で縮める
 scripts/shopify_white_balance.py # 単品の写真のホワイトバランスを揃える
 scripts/shopify_classify_photos.py # 全商品の画像を Clef で分類する
 scripts/photo_review.py # 分類が正しいかを確かめる画面
+scripts/shopify_photo_alts.py # 写真の区分を付けた alt にする
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。

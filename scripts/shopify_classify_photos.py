@@ -104,6 +104,10 @@ def main() -> None:
             "key": key,
             "person": round(labels.person, 4),
             "whole": round(labels.whole, 4),
+            "view": labels.view,
+            "view_confidence": round(labels.view_confidence, 4),
+            "part": labels.part,
+            "part_confidence": round(labels.part_confidence, 4),
         }
 
     failed = 0

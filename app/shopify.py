@@ -206,9 +206,62 @@ def product_search(identifier: str) -> str:
     return f'handle:"{identifier}"'
 
 
-def auto_alt(title: str, index: int) -> str:
-    """alt が空の画像に入れる文言（85store-cms の src/shopify/mapping.ts の autoAlt と同じ形）。"""
-    return f"{title}（{index + 1}枚目）"
+def auto_alt(title: str, index: int, label: str | None = None) -> str:
+    """alt が空の画像に入れる文言（85store-cms の src/shopify/mapping.ts の autoAlt と同じ形）。
+
+    写真の区分（photo_label）が分かれば「商品名（正面）」、分からなければ「商品名（n枚目）」。
+    """
+    return f"{title}（{label or f'{index + 1}枚目'}）"
+
+
+# 写真の区分の語（85store-cms の AUTO_ALT_LABELS と同じ。変えるときは両方直す）
+VIEW_LABELS = {
+    "whole": {"front": "正面", "back": "背面", "side": "横"},
+    "worn": {"front": "着用", "back": "着用・背面", "side": "着用・横"},
+}
+PART_LABELS = {
+    "tag": "タグのアップ",
+    "print": "ロゴ・プリントのアップ",
+    "fabric": "生地のアップ",
+    "fastener": "ボタン・ジッパーのアップ",
+    "collar": "襟元のアップ",
+    "hem": "袖口・裾のアップ",
+    "pocket": "ポケットのアップ",
+    "damage": "傷・汚れのアップ",
+}
+ALT_LABELS = [
+    "正面", "背面", "横", "全体", "着用", "着用・背面", "着用・横",
+    *PART_LABELS.values(),
+    "ディテール",
+]  # fmt: skip
+# 確からしさがこれ未満の向き・部分は使わず、「全体」「着用」「ディテール」とだけ書く
+MIN_VIEW_CONFIDENCE = 0.6
+MIN_PART_CONFIDENCE = 0.3
+
+
+def photo_label(
+    kind: str, view: str, view_confidence: float, part: str, part_confidence: float
+) -> str:
+    """Clef の判定（app/clef.py）から、alt に付ける区分の語を決める。"""
+    if kind == "closeup":
+        if part_confidence >= MIN_PART_CONFIDENCE and part in PART_LABELS:
+            return PART_LABELS[part]
+        return "ディテール"
+    fallback = "着用" if kind == "worn" else "全体"
+    if view_confidence >= MIN_VIEW_CONFIDENCE:
+        return VIEW_LABELS[kind].get(view, fallback)
+    return fallback
+
+
+def auto_alt_label(alt: str, title: str, index: int) -> str | None:
+    """自動で付けた alt なら区分の語（「n枚目」なら ""）を、人が入れた alt なら None を返す。"""
+    if alt == auto_alt(title, index):
+        return ""
+    if alt.startswith(f"{title}（") and alt.endswith("）"):
+        label = alt[len(title) + 1 : -1]
+        if label in ALT_LABELS:
+            return label
+    return None
 
 
 @dataclass

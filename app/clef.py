@@ -13,7 +13,7 @@ import httpx2 as httpx
 
 DEFAULT_MODEL = "@cf/cloudflare/clef-flash"
 # 質問や渡し方を変えたら上げる（保存してある判定を取り直す）
-VERSION = 2
+VERSION = 3
 STATE = "オンラインストアの商品写真を分類する"
 QUESTIONS = {
     "person": {
@@ -30,6 +30,33 @@ QUESTIONS = {
             "一部だけのアップ（タグ・生地・ボタン・プリントの寄り）なら no"
         ),
     },
+    # alt に入れる区分（app/shopify.py の photo_label）。
+    # 全体・着用の写真は向き、アップは写している部分
+    "view": {
+        "type": "choice",
+        "instructions": "服をどちら側から写しているか（商品の全体・着用の写真）",
+        "criteria": {
+            "front": "正面（服の前側。襟・ボタン・前のプリントが見える）",
+            "back": "背面（服の後ろ側）",
+            "side": "横から",
+            "other": "どれでもない・わからない",
+        },
+    },
+    "part": {
+        "type": "choice",
+        "instructions": "アップの写真なら、服のどこを写しているか",
+        "criteria": {
+            "tag": "タグ・ラベル（ブランド名・サイズ・洗濯表示）",
+            "print": "ロゴ・プリント・刺繍",
+            "fabric": "生地・柄・編み目",
+            "fastener": "ボタン・ジッパー・スナップ",
+            "collar": "襟・首まわり",
+            "hem": "袖口・裾",
+            "pocket": "ポケット",
+            "damage": "傷・汚れ・穴・ほつれ",
+            "other": "それ以外・全体が写っている",
+        },
+    },
 }
 # 確率がこれ以上なら「はい」とみなす
 THRESHOLD = 0.5
@@ -45,6 +72,12 @@ class PhotoLabels:
 
     person: float
     whole: float
+    # 向き（front・back・side・other）と、アップで写している部分（tag など）。
+    # confidence は確からしさ
+    view: str = "other"
+    view_confidence: float = 0.0
+    part: str = "other"
+    part_confidence: float = 0.0
 
     @property
     def kind(self) -> str:
@@ -90,5 +123,13 @@ class Clef:
                 errors = " / ".join(e.get("message", "") for e in body.get("errors", []))
                 raise ClefError(f"Workers AI: {res.status_code} {errors}")
             answers = body["result"]["answers"]
-            return PhotoLabels(person=answers["person"]["noul"], whole=answers["whole"]["noul"])
+            view, part = answers.get("view", {}), answers.get("part", {})
+            return PhotoLabels(
+                person=answers["person"]["noul"],
+                whole=answers["whole"]["noul"],
+                view=view.get("choice", "other"),
+                view_confidence=view.get("confidence", 0.0),
+                part=part.get("choice", "other"),
+                part_confidence=part.get("confidence", 0.0),
+            )
         raise ClefError("Workers AI: やり直しても応答がありません")
