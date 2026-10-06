@@ -13,12 +13,15 @@ import httpx2 as httpx
 
 DEFAULT_MODEL = "@cf/cloudflare/clef-flash"
 # 質問や渡し方を変えたら上げる（保存してある判定を取り直す）
-VERSION = 1
+VERSION = 2
 STATE = "オンラインストアの商品写真を分類する"
 QUESTIONS = {
     "person": {
         "type": "noul",
-        "instructions": "写真に人（体の一部を含む。着用している人・モデル・手）が写っているか",
+        "instructions": (
+            "人が服を着ている写真（着用・モデル）か。"
+            "手や指だけが写っている（商品を持つ・広げる・タグを指す）写真は no"
+        ),
     },
     "whole": {
         "type": "noul",
@@ -38,7 +41,7 @@ class ClefError(Exception):
 
 @dataclass(frozen=True)
 class PhotoLabels:
-    """はいの確率（0〜1）。"""
+    """はいの確率（0〜1）。person は人が着ているか（手・指だけなら低い）。"""
 
     person: float
     whole: float

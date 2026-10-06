@@ -102,7 +102,7 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 ## 商品写真を「着用・全体・アップ」に分ける（Clef）
 
 Cloudflare Workers AI の Clef（`@cf/cloudflare/clef-flash`）に、写真ごとに2つの質問をする。
-- 人（体の一部を含む）が写っているか
+- 人が服を着ている写真か（手や指だけが写っているものは含めない）
 - 商品の全体が1枚に収まっているか
 
 人が写っていれば「着用」、いなければ「全体」か「アップ」に分ける。画像は Shopify の CDN で幅 512px に縮めて渡す（1枚あたり約450トークン）。
