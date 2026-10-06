@@ -21,6 +21,13 @@ clip = [
     "torch[device-gfx1100]==2.13.0+rocm10.0.0",
     "torchvision[device-gfx1100]==0.28.0+rocm10.0.0",
 ]
+# Clef-flash（Cloudflare のオープンウェイト）を手元の GPU で動かす（uv sync --group clip --group clef-local）
+clef-local = [
+    "accelerate>=1.10",
+    "huggingface-hub>=1.0",
+    "safetensors>=0.6",
+    "transformers==5.10.2",
+]
 dev = [
     "httpx2>=2.13.1",
     "pytest>=8.0",

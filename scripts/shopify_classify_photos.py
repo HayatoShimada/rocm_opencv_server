@@ -1,7 +1,9 @@
-"""Shopify の全商品の画像を、Clef（Workers AI）で「着用・全体・アップ」に分ける（app/clef.py）。
+"""Shopify の全商品の画像を、Clef で「着用・全体・アップ」に分ける（app/clef.py）。
 
-  uv run --env-file .env python -m scripts.shopify_classify_photos \\
-      [--product <ハンドル>]... [--force]
+  uv run --env-file .env --group clip --group clef-local \\
+      python -m scripts.shopify_classify_photos [--product <ハンドル>]... [--force]
+既定は手元の GPU で判定する。
+CLEF_BACKEND=workers-ai なら Workers AI（そのときは --group は要らない）。
 判定は data/photo-labels/predictions.json に保存する。
 画像（?v=）・質問・モデルが変わっていなければ取り直さない。
 結果が正しいかは scripts/photo_review.py の画面で確かめる。
@@ -78,16 +80,14 @@ def main() -> None:
     client = shopify.Shopify(
         settings.shopify_store, settings.shopify_client_id, settings.shopify_client_secret
     )
-    model = clef.Clef(
-        settings.cloudflare_account_id, settings.cloudflare_api_token, settings.clef_model
-    )
+    model = clef.from_settings(settings)
     searches = [shopify.product_search(p) for p in args.product] if args.product else [None]
     items = collect(client, searches)
     predictions = load_predictions()
 
     todo = []
     for media_id, item in items.items():
-        key = _key(item["url"], settings.clef_model)
+        key = _key(item["url"], model.model)
         saved = predictions.get(media_id)
         if saved and saved.get("key") == key and not args.force:
             saved.update(url=item["url"], products=item["products"])

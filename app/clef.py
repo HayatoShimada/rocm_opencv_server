@@ -1,13 +1,17 @@
-"""商品写真に人が写っているか・商品の全体が写っているかを、
-Cloudflare Workers AI の Clef で判定する。
+"""商品写真に人が写っているか・商品の全体が写っているかを、Cloudflare の Clef で判定する。
 
 Clef は、質問（はい・いいえ など）ごとに選択肢の確率を返す判定用のモデル（文章は生成しない）。
-画像は base64 で渡す（URL は受け付けない。1枚 4MiB・最大4枚）。
+既定は手元の GPU（Hugging Face のオープンウェイト Cloudflare/clef-flash。LocalClef）。
+CLEF_BACKEND=workers-ai で Cloudflare Workers AI を使う（Clef。画像は base64・1枚 4MiB・最大4枚）。
 """
 
 import base64
+import io
+import sys
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx2 as httpx
 
@@ -94,7 +98,22 @@ def photo_kind(person: bool, whole: bool) -> str:
 KIND_LABELS = {"worn": "着用", "whole": "全体", "closeup": "アップ"}
 
 
+def labels_from_answers(answers: dict) -> PhotoLabels:
+    """SystemOne の answers（Workers AI と手元で同じ形）から判定を取り出す。"""
+    view, part = answers.get("view", {}), answers.get("part", {})
+    return PhotoLabels(
+        person=answers["person"]["noul"],
+        whole=answers["whole"]["noul"],
+        view=view.get("choice", "other"),
+        view_confidence=view.get("confidence", 0.0),
+        part=part.get("choice", "other"),
+        part_confidence=part.get("confidence", 0.0),
+    )
+
+
 class Clef:
+    """Cloudflare Workers AI の Clef。"""
+
     def __init__(self, account_id: str, api_token: str, model: str = DEFAULT_MODEL, http=None):
         if not account_id or not api_token:
             raise ClefError("CLOUDFLARE_ACCOUNT_ID と CLOUDFLARE_API_TOKEN を設定してください")
@@ -122,14 +141,54 @@ class Clef:
             if not body.get("success"):
                 errors = " / ".join(e.get("message", "") for e in body.get("errors", []))
                 raise ClefError(f"Workers AI: {res.status_code} {errors}")
-            answers = body["result"]["answers"]
-            view, part = answers.get("view", {}), answers.get("part", {})
-            return PhotoLabels(
-                person=answers["person"]["noul"],
-                whole=answers["whole"]["noul"],
-                view=view.get("choice", "other"),
-                view_confidence=view.get("confidence", 0.0),
-                part=part.get("choice", "other"),
-                part_confidence=part.get("confidence", 0.0),
-            )
+            return labels_from_answers(body["result"]["answers"])
         raise ClefError("Workers AI: やり直しても応答がありません")
+
+
+class LocalClef:
+    """手元の GPU で動かす Clef（Hugging Face の重みと、同梱の joint_schema_model.py）。
+
+    clef-flash（9B・BF16）は VRAM を約19〜21GB 使う。読み込みに約9秒、1枚 約0.4秒（RX 7900 XTX）。
+    GPU は1つなので、同時に呼ばれても1枚ずつ判定する（並べても速くならない）。
+    """
+
+    def __init__(self, model_path: str | Path):
+        path = Path(model_path).expanduser()
+        if not (path / "joint_schema_model.py").exists():
+            raise ClefError(
+                f"Clef の重みがありません: {path}（README の「手元の GPU で動かす」を見てください）"
+            )
+        try:
+            import torch
+        except ImportError as e:
+            raise ClefError(
+                "手元で動かすには uv run --group clip --group clef-local で起動してください"
+            ) from e
+        sys.path.insert(0, str(path))
+        from joint_schema_model import load_release_model, systemone
+
+        self.model = path.name
+        self._torch = torch
+        self._systemone = systemone
+        self._model, self._processor = load_release_model(path, device="cuda")
+        self._lock = threading.Lock()
+
+    def classify(self, image: bytes, content_type: str) -> PhotoLabels:
+        from PIL import Image
+
+        picture = Image.open(io.BytesIO(image)).convert("RGB")
+        request = {"model": self.model, "state": STATE, "questions": QUESTIONS, "images": [picture]}
+        with self._lock:
+            response = self._systemone(self._model, self._processor, request)
+        return labels_from_answers(response["answers"])
+
+
+def from_settings(settings) -> "Clef | LocalClef":
+    """設定（CLEF_BACKEND）に合わせて、手元の GPU か Workers AI の Clef を返す。"""
+    if settings.clef_backend == "local":
+        return LocalClef(settings.clef_model_path)
+    if settings.clef_backend == "workers-ai":
+        return Clef(
+            settings.cloudflare_account_id, settings.cloudflare_api_token, settings.clef_model
+        )
+    raise ClefError(f"CLEF_BACKEND は local か workers-ai です: {settings.clef_backend}")

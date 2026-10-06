@@ -101,15 +101,27 @@ uv run --env-file .env --group clip python -m scripts.shopify_white_balance --pr
 
 ## 商品写真を「着用・全体・アップ」に分ける（Clef）
 
-Cloudflare Workers AI の Clef（`@cf/cloudflare/clef-flash`）に、写真ごとに2つの質問をする。
+Cloudflare の Clef（判定用のモデル）に、写真ごとに質問をする。既定は、オープンウェイトの Clef-flash（9B）を手元の GPU で動かす（`CLEF_BACKEND=workers-ai` で Workers AI の `@cf/cloudflare/clef-flash`）。どちらも同じ判定になる（32枚で区分・向き・部分が一致、確率の差は 0.012 以内）。
 - 人が服を着ている写真か（手や指だけが写っているものは含めない）
 - 商品の全体が1枚に収まっているか
 
 人が写っていれば「着用」、いなければ「全体」か「アップ」に分ける。画像は Shopify の CDN で幅 512px に縮めて渡す（1枚あたり約450トークン）。
 
+手元の GPU で動かすには、重み（約19GB）を一度ダウンロードしておく。
+
+```bash
+uvx --from 'huggingface_hub[hf_xet]' hf download Cloudflare/clef-flash --local-dir ~/models/clef-flash
+```
+
+| | 手元の GPU（既定） | Workers AI |
+|---|---|---|
+| 速さ（RX 7900 XTX） | 2.5〜2.8 枚/秒（1555枚で約9分） | 12 枚/秒（6並列。約2分） |
+| 読み込み | 約9秒（VRAM 約19〜21GB） | なし |
+| 費用 | 電気代 | 1枚 約0.013円（入力 約1000トークン） |
+
 ```bash
 # 全商品の画像を分類する（data/photo-labels/predictions.json。差し替えていない画像は取り直さない）
-uv run --env-file .env python -m scripts.shopify_classify_photos
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_classify_photos
 # 分類が正しいかを確かめる画面（http://127.0.0.1:8010）
 uv run python -m scripts.photo_review
 ```
@@ -146,8 +158,10 @@ uv run --env-file .env python -m scripts.shopify_photo_alts --apply  # Shopify �
 | `SHOPIFY_STORE` / `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | なし | Shopify Admin API（Client Credentials） |
 | `FIT_MAX_SIDE` | `2048` | 商品画像の長辺の上限 |
 | `FIT_QUALITY` | `90` | 縮めた画像の JPEG の品質 |
-| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | なし | Workers AI（Clef）。トークンは「Workers AI」の権限で作る |
-| `CLEF_MODEL` | `@cf/cloudflare/clef-flash` | 写真の分類に使うモデル（`@cf/cloudflare/clef` で 27B） |
+| `CLEF_BACKEND` | `local` | 写真の分類を動かす場所（`local` = 手元の GPU、`workers-ai`） |
+| `CLEF_MODEL_PATH` | `~/models/clef-flash` | 手元で動かすときの Clef-flash の重み |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | なし | Workers AI（`CLEF_BACKEND=workers-ai`）。トークンは「Workers AI」の権限で作る |
+| `CLEF_MODEL` | `@cf/cloudflare/clef-flash` | Workers AI で使うモデル（`@cf/cloudflare/clef` で 27B） |
 
 ## ベンチマーク
 
@@ -167,7 +181,7 @@ app/
   shopify.py     # Shopify の商品画像を縮めて差し替える
   whitebalance.py # 単品の写真のホワイトバランスを基準の壁の色に揃える
   classify.py    # 写真の種類を CLIP で判定する
-  clef.py        # 写真に人・商品の全体が写っているかを Clef（Workers AI）で判定する
+  clef.py        # 写真の区分を Clef（手元の GPU か Workers AI）で判定する
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較

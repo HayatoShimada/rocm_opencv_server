@@ -92,3 +92,24 @@ def test_review_saves_and_clears_labels(tmp_path, monkeypatch):
 
     client.post("/api/labels", json={"labels": {media_id: None}})
     assert client.get("/api/items").json()["labels"] == {}
+
+
+def test_from_settings_picks_backend(tmp_path):
+    from dataclasses import replace
+
+    from app.config import settings
+
+    workers = replace(settings, clef_backend="workers-ai", cloudflare_account_id="a")
+    workers = replace(workers, cloudflare_api_token="t")
+    assert isinstance(clef.from_settings(workers), clef.Clef)
+    # 手元: 重みがなければ、どこを見たかを伝える
+    with pytest.raises(clef.ClefError, match="重みがありません"):
+        clef.from_settings(replace(settings, clef_backend="local", clef_model_path=str(tmp_path)))
+    with pytest.raises(clef.ClefError, match="local か workers-ai"):
+        clef.from_settings(replace(settings, clef_backend="gpu"))
+
+
+def test_labels_from_answers_defaults_missing_questions():
+    labels = clef.labels_from_answers({"person": {"noul": 0.1}, "whole": {"noul": 0.9}})
+    assert labels == clef.PhotoLabels(0.1, 0.9)
+    assert labels.kind == "whole"
