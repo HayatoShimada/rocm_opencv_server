@@ -27,6 +27,10 @@ from app.config import settings
 CACHE = Path("data/classify-cache.json")
 # これ未満の確からしさで「単品」と判定したものは補正しない
 MIN_CONFIDENCE = 0.6
+# 単品と判定されても、「着用」「ディテール」の確からしさがこれ以上なら触らない
+# （人が写っている・アップ）
+MAX_WORN_SCORE = 0.2
+MAX_DETAIL_SCORE = 0.3
 CHUNK = 64
 STATUS_LABELS = {"apply": "補正する", "ok": "補正不要", "review": "要確認", "skip": "対象外"}
 THUMB_WIDTH = 300
@@ -72,14 +76,21 @@ def load(client: shopify.Shopify, item: Item) -> tuple[bytes, np.ndarray]:
 
 
 def decide(item: Item, image: np.ndarray) -> None:
+    """補正するのは、壁の前に掛けた単品の縦長の写真だけ。人が写っているもの・商品のアップ・横長は除く。"""
     c = item.classification
     if c.kind != "single":
         item.status, item.reason = "skip", KIND_LABELS[c.kind]
         return
     height, width = image.shape[:2]
     if width >= height:
-        # 店の単品の写真はすべて縦長。横長はディテール（服の一部）とみなす
-        item.status, item.reason = "skip", "横長（単品は縦長）"
+        item.status, item.reason = "skip", "横長"
+        return
+    # 単品と判定されても、人やアップらしさが残る写真は触らない
+    if c.scores.get("worn", 0) >= MAX_WORN_SCORE:
+        item.status, item.reason = "skip", f"人が写っているかもしれない（{c.scores['worn']:.2f}）"
+        return
+    if c.scores.get("detail", 0) >= MAX_DETAIL_SCORE:
+        item.status, item.reason = "skip", f"アップかもしれない（{c.scores['detail']:.2f}）"
         return
     if c.confidence < MIN_CONFIDENCE:
         item.status, item.reason = "review", f"単品か確かでない（{c.confidence:.2f}）"
@@ -169,6 +180,7 @@ small{{color:#666}}.err{{color:#c00}}</style>
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--product", action="append", help="商品のハンドル（省略すると全商品）")
+    parser.add_argument("--type", action="append", help="商品の種類（product_type。例: Shirts）")
     parser.add_argument("--report", default="data/white-balance-report")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-gain", type=float, help=f"ゲインの上限（既定 {wb.GAIN_RANGE[1]}）")
@@ -188,7 +200,9 @@ def main() -> None:
     originals = Path.home() / "85store-shopify-originals" / datetime.date.today().isoformat()
     cache: dict = json.loads(CACHE.read_text()) if CACHE.exists() else {}
 
-    searches = [shopify.product_search(p) for p in args.product] if args.product else [None]
+    searches = [shopify.product_search(p) for p in args.product or []]
+    searches += [f'product_type:"{t}"' for t in args.type or []]
+    searches = searches or [None]
     items = collect(client, searches)
     print(f"{'実行します' if args.apply else '確認だけ（--apply で実行）'}: 画像 {len(items)} 枚")
     classifier: Classifier | None = None
