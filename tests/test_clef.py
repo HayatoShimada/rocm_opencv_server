@@ -113,3 +113,23 @@ def test_labels_from_answers_defaults_missing_questions():
     labels = clef.labels_from_answers({"person": {"noul": 0.1}, "whole": {"noul": 0.9}})
     assert labels == clef.PhotoLabels(0.1, 0.9)
     assert labels.kind == "whole"
+
+
+def test_ask_sends_state_questions_and_images():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        answers = {"q": {"type": "noul", "noul": 0.7}}
+        return httpx.Response(200, json={"success": True, "result": {"answers": answers}})
+
+    client = _client(handler)
+    answers = client.ask(
+        {"query": "冬"}, {"q": {"type": "noul"}}, [(b"\xff\xd8\xff", "image/jpeg")]
+    )
+    assert answers == {"q": {"type": "noul", "noul": 0.7}}
+    assert seen["body"]["state"] == {"query": "冬"}
+    assert seen["body"]["images"] == [{"content_type": "image/jpeg", "base64": "/9j/"}]
+    # 画像が無ければ images は送らない
+    client.ask("文字だけ", {"q": {"type": "noul"}})
+    assert "images" not in seen["body"]
