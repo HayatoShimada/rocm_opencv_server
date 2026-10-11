@@ -8,7 +8,7 @@
 import json
 
 # 質問や渡し方を変えたら上げる（保存してある判定を取り直す）
-VERSION = 1
+VERSION = 2
 TASK = "古着・セレクトショップの商品の属性を判定する（検索と絞り込みに使う）"
 # 説明の長さの上限（文字）。長い説明はここで切る
 DESCRIPTION_LIMIT = 800
@@ -34,15 +34,34 @@ query($after: String, $query: String, $first: Int!) {
 }
 """.replace("DESCRIPTION_LIMIT", str(DESCRIPTION_LIMIT))
 
+# 括弧の前がテイストの名前（レポートに出す）。括弧の中に、含めないものも書く
+# （v1 では、アウトドアの服にミリタリー・ワークが、国内ブランドの普段着にきれいめが付きすぎた）
 TASTES = {
-    "work": "ワーク（作業着・ワークブランド・ダック地・ペインター・カバーオール）",
-    "military": "ミリタリー（軍もの・ミリタリージャケット・カーゴ・迷彩）",
-    "outdoor": "アウトドア（山・キャンプ・フリース・マウンテンパーカー・ナイロン）",
-    "sports": "スポーツ（スウェット・ジャージ・チームもの・カレッジ）",
-    "street": "ストリート（スケート・ヒップホップ・大きなロゴやプリント）",
-    "trad": "トラッド・アイビー（ボタンダウン・ブレザー・オックスフォード・ケーブルニット）",
-    "western": "ウエスタン（ウエスタンシャツ・デニム・カウボーイ）",
-    "dress": "きれいめ（ジャケット・スラックス・シルク・落ち着いた上品な服）",
+    "work": (
+        "ワーク（作業着・ユニフォーム・Carhartt や Dickies などのワークブランド・ダック地・"
+        "ペインターパンツ・カバーオール。山やキャンプ向けの服は含めない）"
+    ),
+    "military": (
+        "ミリタリー（軍の放出品や軍の仕様の服。M-65・ファティーグ・カーゴパンツ・迷彩。"
+        "軍と関係のないアウトドアやワークの服は含めない）"
+    ),
+    "outdoor": (
+        "アウトドア（山・キャンプ・釣り向けの服。フリース・マウンテンパーカー・"
+        "ナイロンジャケット・フィッシングベスト・アウトドアブランド）"
+    ),
+    "sports": "スポーツ（スウェット・ジャージ・チームやカレッジのもの・スポーツブランド）",
+    "street": "ストリート（スケート・ヒップホップ・グラフィックの大きなプリントやロゴ）",
+    "trad": (
+        "トラッド・アイビー（ボタンダウン・ブレザー・チノ・オックスフォード・"
+        "ケーブルやフェアアイルのニット・Brooks Brothers や Ralph Lauren）"
+    ),
+    "western": "ウエスタン（ウエスタンシャツ・ヨーク・スナップボタン・カウボーイ）",
+    "dress": (
+        "きれいめ（テーラードジャケット・スラックス・シルク・カシミヤなど、"
+        "仕事や改まった場にも着られる上品な服。ショートパンツ・イージーパンツ・"
+        "スウェット・Tシャツなどの普段着は含めない）"
+    ),
+    "minimal": "シンプル・ミニマル（無地で飾りの少ない、今のデザインの服。国内ブランドの新品など）",
 }
 
 QUESTIONS = {
@@ -96,7 +115,10 @@ QUESTIONS = {
         },
     },
     **{
-        f"taste_{key}": {"type": "noul", "instructions": f"テイストが当てはまるか: {text}"}
+        f"taste_{key}": {
+            "type": "noul",
+            "instructions": f"このテイストにはっきり当てはまるか: {text}",
+        }
         for key, text in TASTES.items()
     },
     "season": {
@@ -125,6 +147,17 @@ QUESTIONS = {
             "mens": "メンズ",
             "womens": "レディース",
             "unisex": "どちらでも",
+        },
+    },
+    # 「ユーロ古着」「アメリカ古着」で探されるため
+    "origin": {
+        "type": "choice",
+        "instructions": "ブランドや服の系統",
+        "criteria": {
+            "america": "アメリカ（アメリカのブランド・アメリカ古着）",
+            "europe": "ヨーロッパ（ヨーロッパのブランド・軍もの・ユーロ古着）",
+            "japan": "日本（日本のブランド・日本製）",
+            "unknown": "わからない",
         },
     },
 }
@@ -221,3 +254,36 @@ def expected(product: dict) -> dict:
         "color": colors,
         "pattern": patterns or ({"solid", "print"} if names else set()),
     }
+
+
+# 検索に使う属性の文（AI 検索の Worker が、商品の説明に足して Clef に渡す）。
+# 確からしさがこれ以上の答えだけを使う
+SEARCH_THRESHOLD = 0.5
+THICKNESS_LABELS = ["薄手", "ふつうの厚さ", "厚手"]
+SEARCH_SKIP = {("pattern", "other"), ("origin", "unknown"), ("fit", "regular")}
+
+
+def _label(qid: str, choice: str) -> str:
+    return QUESTIONS[qid]["criteria"][choice].split("（")[0]
+
+
+def search_text(answers: dict) -> str:
+    """判定（scripts/shopify_product_attributes.py の answers）を、検索に使う短い文にする。
+
+    例: 「ニット・セーター / ネイビー / 無地 / トラッド・アイビー / 秋冬 / ヨーロッパ / 厚手」
+    """
+    parts = []
+    for qid in ("category", "color", "pattern"):
+        a = answers[qid]
+        if a["confidence"] >= SEARCH_THRESHOLD and (qid, a["choice"]) not in SEARCH_SKIP:
+            parts.append(_label(qid, a["choice"]))
+    tastes = [TASTES[k].split("（")[0] for k in TASTES if answers[f"taste_{k}"] >= SEARCH_THRESHOLD]
+    if tastes:
+        parts.append("、".join(tastes))
+    for qid in ("season", "fit", "gender", "origin"):
+        a = answers[qid]
+        if a["confidence"] >= SEARCH_THRESHOLD and (qid, a["choice"]) not in SEARCH_SKIP:
+            parts.append(_label(qid, a["choice"]))
+    thickness = answers["thickness"]["score"]
+    parts.append(THICKNESS_LABELS[min(2, max(0, round(thickness)))])
+    return " / ".join(parts)

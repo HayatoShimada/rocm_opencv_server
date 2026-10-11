@@ -148,6 +148,22 @@ uv run --env-file .env python -m scripts.shopify_photo_alts --apply  # Shopify �
 - 人が入れた alt と、ほかの商品と共有している画像には触らない。
 - `--apply` では、前の alt を `~/85store-shopify-originals/alts-<日時>.json` に保存する。
 
+## 商品の属性を判定する（Clef・AI 検索の下ごしらえ）
+
+ショップの AI 検索（85store の `cloudflare/product-search`）が使う、商品の属性を Clef で判定する（`app/product_attributes.py`）。商品名・説明・ブランド・素材・実寸と、写真の分類から選んだ「全体・正面」「着用」の2枚を渡す。
+
+- 聞くこと: 種類・色・柄・テイスト（ワーク・ミリタリー・アウトドア・スポーツ・ストリート・トラッド・ウエスタン・きれいめ・シンプル）・季節・厚さ・シルエット・対象・系統（アメリカ・ヨーロッパ・日本）
+- 色・柄と種類は、入力済みの値と比べて正しさを測るため Clef に渡さない。販売中の293点（2026-10）で、種類 95%・色 85%・柄 86% が入力済みの値と一致した。色の外れには、入力済みの値のほうが違うもの（ブラックで登録されたベージュのキャップなど）が含まれる
+- 1点 約2.8秒（手元の GPU）。Shopify には書き込まない
+
+```bash
+# 判定する（data/product-attributes/predictions.json と、確かめるための index.html）
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_product_attributes --sample 30
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_product_attributes --all
+# AI 検索の Worker 用に書き出す（85store の cloudflare/product-search の README を参照）
+uv run --env-file .env python -m scripts.shopify_product_attributes --all --export data/product-attributes/search-attributes.json
+```
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -182,6 +198,7 @@ app/
   whitebalance.py # 単品の写真のホワイトバランスを基準の壁の色に揃える
   classify.py    # 写真の種類を CLIP で判定する
   clef.py        # 写真の区分を Clef（手元の GPU か Workers AI）で判定する
+  product_attributes.py # 商品の属性（AI 検索用）を Clef で判定する質問
   config.py      # 環境変数
 tests/           # API テスト（CPU で動く）
 scripts/bench.py # CPU / OpenCL 比較
@@ -190,6 +207,7 @@ scripts/shopify_white_balance.py # 単品の写真のホワイトバランスを
 scripts/shopify_classify_photos.py # 全商品の画像を Clef で分類する
 scripts/photo_review.py # 分類が正しいかを確かめる画面
 scripts/shopify_photo_alts.py # 写真の区分を付けた alt にする
+scripts/shopify_product_attributes.py # 商品の属性を判定し、AI 検索用に書き出す
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。

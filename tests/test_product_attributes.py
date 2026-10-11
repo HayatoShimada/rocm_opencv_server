@@ -49,3 +49,26 @@ def test_questions_choices_cover_mapped_names():
     assert set(product_attributes.COLOR_NAMES.values()) <= set(q["color"]["criteria"])
     assert set(product_attributes.PATTERN_NAMES.values()) <= set(q["pattern"]["criteria"])
     assert set(product_attributes.CATEGORY_NAMES.values()) <= set(q["category"]["criteria"])
+
+
+def test_search_text_uses_confident_answers():
+    def choice(c, conf=0.9):
+        return {"choice": c, "confidence": conf}
+
+    answers = {
+        "category": choice("sweaters"),
+        "color": choice("navy"),
+        "pattern": choice("solid"),
+        **{f"taste_{k}": 0.1 for k in product_attributes.TASTES},
+        "taste_trad": 0.8,
+        "taste_dress": 0.6,
+        "season": choice("autumn_winter"),
+        "fit": choice("regular"),  # ふつうは書かない
+        "gender": choice("mens", 0.4),  # 確からしさが低いものは書かない
+        "origin": choice("europe"),
+        "thickness": {"score": 1.8, "confidence": 0.7},
+    }
+    assert product_attributes.search_text(answers) == (
+        "ニット・セーター / ネイビー / 無地 / トラッド・アイビー、きれいめ"
+        " / 秋冬 / ヨーロッパ / 厚手"
+    )

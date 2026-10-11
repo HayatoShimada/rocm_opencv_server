@@ -3,7 +3,8 @@
 質問は app/product_attributes.py にある。
 
   uv run --env-file .env --group clip --group clef-local \\
-      python -m scripts.shopify_product_attributes [--sample 30] [--product <ハンドル>]... [--force]
+      python -m scripts.shopify_product_attributes \\
+      [--sample 30 | --all | --product <ハンドル>...] [--force] [--export <PATH>]
 既定は手元の GPU で判定する。CLEF_BACKEND=workers-ai なら Workers AI。
 販売中の商品だけを対象にする。--sample では、種類が偏らないように選ぶ。
 写真は、写真の分類（scripts/shopify_classify_photos.py の data/photo-labels）から
@@ -106,8 +107,15 @@ def summarize(answers: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", type=int, default=30, help="判定する商品の数（既定 30）")
+    parser.add_argument("--all", action="store_true", help="販売中の全商品（--sample より優先）")
     parser.add_argument("--product", action="append", help="商品のハンドル（--sample より優先）")
     parser.add_argument("--force", action="store_true", help="保存してある判定も取り直す")
+    parser.add_argument(
+        "--export",
+        type=Path,
+        metavar="PATH",
+        help="判定せず、販売中の商品の属性を AI 検索の Worker 用の JSON に書き出す",
+    )
     args = parser.parse_args()
 
     client = shopify.Shopify(
@@ -118,9 +126,13 @@ def main() -> None:
             p for h in args.product for p in fetch_products(client, shopify.product_search(h))
         ]
     else:
-        products = sample(fetch_products(client, "status:active"), args.sample)
+        products = fetch_products(client, "status:active")
+        products = products if args.all else sample(products, args.sample)
     photos = json.loads(PHOTO_PREDICTIONS.read_text()) if PHOTO_PREDICTIONS.exists() else {}
     predictions = json.loads(PREDICTIONS.read_text()) if PREDICTIONS.exists() else {}
+    if args.export:
+        export(products, predictions, args.export)
+        return
 
     t0 = time.time()
     model = clef.from_settings(settings)
@@ -177,6 +189,24 @@ def main() -> None:
     print(f"失敗 {failed} 件。レポート: {report.resolve()}")
 
 
+def export(products: list[dict], predictions: dict, path: Path) -> None:
+    """ハンドルごとに、検索に使う属性の文・ブランド・素材を書き出す（85store の
+    cloudflare/product-search が KV の attributes として読む）。判定の無い商品は文を入れない。"""
+    out = {}
+    for product in products:
+        pred = predictions.get(product["id"])
+        item = {
+            "brand": (product.get("brand") or {}).get("value"),
+            "material": (product.get("material") or {}).get("value"),
+        }
+        if pred and pred["key"].startswith(f"{product_attributes.VERSION}|"):
+            item["text"] = product_attributes.search_text(pred["answers"])
+        out[product["handle"]] = item
+    path.write_text(json.dumps(out, ensure_ascii=False))
+    with_text = sum(1 for v in out.values() if "text" in v)
+    print(f"{len(out)} 点（属性あり {with_text} 点）を書き出しました: {path}")
+
+
 def score(rows: list[tuple[dict, dict]]) -> dict[str, tuple[int, int]]:
     """種類・色・柄で、すでに入っている値と合っている数（合った数, 比べた数）。"""
     result = Counter()
@@ -230,7 +260,12 @@ def write_report(rows: list[tuple[dict, dict]]) -> Path:
             if a[f"taste_{k}"] >= 0.3
         ]
         lines.append(f"<tr><th>テイスト</th><td colspan=2>{'・'.join(tastes) or '—'}</td></tr>")
-        for qid, name in (("season", "季節"), ("fit", "シルエット"), ("gender", "対象")):
+        for qid, name in (
+            ("season", "季節"),
+            ("fit", "シルエット"),
+            ("gender", "対象"),
+            ("origin", "系統"),
+        ):
             lines.append(
                 f"<tr><th>{name}</th><td colspan=2>{e(_choice_label(qid, a[qid]['choice']))}"
                 f" <small>{a[qid]['confidence']:.2f}</small></td></tr>"
