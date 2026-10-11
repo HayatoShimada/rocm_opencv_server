@@ -123,12 +123,16 @@ class Clef:
         self._headers = {"Authorization": f"Bearer {api_token}"}
 
     def classify(self, image: bytes, content_type: str) -> PhotoLabels:
-        payload = {
-            "model": self.model,
-            "state": STATE,
-            "questions": QUESTIONS,
-            "images": [{"content_type": content_type, "base64": base64.b64encode(image).decode()}],
-        }
+        return labels_from_answers(self.ask(STATE, QUESTIONS, [(image, content_type)]))
+
+    def ask(self, state, questions: dict, images: list[tuple[bytes, str]] = ()) -> dict:
+        """state と質問を渡して、SystemOne の answers を返す。images は (中身, Content-Type)。"""
+        payload = {"model": self.model, "state": state, "questions": questions}
+        if images:
+            payload["images"] = [
+                {"content_type": content_type, "base64": base64.b64encode(data).decode()}
+                for data, content_type in images
+            ]
         wait = 1.0
         for _ in range(6):
             res = self._http.post(self.url, json=payload, headers=self._headers)
@@ -141,7 +145,7 @@ class Clef:
             if not body.get("success"):
                 errors = " / ".join(e.get("message", "") for e in body.get("errors", []))
                 raise ClefError(f"Workers AI: {res.status_code} {errors}")
-            return labels_from_answers(body["result"]["answers"])
+            return body["result"]["answers"]
         raise ClefError("Workers AI: やり直しても応答がありません")
 
 
@@ -174,13 +178,18 @@ class LocalClef:
         self._lock = threading.Lock()
 
     def classify(self, image: bytes, content_type: str) -> PhotoLabels:
+        return labels_from_answers(self.ask(STATE, QUESTIONS, [(image, content_type)]))
+
+    def ask(self, state, questions: dict, images: list[tuple[bytes, str]] = ()) -> dict:
+        """Clef.ask と同じ。"""
         from PIL import Image
 
-        picture = Image.open(io.BytesIO(image)).convert("RGB")
-        request = {"model": self.model, "state": STATE, "questions": QUESTIONS, "images": [picture]}
+        request = {"model": self.model, "state": state, "questions": questions}
+        if images:
+            request["images"] = [Image.open(io.BytesIO(data)).convert("RGB") for data, _ in images]
         with self._lock:
             response = self._systemone(self._model, self._processor, request)
-        return labels_from_answers(response["answers"])
+        return response["answers"]
 
 
 def from_settings(settings) -> "Clef | LocalClef":
