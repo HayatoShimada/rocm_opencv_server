@@ -54,3 +54,13 @@ url = "https://stable.repo.amd.com/rocm/pytorch/whl-next/"
 [[tool.uv.index]]
 name = "rocm-core"
 url = "https://stable.repo.amd.com/rocm/core/whl-next/"
+
+# AMD の配布には古い Pillow（12.3.0）しか無く、先に見つかるそちらに固定されてしまう。
+# Pillow は既知の脆弱性が多いので、PyPI から最新を取る
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[tool.uv.sources]
+pillow = { index = "pypi" }
