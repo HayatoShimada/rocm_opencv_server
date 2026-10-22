@@ -17,6 +17,13 @@ curl localhost:8000/device   # opencl_enabled: true と GPU 名が出れば OK
 
 コンテナに `/dev/kfd` と `/dev/dri` を渡し、`video` / `render` グループの GID を付けている（`compose.yaml`）。ホスト側のユーザーもこの2グループに入っている必要がある。
 
+ポートはホストの `127.0.0.1:8000` だけで受ける（画像処理のエンドポイントは認証なしのため、LAN には出さない）。tailnet の別マシン（85pi の 85store-cms など）から使うときは、Tailscale で tailnet にだけ転送する。
+
+```bash
+tailscale serve --bg --tcp 8000 tcp://127.0.0.1:8000
+# 呼び出し側: http://home-linux.taila713c8.ts.net:8000
+```
+
 GID の既定値は `video=44` / `render=992`。ホストで `getent group video render` の値が違う場合は `.env` で上書きする。
 
 ```bash

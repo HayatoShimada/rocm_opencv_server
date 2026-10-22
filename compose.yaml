@@ -5,8 +5,10 @@ services:
       args:
         ROCM_IMAGE_TAG: "10.0.0-full"
     image: rocm-opencv-server
+    # 画像処理のエンドポイントは認証なしなので、ホストの 127.0.0.1 だけで受ける。
+    # tailnet には `tailscale serve --bg --tcp 8000 tcp://127.0.0.1:8000` で出す（README 参照）
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     # ROCm コンテナから GPU を使うためのデバイスと権限
     devices:
       - /dev/kfd
