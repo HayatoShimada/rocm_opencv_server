@@ -218,3 +218,16 @@ scripts/shopify_product_attributes.py # 商品の属性を判定し、AI 検索�
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。
+
+## PiCar-X の猫の検出（UDP）
+
+85pi4（PiCar-X、snoo_trucar）から UDP で届くカメラ画像から猫を検出し、箱を返す（`app/snoo.py`）。やりとりの仕様は snoo_trucar の `docs/PROTOCOL.md`（20 バイトのヘッダー + JPEG を受け、JSON を返す）。
+
+- 検出: RT-DETR v2（`PekingU/rtdetr_v2_r18vd`、COCO の cat、Apache-2.0）を GPU で fp16 で動かす。640x480 で受けてから返すまで 11 ms ほど（JPEG の展開込み）、85pi4 からの往復で 21 ms ほど
+- snoo かどうかの判定はまだ無いので、`snoo` は `null` で返す
+- tailscale serve は UDP を通せないので、tailscale の IP で直接受ける（LAN には出さない）
+
+```bash
+uv sync --group clip --group clef-local   # torch（ROCm）と transformers
+uv run python -m app.snoo --host "$(tailscale ip -4)"   # 既定のポートは 8710
+```
