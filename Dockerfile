@@ -1,6 +1,6 @@
 # HIP / PyTorch などへ広げる前提で、ROCm の SDK 一式が入った -full イメージを使う
 ARG ROCM_IMAGE_TAG=10.0.0-full
-FROM rocm/dev-ubuntu-24.04:${ROCM_IMAGE_TAG}
+FROM rocm/dev-ubuntu-24.04:${ROCM_IMAGE_TAG} AS server
 
 # ROCm 10 は OpenCL の ICD を /etc/OpenCL/vendors に登録しないため、自前で登録し、
 # OpenCV には ROCm 付属の ICD ローダーを直接読ませる
@@ -24,3 +24,8 @@ COPY scripts ./scripts
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# PiCar-X の猫の検出（app/snoo.py）。torch（ROCm）と transformers を足す
+FROM server AS snoo
+RUN uv sync --frozen --no-dev --no-install-project --group clip --group clef-local
+CMD ["python", "-m", "app.snoo"]

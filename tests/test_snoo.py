@@ -70,3 +70,13 @@ def test_serve_replies_even_when_jpeg_is_broken():
     client.sendto(_packet(seq=2, jpeg=b"not a jpeg"), ("127.0.0.1", port))
     reply = json.loads(client.recv(65535))
     assert reply["seq"] == 2 and reply["dets"] == []
+
+
+def test_background_boxes_stay_off_the_cat():
+    from scripts.snoo_gallery import _background_boxes, _overlaps
+
+    cat = (0.3, 0.3, 0.7, 0.7)
+    boxes = _background_boxes([cat], np.random.default_rng(0), 6)
+    assert boxes
+    assert not any(_overlaps(b, cat) for b in boxes)
+    assert _overlaps((0.0, 0.0, 0.3, 0.3), cat)  # 猫の箱の外でも、広げた毛の分にかかれば使わない
