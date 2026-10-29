@@ -1,0 +1,26 @@
+# 開発用の上書き（README の「開発の流れ」）。検出サーバー（snoo）のコードを作り直さずに試す。
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d snoo   # 1 回だけ（コンテナを作り直す）
+#   make deploy-detector                                            # 以後は app/ を直すたびにこれ
+#
+# ./app をコンテナの /app/app に読み取り専用で重ねるので、app/ を直したら `docker compose restart snoo`
+# だけで新しいコードで動く（イメージを作り直さない）。torch.compile の準備は torch-compile
+# ボリュームのキャッシュが効くので、起動から「待ち受け」まで約 18 秒（2026-10-29 に測った）。
+# pyproject.toml・uv.lock・Dockerfile を変えたときだけ `docker compose build snoo` が要る。
+# 本番に戻すときは、この上書きを付けずに `docker compose up -d snoo`。
+services:
+  snoo:
+    volumes:
+      - ./app:/app/app:ro
+    # python が PID 1 だと SIGTERM で止まらず、docker は 10 秒待ってから kill する。
+    # init（tini）を挟むと 0.2 秒で止まる
+    init: true
+    environment:
+      # 読み取り専用の app/ に __pycache__ を書こうとしない
+      PYTHONDONTWRITEBYTECODE: "1"
+      # モデルは hf-cache ボリュームにあるので、Hugging Face に問い合わせない（起動が 0.5 秒ほど縮む）。
+      # 新しいモデルを取ってくるときは HF_HUB_OFFLINE=0 で up -d する
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
+      # 速く試したいときは、環境変数を付けて up -d（restart では環境変数は変わらない）:
+      #   SNOO_CLEARANCE=0 … clear_cm を見積もらない（約 16 秒）
+      #   SNOO_COMPILE=0   … torch.compile しない（clear も切って約 9 秒。検出は 1 枚 6 ms ほどに遅くなる）
