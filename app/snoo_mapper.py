@@ -40,6 +40,8 @@ from app.roommap import (
     Grid,
     Plan,
     Pose,
+    camera_of,
+    drive_poses,
     frontiers,
     mark_sonar,
     next_best_view,
@@ -84,6 +86,9 @@ class MapParams:
     # 格子に足す（app/roommap.mark_sonar）。VGGT は白い壁や近すぎる物を見落とすことがあり、
     # 1 回目の実走（explore_20261029_210008）では 3 歩とも超音波で止まった
     ultrasonic_cm: list[float | None] | None = None
+    # 1 歩を「曲がる → まっすぐ」の区間（segments）で返す。Pi が meta の supports に
+    # "segments" を書いたときだけ（古い Pi は 1 本の弧しか走れない）
+    segments: bool = False
 
 
 @dataclass
@@ -455,6 +460,8 @@ class MapResult:
     # 上から見た絵に使う点（間取りの座標、m）と色（BGR）。間引いてある
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.float32))
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
+    # 次の 1 歩で車（カメラの真下）が通る所。上から見た絵に描く（後ろへ戻るときはサーバーが入れる）
+    step_path: list[Pose] = field(default_factory=list)
 
 
 def _cells_with(grid: Grid, x: np.ndarray, y: np.ndarray, min_count: int):
@@ -553,6 +560,10 @@ def build_map(
             keep_cols.append(cols[idx][good[idx]][near][sel])
 
     action, plan = decide(grid, results, params, heights)
+    step_path = []
+    if plan is not None:
+        pieces = plan.segments or [(plan.steer_deg, plan.step_m)]
+        step_path = [camera_of(p) for _, p in drive_poses(results[-1].pose, pieces)]
     return MapResult(
         grid,
         high,
@@ -564,6 +575,7 @@ def build_map(
         params,
         np.concatenate(keep_pts) if keep_pts else np.zeros((0, 3), np.float32),
         np.concatenate(keep_cols) if keep_cols else np.zeros((0, 3), np.uint8),
+        step_path,
     )
 
 
@@ -613,17 +625,25 @@ def decide(
     pose = stations[-1].pose
     if not frontiers(grid.state()).any():
         return {"action": "done", "reason": "no_frontier"}, None
-    plan = next_best_view(grid, pose)
+    plan = next_best_view(grid, pose, segments=params.segments)
     if plan is None:  # 境目はあるが、見えている床を通って行ける所が無い
         return {"action": "done", "reason": "unreachable"}, None
-    return {
+    action = {
         "action": "move",
         "steer_deg": round(plan.steer_deg, 1),
         "speed": SPEED,
         "distance_cm": round(plan.step_m * 100, 1),
         "pose": pose_dict(pose),
         "target": pose_dict(plan.target),
-    }, plan
+    }
+    if params.segments:
+        # 上の steer_deg・distance_cm は最初の区間（segments を知らない Pi でも同じに動く）
+        action["segments"] = segments_json(plan.segments)
+    return action, plan
+
+
+def segments_json(pieces: list[tuple[float, float]]) -> list[dict]:
+    return [{"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1)} for st, m in pieces]
 
 
 # --- 書き出し ---
@@ -704,8 +724,8 @@ def write_outputs(r: MapResult, out: Path) -> None:
 
 def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) -> np.ndarray:
     """上から見た絵。左は格子（白 = 床、黒 = 障害物、青 = 上の層、灰 = 見ていない）に、
-    ステーション（丸と向き）、道のり（緑）、次の位置（赤）を描く。右は点の色を上から
-    見たもの。格子の線は 1 m ごと。
+    ステーション（丸と向き）、道のり（緑）、次の位置（赤）、次の 1 歩（紫）を描く。
+    右は点の色を上から見たもの。格子の線は 1 m ごと。
     """
     g = r.grid
     state = g.state()
@@ -764,6 +784,9 @@ def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) ->
             )
             cv2.circle(canvas, a, 6, (0, 0, 220), 2)
             cv2.arrowedLine(canvas, a, b, (0, 0, 220), 2, tipLength=0.3)
+        if len(r.step_path) > 1:  # 次の 1 歩（Pi が走る所）
+            step = np.array([to_px(p.x, p.y) for p in r.step_path], np.int32)
+            cv2.polylines(canvas, [step], False, (200, 0, 200), 3)
         for i, s in enumerate(r.stations):
             p = s.pose
             a, b = (

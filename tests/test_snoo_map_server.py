@@ -146,6 +146,24 @@ def test_ultrasonic_is_the_median_of_the_station_readings(tmp_path):
     assert ultrasonic_cm(d) is None
 
 
+def test_segments_only_for_a_pi_that_supports_them(tmp_path):
+    old = _client(tmp_path / "old")
+    _post(old, _meta(0))
+    a_old = _post(old, _meta(1, prev_step={"steer_deg": 0, "speed": 12, "seconds": 1.2})).json()
+    assert a_old["action"] == "move"
+    assert "segments" not in a_old and "reverse" not in a_old  # 古い Pi への返事は今までどおり
+
+    new = _client(tmp_path / "new")
+    _post(new, _meta(0, supports=["reverse", "segments"]))
+    m = _meta(1, prev_step={"steer_deg": 0, "speed": 12, "seconds": 1.2})
+    a = _post(new, {**m, "supports": ["reverse", "segments"]}).json()
+    assert a["action"] == "move" and "reverse" not in a
+    segs = a["segments"]
+    assert 1 <= len(segs) <= 3 and sum(x["distance_cm"] for x in segs) <= 40.05
+    assert (a["steer_deg"], a["distance_cm"]) == (segs[0]["steer_deg"], segs[0]["distance_cm"])
+    assert a["target"] == a_old["target"]  # 行き先は同じで、走り方だけが違う
+
+
 def test_station_is_saved(tmp_path):
     c = _client(tmp_path)
     meta = _meta(3)
@@ -182,6 +200,7 @@ def _all_images(m):
         (_set(battery_v="7.8"), _all_images, "battery_v"),
         (_set(camera_height_cm=0), _all_images, "camera_height_cm"),
         (_set(ultrasonic_cm="34"), _all_images, "ultrasonic_cm"),
+        (_set(supports="reverse"), _all_images, "supports"),
         (lambda m: {**m, "frames": m["frames"][-1:]}, _all_images, "止まって撮った"),
         (lambda m: m, lambda m: ["00_pan-035_tilt-15.jpg"], "画像が無い"),
         (lambda m: m, lambda m: _all_images(m) + ["other.jpg"], "frames に無い"),

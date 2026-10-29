@@ -219,6 +219,17 @@ def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
         build_map(stations, refs, ext, points, conf, MapParams(CAM_H, ultrasonic_cm=[1.0]))
 
 
+def test_decide_returns_segments_only_when_asked(result):
+    heights = [CAM_H, CAM_H]
+    a, plan = decide(result.grid, result.stations, MapParams(segments=True), heights)
+    assert a["action"] == "move"
+    segs = a["segments"]
+    assert 1 <= len(segs) <= 3
+    assert (a["steer_deg"], a["distance_cm"]) == (segs[0]["steer_deg"], segs[0]["distance_cm"])
+    assert sum(x["distance_cm"] for x in segs) <= 40.05
+    assert "segments" not in result.action  # 頼まなければ今までどおり
+
+
 def test_decide_stops_on_step_limit_and_bad_registration(result):
     g = result.grid
     st = result.stations

@@ -142,6 +142,11 @@ def parse_meta(text: str | None) -> dict:
         raise BadRequest("camera_height_cm は 0 より大きく 100 以下にする")
     if meta.get("prev_step") is not None and not isinstance(meta["prev_step"], dict):
         raise BadRequest("prev_step はオブジェクトか null にする")
+    sup = meta.get("supports")
+    if sup is not None and (
+        not isinstance(sup, list) or len(sup) > 16 or not all(isinstance(x, str) for x in sup)
+    ):
+        raise BadRequest("supports は文字列のリストにする")
     frames = meta.get("frames")
     if not isinstance(frames, list) or not frames:
         raise BadRequest("meta の frames が無い")
@@ -225,6 +230,11 @@ def load_still(d: Path) -> Station:
     """
     st = load_station(d, "meta.json")
     return Station(st.dir, [f for f in st.frames if not f.get("moving")])
+
+
+def supports(d: Path) -> set[str]:
+    """Pi ができると書いてきたこと（"reverse"・"segments"）。書いていない Pi は今までどおり。"""
+    return set(json.loads((d / "meta.json").read_text()).get("supports") or [])
 
 
 def camera_height_m(d: Path) -> float:
@@ -359,9 +369,11 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     window = choose_window(ids, station_id, poses)
     dirs = [station_dir(session, i) for i in window]
     stations = [load_still(d) for d in dirs]
+    can = supports(dirs[-1])
     params = MapParams(
         camera_height_m=[camera_height_m(d) for d in dirs],
         ultrasonic_cm=[ultrasonic_cm(d) for d in dirs],
+        segments="segments" in can,
     )
     refs = select_frames(stations, MAX_FRAMES)
     rec = reconstruct(refs, session / "vggt.npz", marks)

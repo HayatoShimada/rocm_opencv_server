@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -321,10 +321,18 @@ class Plan:
     path: list[Pose]
     steer_deg: float  # 最初の 1 歩のハンドル（右が +。Pi の steer と同じ向き）
     step_m: float
+    # segments で決めたときの 1 歩の区間 [(ハンドル°, m), ...]。steer_deg・step_m は最初の区間
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
 
-def next_best_view(grid: Grid, pose: Pose, candidates_max: int = 400, rng=None) -> Plan | None:
-    """次に撮りに行く位置と、そこへの最初の 1 歩。行ける所に見るものが無ければ None。"""
+def next_best_view(
+    grid: Grid, pose: Pose, candidates_max: int = 400, rng=None, segments: bool = False
+) -> Plan | None:
+    """次に撮りに行く位置と、そこへの最初の 1 歩。行ける所に見るものが無ければ None。
+
+    segments なら、1 歩を「曲がる → まっすぐ」の区間に分ける（turn_then_straight）。
+    分けられない候補（Dubins 経路が曲がる・曲がる・曲がるの形など）は、今までの 1 本の弧にする。
+    """
     rng = rng or np.random.default_rng(0)
     state = grid.state()
     occupied = state == OCCUPIED
@@ -375,11 +383,16 @@ def next_best_view(grid: Grid, pose: Pose, candidates_max: int = 400, rng=None) 
         path = sample_path(pose, kind, segs)
         if not path_is_clear(grid, blocked, path):
             continue
-        steer, step = first_step(grid, blocked, pose, path, length)
-        if step <= 0:
-            continue
+        pieces = turn_then_straight(grid, blocked, pose, target) if segments else []
+        if pieces:
+            steer, step = pieces[0]
+        else:
+            steer, step = first_step(grid, blocked, pose, path, length)
+            if step <= 0:
+                continue
+            pieces = [(steer, step)] if segments else []
         best_utility = utility
-        best = Plan(target, gain, length, path, steer, step)
+        best = Plan(target, gain, length, path, steer, step, pieces)
     return best
 
 
@@ -421,3 +434,104 @@ def first_step(
         return 0.0, 0.0
     steer = -math.degrees(math.atan(WHEELBASE_M * curvature))
     return steer, min(run, clear)
+
+
+# --- 曲がってから、まっすぐ走る（Pi が segments を受けるとき） ---
+
+# まっすぐの区間のハンドルはこれより小さくする（Pi の clear_cm は、ハンドルが小さいときだけ
+# 通り道の帯がカメラの画角 54° に収まって測れる。1 回目の実走では 1 歩がみな大きな弧で、
+# 241 回とも画角の外だった）
+STRAIGHT_STEER_DEG = 8.0
+# 曲がる区間がこれより短ければ省く（向きのずれは 0.02 / 0.26 rad = 4° ほど）
+MIN_TURN_M = 0.02
+# 1 歩がこれより短ければ走らない
+MIN_STEP_M = 0.05
+# Pi が 1 回に受ける区間の数の上限
+MAX_SEGMENTS = 3
+# 車の外形の真ん中（後ろの車軸から前へ）。ぶつかるかは、ここが広げた障害物に入るかで見る
+CAR_CENTER_M = (CAR_FRONT_M + CAR_REAR_M) / 2
+
+
+def turn_steer(direction: str) -> float:
+    """最小の回転半径で曲がるハンドル角（右が +）。direction は 'L' か 'R'。"""
+    deg = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    return -deg if direction == "L" else deg
+
+
+def drive_poses(
+    start: Pose, pieces: list[tuple[float, float]], reverse: bool = False, step: float = 0.01
+) -> list[tuple[float, Pose]]:
+    """カメラの真下が start の車が、区間 [(ハンドル°, m), ...] を順に走ったときの
+    (走った長さ, 後ろの車軸の姿勢) の列（step m ごと）。reverse なら後ろへ走る。
+    """
+    r = rear_axle(start)
+    x, y, yaw = r.x, r.y, r.yaw
+    out = [(0.0, Pose(x, y, yaw))]
+    done = 0.0
+    sign = -1.0 if reverse else 1.0
+    for steer, length in pieces:
+        n = max(1, int(math.ceil(length / step)))
+        for _ in range(n):
+            x, y, yaw = arc(x, y, yaw, steer, sign * length / n)
+            done += length / n
+            out.append((done, Pose(x, y, yaw)))
+    return out
+
+
+def take(pieces: list[tuple[float, float]], total: float) -> list[tuple[float, float]]:
+    """区間の頭から total m だけ（足りなければ最後の区間を伸ばす）。"""
+    out: list[tuple[float, float]] = []
+    left = total
+    for i, (steer, length) in enumerate(pieces):
+        if left <= 1e-9:
+            break
+        use = left if i == len(pieces) - 1 else min(length, left)
+        out.append((steer, use))
+        left -= use
+    return out
+
+
+def clip_pieces(
+    grid: Grid, blocked: np.ndarray, start: Pose, pieces: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """区間を自転車モデルで走らせ、車の真ん中が blocked に入る手前までに縮める。
+    MIN_STEP_M も進めなければ空。
+    """
+    clear = 0.0
+    for done, r in drive_poses(start, pieces)[1:]:
+        ix, iy = grid.cell(
+            r.x + CAR_CENTER_M * math.cos(r.yaw), r.y + CAR_CENTER_M * math.sin(r.yaw)
+        )
+        if not grid.inside(ix, iy) or blocked[ix, iy]:
+            break
+        clear = done
+    if clear < MIN_STEP_M:
+        return []
+    out = take(pieces, min(clear, sum(m for _, m in pieces)))
+    return [(st, m) for st, m in out if m >= 0.005]
+
+
+def turn_then_straight(
+    grid: Grid, blocked: np.ndarray, pose: Pose, target: Pose, max_m: float = MAX_STEP_M
+) -> list[tuple[float, float]]:
+    """target へ向かう 1 歩を、最小の回転半径の曲がり（要る分だけ）→ まっすぐ、の区間にする。
+
+    後ろの車軸どうしの Dubins 経路（最小半径 TURN_RADIUS_M）の、最初の曲がりとその後の直線を
+    そのまま使う。曲がりの長さは、直線が次の位置のほうを向くまでの分だけになる。
+    最後の曲がりは使わない（次のステーションで撮って決め直す）。直線の無い形（RLR・LRL）は
+    分けられないので空を返す。区間は自転車モデルで走らせて blocked に当て、ぶつかる手前までにする。
+    """
+    route = dubins(rear_axle(pose), rear_axle(target))
+    if route is None or route[1][1] != "S":
+        return []
+    _, kind, segs = route
+    pieces = []
+    if segs[0] * TURN_RADIUS_M >= MIN_TURN_M:
+        pieces.append((turn_steer(kind[0]), segs[0] * TURN_RADIUS_M))
+    if segs[1] * TURN_RADIUS_M > 0:
+        pieces.append((0.0, segs[1] * TURN_RADIUS_M))
+    total = sum(m for _, m in pieces)
+    if total <= 0:
+        return []
+    pieces = take(pieces, min(max_m, total))
+    return clip_pieces(grid, blocked, pose, pieces)

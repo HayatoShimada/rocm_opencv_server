@@ -4,17 +4,25 @@ import numpy as np
 import pytest
 
 from app.roommap import (
+    CAR_CENTER_M,
     FREE,
+    MAX_STEP_M,
     OCCUPIED,
     SONAR_AHEAD_M,
+    STRAIGHT_STEER_DEG,
     UNKNOWN,
+    WHEELBASE_M,
     Grid,
     Pose,
+    camera_of,
+    drive_poses,
     dubins,
     frontiers,
+    inflate,
     mark_sonar,
     next_best_view,
     sample_path,
+    turn_then_straight,
     view_gain,
 )
 
@@ -150,3 +158,63 @@ def test_sonar_floor_does_not_erase_an_obstacle_the_camera_saw():
     for _ in range(5):
         mark_sonar(g, Pose(0.0, 0.0, 0.0), 1.0)
     assert g.state()[g.cell(0.30, 0.0)] == OCCUPIED
+
+
+def _open_floor(size_m: float = 6.0) -> tuple[Grid, np.ndarray]:
+    g = Grid(size_m=size_m)
+    xs = np.arange(-2.0, 2.0, 0.025)
+    gx, gy = np.meshgrid(xs, xs)
+    g.mark_free(gx.ravel(), gy.ravel())
+    return g, g.state() != FREE
+
+
+def test_segments_turn_only_as_much_as_needed_then_go_straight():
+    g, blocked = _open_floor()
+    # 右前（-y）の、右を向いた位置へ：右に最小半径で曲がり、まっすぐ
+    pieces = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(0.9, -0.6, -math.pi / 2))
+    assert len(pieces) == 2
+    (turn, turn_m), (straight, straight_m) = pieces
+    assert turn == pytest.approx(math.degrees(math.atan(WHEELBASE_M / 0.26)))  # 右が +
+    assert abs(straight) < STRAIGHT_STEER_DEG
+    assert sum(m for _, m in pieces) == pytest.approx(MAX_STEP_M)
+    # 曲がった後は、次の位置のほうへ向いている（そのまま直線で近づく）
+    end = camera_of(drive_poses(Pose(0, 0, 0), pieces[:1])[-1][1])
+    to_goal = math.atan2(-0.6 - end.y, 0.9 - end.x)
+    assert 0.05 < turn_m < 0.30
+    assert abs(math.remainder(end.yaw - to_goal, 2 * math.pi)) < math.radians(25)
+
+
+def test_segments_go_straight_when_the_target_is_ahead():
+    g, blocked = _open_floor()
+    pieces = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(1.0, 0, 0))
+    assert pieces == [(0.0, pytest.approx(MAX_STEP_M))]
+
+
+def test_segments_stop_before_an_obstacle():
+    g, _ = _open_floor()
+    wall = np.arange(-1.0, 1.0, 0.02)
+    g.mark_occupied(np.full_like(wall, 0.55), wall)
+    for _ in range(3):  # 床と重なったセルも障害物にする
+        g.mark_occupied(np.full_like(wall, 0.55), wall)
+    s = g.state()
+    blocked = inflate(s == OCCUPIED, 4) | (s != FREE)
+    pieces = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(1.2, 0, 0))
+    total = sum(m for _, m in pieces)
+    assert 0.05 <= total < MAX_STEP_M
+    for _, r in drive_poses(Pose(0, 0, 0), pieces):  # 車の真ん中は広げた障害物に入らない
+        c = g.cell(r.x + CAR_CENTER_M * math.cos(r.yaw), r.y + CAR_CENTER_M * math.sin(r.yaw))
+        assert not blocked[c]
+
+
+def test_next_best_view_with_segments_keeps_the_first_segment_on_top():
+    g = _room()
+    plan = next_best_view(g, Pose(0, 0, 0), segments=True)
+    assert plan is not None and plan.segments
+    assert (plan.steer_deg, plan.step_m) == plan.segments[0]
+    assert 0.05 <= sum(m for _, m in plan.segments) <= MAX_STEP_M + 1e-9
+    assert len(plan.segments) <= 2
+    if len(plan.segments) == 2:
+        assert abs(plan.segments[1][0]) < STRAIGHT_STEER_DEG
+    # segments を頼まなければ今までどおり（区間は無い）
+    old = next_best_view(g, Pose(0, 0, 0))
+    assert old.segments == [] and old.target == plan.target
