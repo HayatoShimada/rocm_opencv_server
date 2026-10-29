@@ -111,12 +111,20 @@ def make_pool(workers: int):
     return pool
 
 
-def gpu_users() -> list[int]:
-    """GPU（/dev/kfd）を開いているプロセスの番号（自分を除く）。"""
+def gpu_users(allow: tuple[int, ...] = ()) -> list[int]:
+    """GPU（/dev/kfd）を開いているプロセスの番号（自分と allow を除く）。"""
     root = Path("/sys/class/kfd/kfd/proc")
     if not root.is_dir():
         return []
-    return [int(p.name) for p in root.iterdir() if p.name.isdigit() and int(p.name) != os.getpid()]
+    skip = {os.getpid(), *allow}
+    return [int(p.name) for p in root.iterdir() if p.name.isdigit() and int(p.name) not in skip]
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()[:80]
+    except OSError:
+        return "?"
 
 
 def collect(pool, jobs: list[tuple]) -> list[dict] | None:
@@ -317,6 +325,10 @@ def main() -> None:
     parser.add_argument("--eval-homes", type=int, default=36)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--gpu-allow", type=int, nargs="*", default=[],
+        help="GPU を開いていても待たないプロセスの番号（ずっと動いている画像のサーバーなど）",
+    )  # fmt: skip
+    parser.add_argument(
         "--gpu-wait-min", type=float, help="ほかが GPU を使っていたら、この分だけ待って CPU で学ぶ"
         "（既定は空くまで待つ）",
     )  # fmt: skip
@@ -338,8 +350,10 @@ def main() -> None:
 
 def run(args, pool) -> None:
     if args.device.startswith("cuda"):
+        for pid in args.gpu_allow:
+            log(f"GPU を使っているが待たないプロセス: {pid} {_cmdline(pid)}")
         waited = 0.0
-        while gpu_users() and not _stop:
+        while gpu_users(tuple(args.gpu_allow)) and not _stop:
             if args.gpu_wait_min is not None and waited >= args.gpu_wait_min * 60:
                 log(f"GPU が {args.gpu_wait_min} 分空かないので CPU で学ぶ（{gpu_users()}）")
                 args.device = "cpu"
@@ -354,6 +368,8 @@ def run(args, pool) -> None:
     from app.snoo_explore_policy import HIDDEN, N_FEATURES
 
     want_cuda = args.device.startswith("cuda")
+    # cpu なら torch.cuda に触らない（is_available だけでも /dev/kfd を開き、GPU を握る
+    # プロセスに数えられる）
     device = torch.device(args.device if not want_cuda or torch.cuda.is_available() else "cpu")
     if device.type != args.device.split(":")[0]:
         log(f"{args.device} が使えないので {device} で学ぶ")
@@ -393,12 +409,18 @@ def run(args, pool) -> None:
         if eps is None:
             break
         t_roll = time.time() - t0
+        t1 = time.time()
         b = batch_tensors(torch, eps, args.gamma, args.lam, device)
         stats = (
             bc_update(torch, pi, v, opt, b, args.bc_epochs, args.minibatch)
             if bc
             else ppo_update(torch, pi, v, opt, b, args)
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        # 重みを直すのにかかった秒（cpu と cuda を比べるため。周の数 × epochs を秒で割ったものも）
+        stats["update_s"] = round(time.time() - t1, 2)
+        stats["samples_per_s"] = round(len(b["act"]) * args.epochs / max(stats["update_s"], 1e-3))
         state["iteration"] += 1
         state["episodes"] += len(eps)
         state["wall_s"] = wall0 + time.time() - t_start
