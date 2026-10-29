@@ -410,13 +410,42 @@ class VggtReconstruct:
         self.model = None
         self.idle_s = idle_s
         self.last_used = time.monotonic()
+        # 受けている途中のリクエストの数と、終えると決めたか（self._lock で守る）。
+        # 受けてから VGGT を呼ぶまでの間（画像を調べる・保存・GPU を待つ）に終えて切らないため
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self._exiting = False
         if idle_s > 0:
             threading.Thread(target=self._watch_idle, daemon=True, name="vggt-idle").start()
+
+    def enter(self) -> bool:
+        """リクエストを受け始める。
+
+        終えると決めた後なら False（503 を返す。Pi は自分で 1 歩動く）。
+        """
+        with self._lock:
+            if self._exiting:
+                return False
+            self._in_flight += 1
+            self.last_used = time.monotonic()
+            return True
+
+    def leave(self) -> None:
+        with self._lock:
+            self._in_flight -= 1
+            self.last_used = time.monotonic()
+
+    def _should_exit(self) -> bool:
+        with self._lock:
+            idle = time.monotonic() - self.last_used > self.idle_s
+            if self.model is not None and idle and self._in_flight == 0:
+                self._exiting = True
+            return self._exiting
 
     def _watch_idle(self) -> None:
         while True:
             time.sleep(5)
-            if self.model is not None and time.monotonic() - self.last_used > self.idle_s:
+            if self._should_exit():
                 log.info("VGGT を %.0f 秒使っていないので、終えて GPU を手放す", self.idle_s)
                 logging.shutdown()
                 os._exit(0)
@@ -837,6 +866,17 @@ def create_app(
         images: Annotated[list[UploadFile] | None, File()] = None,
     ):
         t0 = time.perf_counter()
+        enter = getattr(reconstruct, "enter", None)
+        if enter is not None and not enter():
+            raise HTTPException(503, "GPU を手放して終えるところ（すぐ起動し直す）")
+        try:
+            return handle(meta, images, t0)
+        finally:
+            leave = getattr(reconstruct, "leave", None)
+            if leave is not None:
+                leave()
+
+    def handle(meta, images, t0: float) -> dict:
         try:
             m = parse_meta(meta)
             files = read_images(images, m)
@@ -844,21 +884,22 @@ def create_app(
             raise HTTPException(400, str(e)) from e
         session = root / m["session_id"]
         sid = m["station_id"]
-        save_station(session, sid, m, files)
-        marks = {"save": time.perf_counter() - t0}
-
-        battery = m.get("battery_v")
-        # 0 V 以下は読めなかった（2 回目の実走の最後で 0.0 が来た）ので、電池切れにしない
-        if battery is not None and 0 < battery < LOW_BATTERY_V:
-            log.info("%s/%03d: 電池が %.2f V なのでやめる", session.name, sid, battery)
-            return {"action": "done", "reason": "low_battery"}
-        if len(station_ids(session)) >= MAX_STATIONS:
-            log.info("%s/%03d: %d か所を超えたのでやめる", session.name, sid, MAX_STATIONS)
-            return {"action": "done", "reason": "step_limit"}
-
         t = time.perf_counter()
+        # 保存も GPU のロックの中でする。Pi が同じ station_id を送り直したとき、前のリクエストが
+        # 読んでいる置き場を消して 500 にしていた（コードレビュー）
         with gpu:
-            marks["wait"] = time.perf_counter() - t
+            marks = {"wait": time.perf_counter() - t}
+            save_station(session, sid, m, files)
+            marks["save"] = time.perf_counter() - t0 - marks["wait"]
+
+            battery = m.get("battery_v")
+            # 0 V 以下は読めなかった（2 回目の実走の最後で 0.0 が来た）ので、電池切れにしない
+            if battery is not None and 0 < battery < LOW_BATTERY_V:
+                log.info("%s/%03d: 電池が %.2f V なのでやめる", session.name, sid, battery)
+                return {"action": "done", "reason": "low_battery"}
+            if len(station_ids(session)) >= MAX_STATIONS:
+                log.info("%s/%03d: %d か所を超えたのでやめる", session.name, sid, MAX_STATIONS)
+                return {"action": "done", "reason": "step_limit"}
             try:
                 action = plan_station(session, sid, reconstruct, marks)
             except Exception as e:
