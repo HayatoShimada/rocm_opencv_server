@@ -58,7 +58,7 @@ class MapParams:
     # 床からカメラの中心まで。ステーションごとに変えてもよい。None のステーションは
     # 大きさを決めるのに使わず、ほかのステーションで決めた大きさで高さを測る
     # （机の上から撮ったときなど）
-    camera_height_m: float | list[float | None] = 0.10
+    camera_height_m: float | list[float | None] = 0.08  # SD カード 2.5 枚分と測った
     car_height_m: float = 0.12
     floor_tol_m: float = 0.02  # 床と見る高さの幅（±）
     obstacle_margin_m: float = 0.03  # 車の高さに足す余裕

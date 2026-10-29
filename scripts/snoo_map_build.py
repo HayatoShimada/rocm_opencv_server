@@ -1,6 +1,6 @@
 """PiCar-X の撮影（ステーション）から間取りを作り、次の 1 歩を決める（app/snoo_mapper.py）。
 
-  python -m scripts.snoo_map_build <ステーションの置き場...> --camera-height-cm 10 --out <出力先>
+  python -m scripts.snoo_map_build <ステーションの置き場...> --camera-height-cm 8 --out <出力先>
 置き場は撮った順に並べる（最初のステーションが原点と x の向きになり、最後のステーション
 から次の 1 歩を出す）。VGGT は GPU で 1 回だけ回し、出力を <出力先>/vggt.npz に残す。
 --vggt でそれを（または前に作ったものを）渡せば GPU を使わずに作り直せる。

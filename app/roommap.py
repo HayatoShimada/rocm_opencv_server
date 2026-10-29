@@ -23,9 +23,10 @@ UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 RES_M = 0.05
 # 車の外形（約 26x19 cm）を囲む円の半径と余裕
 CAR_RADIUS_M = 0.17
-# 最小の回転半径（ホイールベース 9.5 cm、ハンドル ±30° で 16.5 cm。余裕を見る）
-TURN_RADIUS_M = 0.22
-WHEELBASE_M = 0.095
+# 最小の回転半径。ホイールベースは PiCar-X の目安の 13.5〜14 cm（実測していない）。
+# ハンドル ±30° で 13.75 / tan 30° = 23.8 cm なので、余裕を見て 26 cm
+TURN_RADIUS_M = 0.26
+WHEELBASE_M = 0.1375
 # 1 回の撮影で見える範囲：画角 54° の半分 + パン ±35°
 HALF_VIEW_DEG = 62.0
 VIEW_RANGE_M = 2.0
