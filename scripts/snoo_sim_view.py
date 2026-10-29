@@ -61,7 +61,7 @@ def main() -> None:
         "--backtrack",
         type=int,
         default=0,
-        help="行き場が無いとき来た道を戻って撮り直す回数（Pi の reverse。サーバーは 2）",
+        help="1 なら、行き場が無いとき地図のサーバーと同じに後ろへ下がる（Pi の reverse）",
     )
     parser.add_argument("--sonar", action="store_true", help="前の超音波を格子に足す")
     parser.add_argument("--segments", action="store_true", help="1 歩を曲がる → まっすぐで走る")

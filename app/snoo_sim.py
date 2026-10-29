@@ -25,6 +25,7 @@ yaw は左回りが +（app/roommap.py と同じ）。車の姿勢は後ろの�
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -40,8 +41,9 @@ from app.roommap import (
     CAR_FRONT_M,
     CAR_REAR_M,
     FREE,
-    MAX_SEGMENTS,
+    FREE_HIT,
     OCCUPIED,
+    OCCUPIED_HIT,
     REVERSE_MAX_M,
     SONAR_HALF_DEG,
     SONAR_RANGE_M,
@@ -54,9 +56,19 @@ from app.roommap import (
     arc,
     consume,
     mark_sonar,
-    retrace,
 )
-from app.snoo_mapper import MapParams, StationResult, decide
+from app.snoo_mapper import (
+    CLUSTER_STATIONS,
+    RECENT_STATIONS,
+    History,
+    MapParams,
+    StationResult,
+    choose_window,
+    clustered,
+    decide,
+    reverse_action,
+    reverse_step,
+)
 
 # GL の選び方は mujoco を読み込む前に決める（画面の無いマシンでも描けるよう EGL にする）
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -86,14 +98,32 @@ SCAN_PANS = tuple(range(-35, 36, 10))
 SCAN_TILTS = (-15, 0, 15)
 # 1 コマ撮る間に進む時間（サーボを回して止まるまで。測っていない）
 SCAN_FRAME_S = 0.4
+
+
+@dataclass(frozen=True)
+class Pace:
+    """1 周（撮る → 地図を直す → 走る）の撮り方と時間。Sim.t を実機の時計に合わせるため。
+
+    既定は前のシミュレーター（24 コマ × 0.4 秒、地図 3 秒）。REAL_PACE は 3 回目の実走
+    （explore_20261029_223944）：チルト -15・0 × パン -30〜30 を 15° おきの 10 コマを
+    1.44 秒おきに撮り（1 か所 14.4 秒）、地図のサーバーは平均 11 秒で返した。走る時間は
+    速さから出す（speed 12 で 20 cm/s。実走の prev_step の seconds と合う）。
+    """
+
+    pans: tuple[float, ...] = SCAN_PANS
+    tilts: tuple[float, ...] = SCAN_TILTS
+    hold_s: float = SCAN_FRAME_S  # 1 コマにかかる時間（首を回して止まるまで）
+    server_s: float = 3.0  # 撮り終えてから返事が来るまで（送る・VGGT・間取り）
+
+
+REAL_PACE = Pace(tuple(range(-30, 31, 15)), (-15, 0), 1.44, 11.0)
 # 走るときの首の向き。通り道の手前が映るよう少し下を向く（Pi の値は決まっていない）
 DRIVE_TILT_DEG = -15.0
 # 通り道（clear_cm）の帯：車の幅の両脇に足す余裕と、先を見る長さ（app/clearance.py と同じ）
 CORRIDOR_MARGIN_M = 0.02
 CLEAR_MAX_M = 1.0
-# 行き場が無いときに来た道を戻る長さと速さ（explore の backtrack。地図のサーバーの reverse と同じ）
+# 行き場が無いときに来た道を戻る長さ（地図のサーバーの reverse と同じ）
 BACKTRACK_M = REVERSE_MAX_M
-SPEED_BACK = 12
 # 走っている間、前がこれより近くまでふさがったら止まる（Pi が clear_cm を見て止まる代わり）
 STOP_CLEAR_M = 0.05
 
@@ -258,13 +288,22 @@ def _pose(d: dict) -> Pose:
     return Pose(float(d["x"]), float(d["y"]), math.radians(float(d["yaw_deg"])))
 
 
-def room_from_map(path: str | Path, high_board_m: float = 0.40, margin_m: float = 0.5) -> Room:
+def room_from_map(
+    path: str | Path,
+    high_board_m: float = 0.40,
+    margin_m: float = 0.5,
+    unseen_floor: bool = False,
+) -> Room:
     """間取り（app/snoo_mapper.py の room.json・grid.png・high.png）から部屋を作る。
 
     - ふさがったセル：高さ「車の高さ + 余裕」（room.json の min_height_m）の箱
     - 上の層のセル：高さ high_board_m の薄い板（間取りは高さを持たないので決め打ち）
     - 見ていないセル：床を暗くする（光線が当たっても床とは言わない）
     隣り合うセルは長方形にまとめる。
+
+    unseen_floor なら、見ていないセルも床にし、まわり（見た所 + margin_m）を壁で囲む。
+    実走の間取りは窓の中だけで狭い（3 回目の実走で床 1.4 m²）ので、探る速さを比べるときは
+    「見た障害物はそのまま、見ていない所は床が続く部屋」にする。
     """
     room, state, high, grid, _ = load_map(path)
     top = float(room["layers"]["high"]["legend"].get("min_height_m", 0.15))
@@ -294,16 +333,28 @@ def room_from_map(path: str | Path, high_board_m: float = 0.40, margin_m: float 
         blocks.append(
             _box(x0, y0, x1, y1, high_board_m, high_board_m + 0.02, (0.4, 0.55, 0.8, 0.9), f"hi{k}")
         )
-    dim = [rect_xy(r) for r in merge_cells(sub == UNKNOWN)]
     stations = [_pose(s["pose"]) for s in room.get("stations", [])]
     x0, y0, x1, y1 = rect_xy((0, i1 - i0, 0, j1 - j0))
+    if unseen_floor:
+        dim, floor_ok = [], np.zeros_like(state, bool)
+        floor_ok[i0:i1, j0:j1] = sub != OCCUPIED
+        wall, t, h = (0.86, 0.84, 0.80, 1.0), 0.05, 0.5
+        blocks += [
+            _box(x0 - t, y0 - t, x1 + t, y0, 0, h, wall, "wall_s"),
+            _box(x0 - t, y1, x1 + t, y1 + t, 0, h, wall, "wall_n"),
+            _box(x0 - t, y0, x0, y1, 0, h, wall, "wall_w"),
+            _box(x1, y0, x1 + t, y1, 0, h, wall, "wall_e"),
+        ]
+    else:
+        dim = [rect_xy(r) for r in merge_cells(sub == UNKNOWN)]
+        floor_ok = state == FREE
     return Room(
         blocks,
         (x0, y0, x1, y1),
         start=stations[-1] if stations else _pose(room["start_pose"]),
-        floor_ok=state == FREE,
+        floor_ok=floor_ok,
         dim=dim,
-        name=Path(path).name,
+        name=Path(path).name + ("_open" if unseen_floor else ""),
         source_state=state,
         source_high=high,
         source_stations=stations,
@@ -720,6 +771,20 @@ class ScanHits:
     kind: np.ndarray  # (N,)
 
 
+@dataclass
+class StationObs:
+    """1 ステーションで見たもの（格子のセル (K, 2)）と、そのときの超音波。
+    地図のサーバーの窓（WINDOW か所だけで間取りを作る）をまねるとき、選んだステーションの分だけ
+    足し直す。
+    """
+
+    free: np.ndarray
+    occupied: np.ndarray
+    high: np.ndarray
+    sonar_m: float | None
+    pose: Pose
+
+
 # --- シミュレーター ---
 
 
@@ -735,6 +800,11 @@ class Summary:
     reverses: int
     distance_m: float
     reason: str
+    # 時間（実機の時計。Pace で決める）と、調べた床の広さ
+    t_s: float = 0.0
+    covered_m2: float = 0.0  # 本当の床のうち、床と分かった広さ
+    m2_per_min: float = 0.0
+    m2_per_m: float = 0.0  # 走った 1 m あたり
 
 
 class Sim:
@@ -748,8 +818,13 @@ class Sim:
         params: MapParams | None = None,
         seed: int = 0,
         sonar_map: bool = False,
+        pace: Pace | None = None,
+        window: int | None = None,
     ):
         self.room = room
+        self.pace = pace or Pace()
+        # 地図のサーバーの窓（int なら、その数のステーションだけで間取りを作る。None は全部）
+        self.window = window
         self.xml = build_mjcf(room)
         self.model = mujoco.MjModel.from_xml_string(self.xml)
         self.data = mujoco.MjData(self.model)
@@ -759,6 +834,11 @@ class Sim:
         self.sonar_map = sonar_map
         # 前へ走った道（走った順の区間 (ハンドル°, m)）。行き場が無いときに戻るのに使う
         self.driven: list[tuple[float, float]] = []
+        self.backs = 0  # 続けて後ろへ戻った回数
+        self.arrived_reverse: list[bool] = []  # ステーションごとの、後ろへ戻って着いたか
+        self._reversed = False
+        self.obs: list[StationObs] = []
+        self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
         if snoo is None:
@@ -985,25 +1065,48 @@ class Sim:
         外れないので 1 点で使う。
         """
         g = self.grid
+        empty = np.zeros((0, 2), int)
+        cells = {0: empty, 1: empty, 2: empty}
         if self.station_hits:
             p = np.concatenate([h.points for h in self.station_hits])
             k = np.concatenate([h.kind for h in self.station_hits])
-            g.mark_free(p[k == 0, 0], p[k == 0, 1])
-            g.mark_occupied(p[k == 1, 0], p[k == 1, 1])
-            hx, hy = g.cell(p[k == 2, 0], p[k == 2, 1])
-            ok = g.inside(hx, hy)
-            cells = np.unique(np.stack([hx[ok], hy[ok]], 1), axis=0)
-            if len(cells):
-                self.high[cells[:, 0], cells[:, 1]] += 1
+            for kind in cells:
+                ix, iy = g.cell(p[k == kind, 0], p[k == kind, 1])
+                ok = g.inside(ix, iy)
+                cells[kind] = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0).reshape(-1, 2)
         frames = len(self.station_hits)
         self.station_hits = []
-        if self.sonar_map:
-            mark_sonar(g, self.car.camera_pose(), self.sonar_m)
-        st = StationResult(
-            f"sim{len(self.stations):03d}", self.car.camera_pose(), CAM_H_M, 0.0, frames
-        )
+        pose = self.car.camera_pose()
+        self.obs.append(StationObs(cells[0], cells[1], cells[2], self.sonar_m, pose))
+        st = StationResult(f"sim{len(self.stations):03d}", pose, CAM_H_M, 0.0, frames)
         self.stations.append(st)
+        self.arrived_reverse.append(self._reversed)
+        self._reversed = False
+        self.rebuild_map()
         return st
+
+    def rebuild_map(self) -> None:
+        """ステーションごとに見たものから格子を作り直す（窓があれば窓の中のステーションだけ）。
+        足し方は Grid.mark_free・mark_occupied と同じ（1 回の撮影で 1 セル 1 回）。
+        """
+        ids = list(range(len(self.obs)))
+        if self.window and ids:
+            poses = {i: o.pose for i, o in enumerate(self.obs)}
+            ids = choose_window(ids, ids[-1], poses, self.window)
+        g = Grid(size_m=self.grid.n * self.grid.res, res=self.grid.res)
+        g.origin = self.grid.origin
+        high = np.zeros_like(g.logodds, np.int32)
+        for i in ids:
+            o = self.obs[i]
+            for c, v in ((o.free, FREE_HIT), (o.occupied, OCCUPIED_HIT)):
+                if len(c):
+                    g.logodds[c[:, 0], c[:, 1]] += v
+                    np.clip(g.logodds, -4, 4, out=g.logodds)
+            if len(o.high):
+                high[o.high[:, 0], o.high[:, 1]] += 1
+            if self.sonar_map:
+                mark_sonar(g, o.pose, o.sonar_m)
+        self.grid, self.high = g, high
 
     def truth_floor(self) -> np.ndarray:
         """本当の床（部屋の中で、車の高さより低い物の無いセル）。調べた割合を出すのに使う。"""
@@ -1021,6 +1124,7 @@ class Sim:
         s = self.grid.state()
         cell = self.grid.res**2
         truth = self.truth_floor()
+        covered = float(((s == FREE) & truth).sum() * cell)
         return Summary(
             self.cycle,
             len(self.stations),
@@ -1032,6 +1136,10 @@ class Sim:
             self.reverses,
             round(self.distance_m, 2),
             reason or str(self.action.get("reason", self.action.get("action", ""))),
+            round(self.t, 1),
+            round(covered, 3),
+            round(covered / max(self.t / 60, 1e-9), 3),
+            round(covered / max(self.distance_m, 1e-9), 3) if self.distance_m > 0 else 0.0,
         )
 
     # --- 動かす ---
@@ -1048,10 +1156,10 @@ class Sim:
         """止まって首を振って撮る（実機の scan.json と同じ順）。"""
         self.phase = "scan"
         self.car.steer_deg = 0.0
-        for tilt in SCAN_TILTS:
-            for pan in SCAN_PANS:
+        for tilt in self.pace.tilts:
+            for pan in self.pace.pans:
                 self.car.pan_deg, self.car.tilt_deg = float(pan), float(tilt)
-                self.advance(SCAN_FRAME_S)
+                self.advance(self.pace.hold_s)
                 self.sync()
                 self.last_hits = self.shoot()
                 self.station_hits.append(self.last_hits)
@@ -1060,20 +1168,42 @@ class Sim:
         self.car.pan_deg, self.car.tilt_deg = 0.0, 0.0
         self.commit_station()
 
+    def history(self) -> History:
+        """地図のサーバーが置き場から作るのと同じ、前のステーションまでの走り方。"""
+        return History(list(self.driven), self.backs, sum(self.arrived_reverse[-RECENT_STATIONS:]))
+
     def think(self) -> dict:
-        """app/snoo_mapper.decide で次の 1 歩を決める（地図のサーバーと同じ）。"""
+        """次の 1 歩を、地図のサーバー（app/snoo_map_server.plan_station）と同じに決める。
+        app/snoo_mapper.decide で決め、行き場が無ければ（unreachable）、Pi が reverse を
+        受けられるとき（params.reverse）は reverse_step で後ろへ下がる。でたらめな 1 歩の
+        くじ（seed）はステーションの番号、固まったか（clustered）は直前のステーションで見る。
+        """
         self.phase = "plan"
         heights = [CAM_H_M] * len(self.stations)
-        self.action, self.plan = decide(self.grid, self.stations, self.params, heights)
+        recent = [s.pose for s in self.stations[-CLUSTER_STATIONS - 1 : -1]]
+        params = dataclasses.replace(
+            self.params, seed=len(self.stations) - 1, force_random=clustered(recent)
+        )
+        self.action, self.plan = decide(self.grid, self.stations, params, heights)
+        if self.action == {"action": "done", "reason": "unreachable"} and params.reverse:
+            pose = self.stations[-1].pose
+            pieces = reverse_step(self.grid, pose, self.history(), params.segments)
+            if pieces:
+                self.action = reverse_action(pieces, params.segments)
+        a = self.action
+        kind = "reverse" if a.get("reverse") else "random" if a.get("random") else "nbv"
+        kind = kind if a.get("action") == "move" else "done"
+        self.kinds[kind] = self.kinds.get(kind, 0) + 1
         self.step_arc = []
         if self.action.get("action") == "move":
             c = self.car
+            sign = -1.0 if self.action.get("reverse") else 1.0
             x, y, yaw = c.x, c.y, c.yaw
             self.step_arc = [(x, y, yaw)]
             for steer, cm in self.pieces(self.action):
                 n = max(2, int(cm / 2))
                 for _ in range(n):
-                    x, y, yaw = arc(x, y, yaw, steer, cm / 100 / n)
+                    x, y, yaw = arc(x, y, yaw, steer, sign * cm / 100 / n)
                     self.step_arc.append((x, y, yaw))
         self.car.steer_deg = float(self.action.get("steer_deg", 0.0))
         self.car.tilt_deg = DRIVE_TILT_DEG
@@ -1139,48 +1269,56 @@ class Sim:
         return result
 
     def explore(
-        self, cycles: int, on_frame=None, plan_frames: int = 6, backtrack: int = 0
+        self,
+        cycles: int,
+        on_frame=None,
+        plan_frames: int | None = None,
+        backtrack: int = 0,
+        time_budget_s: float | None = None,
     ) -> Summary:
-        """撮る → 地図を直す → 1 歩走る、を cycles 回（やめる理由が出たらそこまで）。
+        """撮る → 地図を直す → 1 歩走る、を cycles 回（やめる理由が出たら・time_budget_s 秒
+        （Sim.t）を過ぎたらそこまで）。
 
-        前にしか走らないので、角に入ると回れずに unreachable で止まることがある。
-        backtrack > 0 なら、そのとき来た道を同じハンドルで BACKTRACK_M まで戻って撮り直す
-        （続けて backtrack 回まで。地図のサーバーの reverse と同じ。さっき走った床の上だけを通る）。
+        次の 1 歩の決め方は地図のサーバーと同じ（think）。backtrack > 0 なら Pi が reverse を
+        受けられることにする（params.reverse。行き場が無いとき、切り返しか来た道を戻る）。
         params.segments なら、1 歩を「曲がる → まっすぐ」の区間で走る。
+        地図を作り直す間（pace.server_s 秒、plan_frames があれば 0.5 秒 × plan_frames）も猫は動く。
         """
+        if backtrack:
+            self.params = dataclasses.replace(self.params, reverse=True)
+        wait_s = self.pace.server_s if plan_frames is None else 0.5 * plan_frames
         reason = "cycles"
-        backs = 0
         for k in range(cycles):
+            if time_budget_s is not None and self.t >= time_budget_s:
+                reason = "time"
+                break
             self.cycle = k + 1
             self.scan(on_frame)
             action = self.think()
-            for _ in range(plan_frames):
-                self.advance(0.5)  # 地図を作り直す間（実機は 10 秒ほど）も猫は動く
+            left = wait_s
+            while left > 1e-9:
+                self.advance(min(0.5, left))
+                left -= 0.5
                 self.sync()
                 if on_frame:
                     on_frame(self)
             if action.get("action") != "move":
-                back = retrace(self.driven, BACKTRACK_M, MAX_SEGMENTS)
-                if action.get("reason") == "unreachable" and backs < backtrack and back:
-                    backs += 1
-                    self.reverses += 1
-                    for steer, m in back:
-                        before = self.distance_m
-                        result = self.drive(steer, SPEED_BACK, m * 100, on_frame, reverse=True)
-                        self.driven = consume(self.driven, self.distance_m - before)
-                        if result != "ok":
-                            break
-                    continue
                 reason = str(action.get("reason", "done"))
                 break
-            backs = 0
+            reverse = bool(action.get("reverse"))
             for steer, cm in self.pieces(action):
                 before = self.distance_m
-                result = self.drive(steer, action["speed"], cm, on_frame)
-                if self.distance_m - before > 1e-6:
-                    self.driven.append((steer, self.distance_m - before))
+                result = self.drive(steer, action["speed"], cm, on_frame, reverse=reverse)
+                moved = self.distance_m - before
+                if reverse:
+                    self.driven = consume(self.driven, moved)
+                elif moved > 1e-6:
+                    self.driven.append((steer, moved))
                 if result != "ok":
                     break
+            self.backs = self.backs + 1 if reverse else 0
+            self.reverses += reverse
+            self._reversed = reverse
         self.phase = "done"
         return self.summary(reason)
 

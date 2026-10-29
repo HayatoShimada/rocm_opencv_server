@@ -114,3 +114,36 @@ def test_explore_with_sonar_segments_and_retrace():
     assert s.action.get("action") in ("move", "done")
     if s.action.get("action") == "move":
         assert "segments" in s.action
+
+
+def test_explore_clock_follows_the_real_pace():
+    """1 周の時間は、首振り（10 コマ × 1.44 秒）+ 地図のサーバー（11 秒）+ 走る時間。"""
+    from app.snoo_sim import REAL_PACE
+
+    s = Sim(synthetic_room(), rays=(64, 48), seed=1, pace=REAL_PACE)
+    summary = s.explore(1)
+    scan_and_server = 10 * 1.44 + 11.0
+    assert summary.stations == 1
+    drive_s = s.distance_m / (12 * 0.017)
+    assert summary.t_s == pytest.approx(scan_and_server + drive_s, abs=0.2)
+    assert summary.covered_m2 > 0.5
+    assert summary.m2_per_min == pytest.approx(summary.covered_m2 / (summary.t_s / 60), rel=0.01)
+    # 時間で止める
+    s = Sim(synthetic_room(), rays=(64, 48), seed=1, pace=REAL_PACE)
+    assert s.explore(10, time_budget_s=30).reason == "time"
+    assert len(s.stations) == 2
+
+
+def test_window_keeps_only_the_stations_near_the_car():
+    """地図のサーバーの窓をまねると、窓の外のステーションで見た床は地図から消える。"""
+
+    def two_stations(window):
+        s = Sim(synthetic_room(), rays=(64, 48), seed=0, window=window)
+        s.scan()
+        s.car = CarState.from_camera(Pose(1.2, 0.3, math.pi / 2))
+        s.sync()
+        s.scan()
+        return int((s.grid.state() == FREE).sum())
+
+    assert two_stations(1) < two_stations(None)
+    assert two_stations(2) == two_stations(None)
