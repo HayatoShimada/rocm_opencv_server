@@ -553,9 +553,21 @@ def mark_slam(grid: Grid, high: np.ndarray, slam_dir: Path, params: MapParams) -
     """
     try:
         status = json.loads((slam_dir / "status.json").read_text())
-        rmse = (status.get("alignment") or {}).get("rmse_m")
-        if status.get("state") != "ok" or rmse is None or rmse > SLAM_MAX_RMSE_M:
-            return {"used": False, "reason": f"state={status.get('state')} rmse={rmse}"}
+        alignment = status.get("alignment") or {}
+        rmse = alignment.get("rmse_m")
+        # 位置で合わせた（ステーション 2 か所以上）ときだけ使う。向きだけで合わせたときは、
+        # ずれを確かめられず、向きが 5° ずれると 3 m 先で 26 cm ずれた障害物が入る
+        if (
+            status.get("state") != "ok"
+            or alignment.get("method") != "stations"
+            or rmse is None
+            or rmse > SLAM_MAX_RMSE_M
+        ):
+            return {
+                "used": False,
+                "reason": f"state={status.get('state')} "
+                f"method={alignment.get('method')} rmse={rmse}",
+            }
         d = np.load(slam_dir / "points.npz")
         xyz, count = d["xyz"], d["count"]
     except (OSError, ValueError, KeyError) as e:
@@ -771,6 +783,9 @@ def _failed(stations, refs, params, reason) -> MapResult:
         {"action": "done", "reason": reason},
         None,
         params,
+        # 地図のサーバーはステーションと同じ数の見たものを並べて回すので、数を合わせる
+        # （空だと zip(strict=True) で落ち、done の代わりに 500 を返していた）
+        observations=[None] * len(stations),
     )
 
 

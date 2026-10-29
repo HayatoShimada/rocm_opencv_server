@@ -296,12 +296,14 @@ def test_decide_turns_instead_of_looping_when_the_target_is_behind():
     assert not a.get("turn")  # reverse を受けない Pi には今までどおり
 
 
-def _slam_dir(tmp_path, state="ok", rmse=0.03):
+def _slam_dir(tmp_path, state="ok", rmse=0.03, method="stations"):
     import json as _json
 
     d = tmp_path / "slam"
     d.mkdir()
-    (d / "status.json").write_text(_json.dumps({"state": state, "alignment": {"rmse_m": rmse}}))
+    (d / "status.json").write_text(
+        _json.dumps({"state": state, "alignment": {"method": method, "rmse_m": rmse}})
+    )
     xs = np.arange(0.0, 1.0, 0.03)
     floor = np.stack([xs, np.zeros_like(xs), np.zeros_like(xs)], 1)
     wall = np.array([[1.2, 0.0, 0.06], [1.2, 0.03, 0.06]])
@@ -334,11 +336,12 @@ def test_mark_slam_ignores_a_lost_or_misaligned_slam(tmp_path):
     from app.roommap import Grid
     from app.snoo_mapper import MapParams, mark_slam
 
-    for state, rmse in (("lost", 0.03), ("ok", 0.2)):
+    for state, rmse, method in (("lost", 0.03, "stations"), ("ok", 0.2, "stations"),
+                                ("ok", 0.0, "heading")):  # fmt: skip
         g = Grid()
-        sub = tmp_path / f"{state}{rmse}"
+        sub = tmp_path / f"{state}{rmse}{method}"
         sub.mkdir()
-        info = mark_slam(g, np.zeros_like(g.logodds, np.int32), _slam_dir(sub, state, rmse),
+        info = mark_slam(g, np.zeros_like(g.logodds, np.int32), _slam_dir(sub, state, rmse, method),
                          MapParams())  # fmt: skip
         assert not info["used"] and not g.logodds.any()
     assert not mark_slam(Grid(), np.zeros((240, 240), np.int32), tmp_path / "none", MapParams())[

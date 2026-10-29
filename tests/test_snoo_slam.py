@@ -291,6 +291,9 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
             {"t_capture_ns": starts[0] - 10**9, "image": f"{file_stem(starts[0] - 10**9)}.jpg"}
         )
     )
+    # ステーションを受けた時刻を、作り物の時計にそろえる（それより前に届いたタップは使わない）
+    for meta in (tmp_path / "data").glob("*/*/meta.json"):
+        os.utime(meta, (T0 - 10.0, T0 - 10.0))
     clock = Clock()
     fake = FakeSlam(sc, truth)
     svc = SlamService(

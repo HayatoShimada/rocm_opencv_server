@@ -519,7 +519,9 @@ def align_session(
     b = np.concatenate([t2 - scale * m2 @ o, [scale * floor.offset]])
     frame = SessionFrame(scale, m, b)
     rmse = None
-    if common:
+    # 位置で合わせたときだけ、ずれを測れる。向きで合わせた（ステーションが 1 か所・近すぎる）ときは
+    # t2 を差から決めるので、ずれは必ず 0 になり、確かめたことにならない
+    if method == "stations":
         fit = p_slam @ r2.T + t2
         rmse = float(np.sqrt(((fit - p_ses) ** 2).sum(1).mean()))
     return Alignment(frame, method, floor, common, rmse, sim2)
@@ -912,13 +914,25 @@ class SlamService:
                     self.t_min = meta_still[0].t_capture_ns
             n += sum(self.ingest(k) for k in fr)
         if self.queue.exists() and self.t_min is not None:
+            started = self.session_started()
             for sd in sorted(p for p in self.queue.iterdir() if p.is_dir()):
                 seen = self.seen_queue.get(sd.name, self.t_min)
                 for k in read_queue(sd, seen):
-                    n += self.ingest(k)
                     seen = max(seen, k.t_capture_ns)
+                    # セッションが始まる前に届いたもの（Pi を起動し直す前の起動のフレームは、撮った
+                    # 時刻が新しいセッションより大きく見える）は使わない
+                    if k.t_recv is not None and started is not None and k.t_recv < started - 5:
+                        continue
+                    n += self.ingest(k)
                 self.seen_queue[sd.name] = seen
         return n
+
+    def session_started(self) -> float | None:
+        """セッションの最初のステーションを受けた時刻（UNIX）。"""
+        try:
+            return min(d.joinpath("meta.json").stat().st_mtime for d in station_dirs(self.session))
+        except (OSError, ValueError):
+            return None
 
     def due(self) -> bool:
         if not self.pending or map_is_busy():
