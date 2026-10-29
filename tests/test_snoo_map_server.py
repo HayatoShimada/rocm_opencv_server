@@ -344,7 +344,9 @@ def _stuck_session(tmp_path, supports):
     return _post(c, _meta(1, prev_step=PREV, supports=supports)).json()
 
 
-def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, stuck):
+def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, stuck, monkeypatch):
+    # 切り返しが使えないときに、来た道を戻ることを見る
+    monkeypatch.setattr("app.snoo_map_server.turning_reverse", lambda *a, **k: [])
     a = _stuck_session(tmp_path, ["reverse", "segments"])
     assert a["action"] == "move" and a["reverse"] is True
     assert a["steer_deg"] == -8.9 and a["speed"] == REVERSE_SPEED
@@ -359,7 +361,9 @@ def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, s
     assert plan["reply"]["reverse"] is True
 
 
-def test_reverse_without_segments_is_one_arc(tmp_path, stuck):
+def test_reverse_without_segments_is_one_arc(tmp_path, stuck, monkeypatch):
+    # 切り返しが使えないときに、来た道を戻ることを見る
+    monkeypatch.setattr("app.snoo_map_server.turning_reverse", lambda *a, **k: [])
     a = _stuck_session(tmp_path, ["reverse"])
     assert a["reverse"] is True and a["distance_cm"] == 30.0 and "segments" not in a
 

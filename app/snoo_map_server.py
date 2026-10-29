@@ -74,6 +74,7 @@ from app.roommap import (
     fit_driven,
     retrace,
     take,
+    turning_reverse,
 )
 from app.snoo import _allowed, parse_allow
 from app.snoo_mapper import (
@@ -462,7 +463,15 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     raw = r.action
     action = dict(raw)
     if action == {"action": "done", "reason": "unreachable"} and "reverse" in can:
-        pieces = backtrack(session, station_id, poses, "segments" in can)
+        pieces = []
+        if recent_reverses(session, station_id) < MAX_RECENT_REVERSES:
+            # まず切り返し（曲がりながら下がって向きを変える）、だめなら来た道を戻る
+            # 後ろは見ていないので 30 cm 下がれなければ、見ていない所に入る 15 cm だけ下がる
+            pieces = turning_reverse(r.grid, r.stations[-1].pose) or turning_reverse(
+                r.grid, r.stations[-1].pose, length=0.15
+            )
+        if not pieces:
+            pieces = backtrack(session, station_id, poses, "segments" in can)
         if pieces:
             action = reverse_action(pieces, "segments" in can)
             # 戻る弧を上から見た絵に描き、戻った先を target にする

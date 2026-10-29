@@ -287,3 +287,28 @@ def test_random_step_is_none_when_boxed_in():
     a, r = np.meshgrid(np.linspace(0, 2 * np.pi, 300), np.linspace(0.12, 0.18, 4))
     g.mark_occupied((r * np.cos(a)).ravel(), (r * np.sin(a)).ravel())
     assert random_step(g, Pose(0, 0, 0), np.random.default_rng(0)) is None
+
+
+def test_turning_reverse_changes_heading_and_avoids_obstacles():
+    from app.roommap import turning_reverse
+
+    g, _ = _open_floor()
+    pieces = turning_reverse(g, Pose(0, 0, 0))
+    assert len(pieces) == 1 and pieces[0][1] == pytest.approx(0.30)
+    end = camera_of(drive_poses(Pose(0, 0, 0), pieces, reverse=True)[-1][1])
+    assert abs(end.yaw) > math.radians(40)  # 向きが変わる
+    # 真後ろ以外すべて障害物なら下がらない
+    wall = Grid(size_m=6.0)
+    xs = np.arange(-1.0, 1.0, 0.02)
+    gx, gy = np.meshgrid(xs, xs)
+    wall.mark_occupied(gx.ravel(), gy.ravel())
+    wall.mark_free(np.array([0.0]), np.array([0.0]))
+    assert turning_reverse(wall, Pose(0.6, 0.6, 0)) == []
+
+
+def test_turning_reverse_may_enter_unseen_floor_only_at_the_start():
+    from app.roommap import turning_reverse
+
+    g = Grid(size_m=6.0)  # 何も見ていない
+    assert turning_reverse(g, Pose(0, 0, 0), unseen_ok_m=0.15) == []  # 30 cm は無理
+    assert turning_reverse(g, Pose(0, 0, 0), length=0.12, unseen_ok_m=0.15)  # 12 cm ならよい

@@ -630,6 +630,44 @@ def consume(trail: list[tuple[float, float]], m: float) -> list[tuple[float, flo
     return out
 
 
+def turning_reverse(
+    grid: Grid, pose: Pose, length: float = 0.30, unseen_ok_m: float = 0.15
+) -> list[tuple[float, float]]:
+    """切り返し：ハンドルをいっぱいに切って後ろへ下がる 1 本の弧（ハンドル°、m）。走れなければ空。
+
+    来た道をそのまま戻ると、同じ位置・同じ向きに戻って同じ 1 歩を選び直す（3 回目の実走では
+    15 か所・4.7 m 走って、半径 30 cm から出られなかった）。曲がりながら下がると向きが
+    40〜60° 変わり、次の 1 歩で別のほうへ進める。
+
+    カメラは前（パン ±35°）しか見ないので、車の後ろはいつも見ていない（3 回目の実走の地図でも
+    後ろ側が空いていた）。見えている床だけを通ると、後ろへはほとんど下がれない。そこで
+    頭の unseen_ok_m だけは、障害物と分かっていない（見ていない）所も通ってよいことにする
+    （Pi は遅く下がり、画像が動かなければ止まる）。その先は見えている床だけ。
+    左右のうち、下がった先から新しく見えそうなセルが多いほうを選ぶ。
+    """
+    state = grid.state()
+    blocked = blocked_cells(grid, state, pose)
+    hard = inflate(state == OCCUPIED, int(math.ceil(CAR_RADIUS_M / grid.res)))
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    best, best_gain = [], -1
+    for steer in (max_steer, -max_steer):
+        pieces = [(steer, length)]
+        ok = True
+        for done, rear in drive_poses(pose, pieces, reverse=True)[1:]:
+            cx = rear.x + CAR_CENTER_M * math.cos(rear.yaw)
+            c = grid.cell(cx, rear.y + CAR_CENTER_M * math.sin(rear.yaw))
+            if not grid.inside(*c) or (hard if done <= unseen_ok_m else blocked)[c]:
+                ok = False
+                break
+        if not ok:
+            continue
+        end = camera_of(drive_poses(pose, pieces, reverse=True)[-1][1])
+        gain = view_gain(grid, state, end, rays=21)
+        if gain > best_gain:
+            best, best_gain = pieces, gain
+    return best
+
+
 def retrace(
     trail: list[tuple[float, float]], budget: float = REVERSE_MAX_M, max_pieces: int = MAX_SEGMENTS
 ) -> list[tuple[float, float]]:
