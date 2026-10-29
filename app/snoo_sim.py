@@ -39,7 +39,9 @@ import numpy as np
 from app.roommap import (
     CAM_X_M,
     CAR_FRONT_M,
+    CAR_HEIGHT_M,
     CAR_REAR_M,
+    CAR_WIDTH_M,
     FREE,
     FREE_HIT,
     OCCUPIED,
@@ -81,8 +83,6 @@ TRACK_M = 0.12
 WHEEL_R_M = 0.0326
 # 外形 約 26 x 19 cm、高さ 約 12 cm。前後の端（CAR_FRONT_M・CAR_REAR_M）と、後ろの車軸から
 # カメラまで（CAM_X_M）は、地図のサーバーも使うので app/roommap.py に置く
-CAR_WIDTH_M = 0.19
-CAR_HEIGHT_M = 0.12
 CAM_H_M = 0.08  # 床からレンズの中心まで（SD カード 2.5 枚分と測った）
 HFOV_DEG = 54.0
 IMG_W, IMG_H = 640, 480

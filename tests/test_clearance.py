@@ -126,8 +126,10 @@ def test_right_steer_turns_right_and_widens_the_outer_side():
     lo, hi = path.bounds()
     half = car.width_cm / 2 + car.margin_cm
     assert lo == -half and hi > half  # 右に曲がると、前の左の角が外へ振れる
-    # 半周より先は扱わない
-    assert not path.inside(path.max_s + 1, 0) and path.inside(path.max_s - 1, 0)
+    # 半周より先は扱わない（ハンドルいっぱいで、半周が見る長さ 1 m より短いとき）
+    sharp = Path(car, steer_deg=30)
+    assert sharp.max_s < 100
+    assert not sharp.inside(sharp.max_s + 1, 0) and sharp.inside(sharp.max_s - 1, 0)
     assert Grid(Camera(tilt_deg=-20), path).s[-1] <= path.max_s
     # まっすぐと、ほぼまっすぐはつながる
     a = Path(car, 0).from_path(30.0, 0.0)
