@@ -91,10 +91,12 @@ class Station:
         return self.dir.name
 
 
-def load_station(d: str | Path) -> Station:
-    """撮影の置き場（scan.json と画像）を読む。tilt_offset_deg は tilt に足して校正済みにする。"""
+def load_station(d: str | Path, scan_file: str = "scan.json") -> Station:
+    """撮影の置き場（scan.json と画像）を読む。tilt_offset_deg は tilt に足して校正済みにする。
+    HTTP で受けたステーション（app/snoo_map_server.py）は meta.json に置くので、名前を変えられる。
+    """
     d = Path(d)
-    scan = json.loads((d / "scan.json").read_text())
+    scan = json.loads((d / scan_file).read_text())
     offset = float(scan.get("tilt_offset_deg") or 0.0)
     frames = []
     for f in scan["frames"]:
@@ -157,16 +159,27 @@ class VggtOut:
     files: list[str]
 
 
-def run_vggt(paths: list[Path]) -> VggtOut:
-    """画像をまとめて VGGT（facebook/VGGT-1B）に通す。GPU を使う。
+def load_vggt_model():
+    """VGGT（facebook/VGGT-1B）を GPU に載せる。読むのに 5〜7 秒かかり、GPU を 5 GB 使う。
     torch・vggt は重いので、使うときだけ読む。
     """
-    import torch
     from vggt.models.vggt import VGGT
+
+    return VGGT.from_pretrained("facebook/VGGT-1B").to("cuda").eval()
+
+
+def run_vggt(paths: list[Path], model=None) -> VggtOut:
+    """画像をまとめて VGGT に通す。GPU を使う。
+    model を渡さなければ、その場で読んで、終わったら捨てる（コマンドで 1 回だけ使うとき）。
+    サーバーは読んだものを持ち続けて渡す（ステーションごとに読み直すと 5 秒以上かかる）。
+    """
+    import torch
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to("cuda").eval()
+    own = model is None
+    if own:
+        model = load_vggt_model()
     imgs = load_and_preprocess_images([str(p) for p in paths]).to("cuda")
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         out = model(imgs)
@@ -178,7 +191,9 @@ def run_vggt(paths: list[Path]) -> VggtOut:
         depth_conf=out["depth_conf"][0].float().cpu().numpy(),
         files=[str(Path(p).resolve()) for p in paths],
     )
-    del model, out, imgs
+    del out, imgs
+    if own:
+        del model
     torch.cuda.empty_cache()
     return result
 
