@@ -376,6 +376,9 @@ def test_clear_waits_for_the_servos_to_settle_after_the_head_moves():
     assert worker.submit(ADDR, later, IMAGE)
     _wait_idle(worker)
     assert worker.fields(ADDR, parse_frame(_packet_v2(seq=3, t=t0 + 450_000_000)))["clear_cm"]
+    # 首の指令が少し揺れただけ（1.5° 未満）なら待ち直さない
+    jitter = parse_frame(_packet_v2(seq=31, t=t0 + 455_000_000, pan=0.6))
+    assert "clear_cm" in worker.fields(ADDR, jitter)
     # 首を振ったら、また待つ。前の値も使わない
     turned = parse_frame(_packet_v2(seq=4, t=t0 + 460_000_000, pan=-15.0))
     assert worker.fields(ADDR, turned) == {"clear_skip": "settling"}

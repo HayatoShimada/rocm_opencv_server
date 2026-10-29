@@ -396,6 +396,15 @@ class _ClearResult:
     clearance: object  # app.clearance.Clearance
 
 
+# 首の向きがこれだけ変わったら、サーボが止まるまで clear_cm を待つ
+SETTLE_TOL_DEG = 1.5
+
+
+def same_pose(a: tuple, b: tuple) -> bool:
+    """(走っているか, パン, チルト) が同じとみなせるか。"""
+    return a[0] == b[0] and abs(a[1] - b[1]) < SETTLE_TOL_DEG and abs(a[2] - b[2]) < SETTLE_TOL_DEG
+
+
 class ClearanceWorker:
     """走っている間の前の空き（clear_cm）を、検出とは別のスレッドで見積もる。
 
@@ -452,9 +461,12 @@ class ClearanceWorker:
 
     def settling(self, addr: tuple, frame: Frame) -> bool:
         """首を動かした・走り出した直後で、サーボがまだ止まっていないか。フレームごとに呼ぶ。"""
-        key = (frame.moving, round(frame.pan_deg or 0.0, 1), round(frame.tilt_deg or 0.0, 1))
+        key = (frame.moving, frame.pan_deg or 0.0, frame.tilt_deg or 0.0)
         last = self._pose.get(addr)
-        if last is None or last[0] != key or frame.t_capture_ns < last[1]:
+        # 首の指令は滑らかに動くので、少しの変化（SETTLE_TOL_DEG 未満）では待ち直さない。
+        # 0.1° で比べていたら、3 回目の実走では走っている間の 1454 コマのうち 574 コマが
+        # settling になり、clear_cm がほとんど出なかった
+        if last is None or frame.t_capture_ns < last[1] or not same_pose(last[0], key):
             self._pose[addr] = (key, frame.t_capture_ns)
             return self.settle_ns > 0
         return frame.t_capture_ns - last[1] < self.settle_ns
