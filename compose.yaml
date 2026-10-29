@@ -66,7 +66,7 @@ services:
       # カメラの高さはまだ測っていない（距離はこれに比例して変わる）。tilt は Pi が 10/29 に
       # 校正を直したので直さない（1.0 と 0.0）
       SNOO_CLEARANCE: "${SNOO_CLEARANCE:-1}"
-      SNOO_CAMERA_HEIGHT_CM: "${SNOO_CAMERA_HEIGHT_CM:-10}"
+      SNOO_CAMERA_HEIGHT_CM: "${SNOO_CAMERA_HEIGHT_CM:-8}"
       SNOO_TILT_GAIN: "${SNOO_TILT_GAIN:-1.0}"
       SNOO_TILT_OFFSET_DEG: "${SNOO_TILT_OFFSET_DEG:-0.0}"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor

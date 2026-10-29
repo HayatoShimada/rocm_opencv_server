@@ -397,11 +397,14 @@ class ClearanceWorker:
 
     返事の欄（fields）の決まり（Pi と決めたもの）
     - 欄が無い = サーバーは clear を見ていない（Pi は止まらない）。走っていないフレーム・SNO1・
-      モデルがまだ無い（読み込み中か失敗）とき。
-    - null = 見ているが、このフレームには使える値が無い（Pi は走っている間に null が 0.3 秒
-      続くと止まる）。元のフレームが CLEAR_MAX_AGE_MS より古い・まだ無い・見えない
-      （手前が見えなさすぎる・床に合わない）・確からしさが CLEAR_MIN_CONF より低い・
-      下がっている（カメラは前を向いているので、進む先が見えない）とき。
+      モデルがまだ無い（読み込み中か失敗）とき。それと、通り道がそもそも画面に入らないとき
+      （clear_skip に理由を書く）。舵を約 10° 以上切ると、帯が画角 54° からはみ出す。下がって
+      いるときは、カメラが前を向いているので進む先が見えない。どちらも null にすると Pi は
+      0.3 秒で止まり、曲がるたび・切り返すたびに止まってしまう。その間は超音波・画像が
+      動かないときの判定・床が見えた所だけを通る地図の道で守る。
+    - null = 見ているはずなのに、このフレームには使える値が無い（Pi は走っている間に null が
+      0.3 秒続くと止まる）。元のフレームが CLEAR_MAX_AGE_MS より古い・まだ無い・床に合わない・
+      確からしさが CLEAR_MIN_CONF より低いとき。
 
     build は見積もりの道具（app.clearance.Estimator か、テストでは同じ形の物）を作る関数。
     compile した HIP グラフは作ったスレッドでしか使い回せないので、見積もるスレッドの中で作る。
@@ -438,7 +441,7 @@ class ClearanceWorker:
         if not frame.moving or self.estimator is None:
             return None
         if frame.flags & REVERSING:
-            return dict(NO_CLEAR)
+            return {"clear_skip": "reversing"}
         with self._lock:
             r = self._results.get(addr)
         # 古さは Pi の撮った時刻どうしで比べる（届くまでの揺れが入らない）。
@@ -446,6 +449,8 @@ class ClearanceWorker:
         if r is None or not 0 <= frame.t_capture_ns - r.t_capture_ns <= self.max_age_ns:
             return dict(NO_CLEAR)
         c = r.clearance
+        if getattr(c, "out_of_view", False):
+            return {"clear_skip": "out_of_view"}
         ok = c.clear_cm is not None and c.confidence >= self.min_conf
         return {
             "clear_cm": round(c.clear_cm, 1) if ok else None,

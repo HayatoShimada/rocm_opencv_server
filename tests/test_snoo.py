@@ -241,8 +241,8 @@ def _packet_v2(seq=7, t=10**12, jpeg=b"\xff\xd8jpeg", flags=1, steer=0.0, pan=0.
 class _FakeEstimator:
     """見積もりの代わり。delay 秒かかり、同時に回った数の最大を数える。"""
 
-    def __init__(self, cm=42.0, conf=0.8, delay=0.0):
-        self.cm, self.conf, self.delay = cm, conf, delay
+    def __init__(self, cm=42.0, conf=0.8, delay=0.0, blind=13.0):
+        self.cm, self.conf, self.delay, self.blind = cm, conf, delay, blind
         self.calls: list[tuple] = []
         self.running = self.max_running = 0
         self.lock = threading.Lock()
@@ -257,7 +257,7 @@ class _FakeEstimator:
         with self.lock:
             self.running -= 1
             self.calls.append((tilt_deg, pan_deg, steer_deg))
-        return Clearance(self.cm, self.conf, 13.0, "both")
+        return Clearance(self.cm, self.conf, self.blind, "both")
 
 
 def _worker(estimator, **kw):
@@ -322,7 +322,7 @@ def _at(t0, ms, flags=1):
     return parse_frame(_packet_v2(seq=9, t=t0 + int(ms * 1e6), flags=flags))
 
 
-def test_old_low_confidence_and_reversing_values_become_null():
+def test_old_and_low_confidence_values_become_null():
     worker = _worker(_FakeEstimator())
     t0 = 10**12
     worker.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0)), IMAGE)
@@ -330,13 +330,35 @@ def test_old_low_confidence_and_reversing_values_become_null():
     assert worker.fields(ADDR, _at(t0, 150))["clear_cm"] == 42.0
     assert worker.fields(ADDR, _at(t0, 151)) == snoo.NO_CLEAR  # 150 ms より古い
     assert worker.fields(ADDR, _at(t0, -1)) == snoo.NO_CLEAR  # Pi が起動し直して時刻が戻った
-    assert worker.fields(ADDR, _at(t0, 10, flags=1 | 2)) == snoo.NO_CLEAR  # 下がっている
 
     low = _worker(_FakeEstimator(conf=0.3), min_conf=0.5)
     low.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0)), IMAGE)
     _wait_idle(low)
     fields = low.fields(ADDR, _at(t0, 10))
     assert fields["clear_cm"] is None and fields["clear_conf"] == 0.3
+
+
+def test_clear_fields_are_skipped_when_the_path_is_out_of_view_or_reversing():
+    # 舵を大きく切って帯が画面に入らない・下がっている間は、null（止まれ）にせず欄を載せない。
+    # null にすると Pi は 0.3 秒で止まり、曲がるたび・切り返すたびに止まってしまう
+    t0 = 10**12
+    turning = _worker(_FakeEstimator(cm=None, conf=0.0, blind=100.0))
+    turning.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0, steer=-25.0, pan=-25.0)), IMAGE)
+    _wait_idle(turning)
+    fields = turning.fields(ADDR, _at(t0, 10))
+    assert fields == {"clear_skip": "out_of_view"}
+    reply = json.loads(encode_reply(_at(t0, 10), [], 1.0, fields))
+    assert "clear_cm" not in reply  # Pi は「欄が無い」として止まらない
+
+    worker = _worker(_FakeEstimator())
+    worker.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0)), IMAGE)
+    _wait_idle(worker)
+    assert worker.fields(ADDR, _at(t0, 10, flags=1 | 2)) == {"clear_skip": "reversing"}
+    # 床に合わない（見えているのに確かめられない）ときは null のまま
+    unsure = _worker(_FakeEstimator(cm=None, conf=0.0, blind=20.0))
+    unsure.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0)), IMAGE)
+    _wait_idle(unsure)
+    assert unsure.fields(ADDR, _at(t0, 10))["clear_cm"] is None
 
 
 def test_only_one_estimate_runs_at_a_time_and_busy_frames_are_dropped():

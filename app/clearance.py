@@ -48,7 +48,7 @@ import numpy as np
 # 横の画角（測った値）。縦は 640x480 の比から決まる（約 42°）
 HFOV_DEG = 54.0
 # カメラの床からの高さ（まだ測っていない。距離はこれに比例して変わる）
-CAM_HEIGHT_CM = float(os.getenv("SNOO_CAMERA_HEIGHT_CM", "10"))
+CAM_HEIGHT_CM = float(os.getenv("SNOO_CAMERA_HEIGHT_CM", "8"))  # SD カード 2.5 枚分と測った
 # Pi の tilt の指令から、床に対する実際の向きを出す（実際 = 指令 × GAIN + OFFSET）。
 # 試作のときの地図のフレーム（VGGT の深度）では、水平線がどの tilt でも 40〜50 画素上にあった
 # （= カメラが約 4.5° 下を向いていた）。同じソファの脚が tilt 0° と -15° で同じ位置に来るのは、
@@ -218,6 +218,14 @@ class Clearance:
     confidence: float  # 0..1
     blind_cm: float  # 前の端からこの距離までは見えていない（帯の幅の 90% が映るまで）
     method: str
+
+    @property
+    def out_of_view(self) -> bool:
+        """通り道がそもそも画面に入っていない（大きく曲がっている・上を向いている）。
+
+        確かめられなかったのではなく、見ていないので、Pi に止まれ（null）とは言わない。
+        """
+        return self.clear_cm is None and self.blind_cm > MAX_BLIND_CM
 
     def to_json(self) -> dict | None:
         if self.clear_cm is None:
