@@ -19,6 +19,13 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
     を返す（続けて 2 回まで）
   - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
+- GET /twin：車と部屋をブラウザで見る画面（app/snoo_twin.py）。地図・ステーション・次の 1 歩・
+  撮った画像と、検出サーバーの今のフレーム（SNOO_MAP_LIVE_DIR）を 1〜2 秒ごとに読み直して出す。
+  このマシンのブラウザなら http://127.0.0.1:8720/twin で開ける。tailnet や LAN の別の機械から
+  見るときは、その機械の IP を SNOO_MAP_ALLOW に足して起動し直す（既定には入れていない。
+  認証が無く、撮った部屋の画像が見えるため）。例：
+      SNOO_MAP_ALLOW=192.168.0.188,100.73.14.8,127.0.0.1,100.x.y.z \\
+          .venv/bin/python -m app.snoo_map_server
 
 受けたステーションは <SNOO_MAP_DATA>/<session_id>/<station_id:03d>/ に画像と meta.json で残し、
 結果（vggt.npz・room.json・topdown.png・plan.json など）はセッションの置き場に書く。
@@ -94,6 +101,9 @@ PORT = int(os.getenv("SNOO_MAP_PORT", "8720"))
 # 受ける送り元（IP か CIDR をカンマで区切る）。Pi の LAN・Pi の tailscale・このマシン
 ALLOW = os.getenv("SNOO_MAP_ALLOW", "192.168.0.188,100.73.14.8,127.0.0.1")
 DATA = os.getenv("SNOO_MAP_DATA", "data/snoo_map/sessions")
+# 検出サーバー（Docker の snoo）が今のフレームを書く所（compose.yaml の SNOO_LIVE_DIR と同じ所）。
+# 空なら /twin に今のフレームを出さない
+LIVE_DIR = os.getenv("SNOO_MAP_LIVE_DIR", "/run/snoo/live")
 # VGGT に使わせる GPU の CU（ROCm の HSA_CU_MASK の形「GPU 番号:CU の範囲」）。空なら全部使う。
 # VGGT が GPU を全部使うと、同じ GPU の猫の検出（Docker の snoo）が 1 枚 4.4 ms → p50 37 ms・
 # p95 185 ms（60 fps → 15 fps）まで遅れた。RX 7900 XTX（96 CU）で 72 CU（0-71）にすると、検出は
@@ -654,7 +664,10 @@ def create_app(
     root: Path | str = DATA,
     allow: list | None = None,
     reconstruct: Reconstruct | None = None,
+    live_dir: Path | str | None = LIVE_DIR,
 ) -> FastAPI:
+    from app.snoo_twin import add_twin  # snoo_twin がこのモジュールを使うので、ここで読む
+
     root = Path(root)
     allow = parse_allow(ALLOW) if allow is None else allow
     reconstruct = VggtReconstruct() if reconstruct is None else reconstruct
@@ -750,6 +763,7 @@ def create_app(
             raise HTTPException(404, "まだ作っていない")
         return FileResponse(path, media_type=OUTPUTS[name], headers={"Cache-Control": "no-store"})
 
+    add_twin(app, root, Path(live_dir) if live_dir else None)
     return app
 
 
