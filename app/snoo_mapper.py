@@ -314,6 +314,40 @@ def unproject(v: VggtOut, stride: int = 2, border_px: int = 8) -> tuple[np.ndarr
     return pts, conf
 
 
+# 猫の箱を広げる割合（毛やぼけで箱の外に点がはみ出す分）と、箱とみなす確からしさの下限
+CAT_MASK_PAD = 0.15
+CAT_MASK_MIN = 0.5
+
+
+def mask_cats(conf: np.ndarray, boxes: list[list]) -> int:
+    """各コマの、猫の箱の中の点の確からしさを 0 にする（間取りに入れない）。消した点の数を返す。
+
+    snoo は動くので、撮った時の場所に「障害物」として残ると、どいた後もそこを通れない幽霊の壁になる
+    （Nav2 は光線で消し、RTAB-Map は弱い当たりで少しずつ確かめる。ここは検出の箱で先に除く）。
+    boxes はコマごとの [{box: [x1, y1, x2, y2]（0..1）, cat}, ...]。Pi が止まって撮ったコマごとに
+    meta の frames[].dets に入れる。VGGT は横を 518 に縮めて縦を切りそろえるので、比のまま当てる。
+    """
+    if conf.ndim != 3 or not boxes:  # 画素の並びが無い（作り物の点）なら消せない
+        return 0
+    n = 0
+    F, h, w = conf.shape
+    for i in range(min(F, len(boxes))):
+        dets = boxes[i] if isinstance(boxes[i], list) else []
+        for det in dets:
+            try:  # Pi から届いたもの。形が違えば使わない（500 にしない）
+                if float(det.get("cat", 0)) < CAT_MASK_MIN:
+                    continue
+                x1, y1, x2, y2 = (min(1.0, max(0.0, float(v))) for v in det["box"])
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            dx, dy = (x2 - x1) * CAT_MASK_PAD, (y2 - y1) * CAT_MASK_PAD
+            c0, c1 = max(0, int((x1 - dx) * w)), min(w, int(np.ceil((x2 + dx) * w)))
+            r0, r1 = max(0, int((y1 - dy) * h)), min(h, int(np.ceil((y2 + dy) * h)))
+            n += int((conf[i, r0:r1, c0:c1] > 0).sum())
+            conf[i, r0:r1, c0:c1] = 0
+    return n
+
+
 def frame_colors(paths: list[Path], shape: tuple[int, int], stride: int = 2) -> np.ndarray:
     """点の色（BGR、(F, h, w, 3)）。VGGT の前処理と同じく幅 518 に縮めた画像から取る。"""
     H, W = shape

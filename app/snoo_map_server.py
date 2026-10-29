@@ -106,6 +106,7 @@ from app.snoo_mapper import (
     load_station,
     load_vggt_model,
     mark_slam,
+    mask_cats,
     or_reverse,
     pose_dict,
     registration_is_bad,
@@ -582,6 +583,12 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     with gpu_busy():  # SLAM（app/snoo_slam.py）は、この間サブマップを回さずに待つ
         rec = reconstruct(refs, session / "vggt.npz", marks)
     save_recon(station_dir(session, station_id) / RECON_FILE, refs, rec)
+    # 写っていた猫を間取りに入れない（Pi が止まって撮ったコマごとに frames[].dets を付けたとき）
+    dets = {(d.name, f["file"]): f.get("dets") for d, st in zip(dirs, stations, strict=True)
+            for f in st.frames}  # fmt: skip
+    marks["cat_points"] = mask_cats(
+        rec.conf, [dets.get((Path(r.path).parent.name, Path(r.path).name)) for r in refs]
+    )
 
     t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)
