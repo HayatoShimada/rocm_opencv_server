@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay
+.PHONY: phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -36,6 +36,15 @@ deploy-map:
 
 status:
 	$(PYTHON) -m scripts.snoo_dev status
+
+phase-train:
+	scripts/snoo_phase.sh train
+
+phase-robot:
+	scripts/snoo_phase.sh robot
+
+phase:
+	scripts/snoo_phase.sh status
 
 scale-check:
 	@test -n "$(IMAGE)" -a -n "$(TILT)" || { echo "make scale-check IMAGE=<A4 を撮った画像> TILT=<チルト>"; exit 2; }
