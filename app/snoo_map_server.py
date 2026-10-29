@@ -94,6 +94,14 @@ PORT = int(os.getenv("SNOO_MAP_PORT", "8720"))
 # 受ける送り元（IP か CIDR をカンマで区切る）。Pi の LAN・Pi の tailscale・このマシン
 ALLOW = os.getenv("SNOO_MAP_ALLOW", "192.168.0.188,100.73.14.8,127.0.0.1")
 DATA = os.getenv("SNOO_MAP_DATA", "data/snoo_map/sessions")
+# VGGT に使わせる GPU の CU（ROCm の HSA_CU_MASK の形「GPU 番号:CU の範囲」）。空なら全部使う。
+# VGGT が GPU を全部使うと、同じ GPU の猫の検出（Docker の snoo）が 1 枚 4.4 ms → p50 37 ms・
+# p95 185 ms（60 fps → 15 fps）まで遅れた。RX 7900 XTX（96 CU）で 72 CU（0-71）にすると、検出は
+# p50 8.7 ms・p95 11.5 ms（55 fps）、VGGT は 40 コマで 6.5 → 7.4 秒（2026-10-29 に測った）。
+# 48 CU（0-47）なら検出 p50 6.2 ms・p95 8.5 ms だが、VGGT が 9.9 秒になり、48 コマの窓では
+# Pi の待ち（20 秒）に近づくので、余裕のある 0-71 にする。
+# HSA_CU_MASK を直に付けて起動したときは、そちらを使う
+CU_MASK = os.getenv("SNOO_MAP_CU_MASK", "0:0-71")
 # 1 回の POST の上限。Pi の画像は 640x480 の JPEG で 1 枚 30 KB ほど、1 ステーション 24 枚ほど
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
@@ -712,8 +720,16 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # GPU の実行時（HSA）は torch を初めて使うときに環境変数を読むので、VGGT を読む前に決める
+    if CU_MASK:
+        os.environ.setdefault("HSA_CU_MASK", CU_MASK)
     log.info(
-        "%s:%d で待ち受け（受ける送り元: %s、置き場: %s）", HOST, PORT, ALLOW or "すべて", DATA
+        "%s:%d で待ち受け（受ける送り元: %s、置き場: %s、VGGT の CU: %s）",
+        HOST,
+        PORT,
+        ALLOW or "すべて",
+        DATA,
+        os.environ.get("HSA_CU_MASK") or "すべて",
     )
     uvicorn.run(create_app(), host=HOST, port=PORT)
 
