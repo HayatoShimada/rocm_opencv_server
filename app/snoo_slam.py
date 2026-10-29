@@ -896,7 +896,7 @@ class SlamService:
                     float(row.get("pan_deg") or 0), float(row.get("tilt_deg") or 0),
                     float(row.get("steer_deg") or 0), float(row.get("speed") or 0),
                     bool(row.get("moving")), row.get("station"), row.get("source") or "tap",
-                    [], row.get("t_recv"), row["file"],
+                    row.get("boxes") or [], row.get("t_recv"), row["file"],
                 )  # fmt: skip
             except (KeyError, TypeError, ValueError):
                 continue

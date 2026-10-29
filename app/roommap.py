@@ -659,10 +659,16 @@ def clip_pieces(
     """
     clear = 0.0
     for done, r in drive_poses(start, pieces)[1:]:
-        ix, iy = grid.cell(
-            r.x + CAR_CENTER_M * math.cos(r.yaw), r.y + CAR_CENTER_M * math.sin(r.yaw)
-        )
-        if not grid.inside(ix, iy) or blocked[ix, iy]:
+        # 車の真ん中だけでなく、カメラの真下（前の端の 5 cm 手前）も見る。出発点のまわりは
+        # 障害物を 10 cm しか広げないので、真ん中だけでは前の端が 2〜3 cm 入った（コードレビュー）
+        c, s = math.cos(r.yaw), math.sin(r.yaw)
+        ok = True
+        for ahead in (CAR_CENTER_M, CAM_X_M):
+            ix, iy = grid.cell(r.x + ahead * c, r.y + ahead * s)
+            if not grid.inside(ix, iy) or blocked[ix, iy]:
+                ok = False
+                break
+        if not ok:
             break
         clear = done
     if clear < MIN_STEP_M:

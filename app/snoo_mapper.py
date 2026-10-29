@@ -48,9 +48,9 @@ from app.roommap import (
     Pose,
     Turn,
     bearing,
+    big_frontiers,
     camera_of,
     drive_poses,
-    frontiers,
     mark_sonar,
     moves_are_clear,
     next_best_view,
@@ -855,7 +855,8 @@ def decide(
     if int((grid.state() == FREE).sum()) < MIN_FREE_CELLS:
         return {"action": "done", "reason": "too_little_floor"}, None
     pose = stations[-1].pose
-    if not frontiers(grid.state()).any():
+    # 次に撮る位置と同じ境目で見る（床の中の小さな穴だけが残ったら、調べ終えたとする）
+    if not big_frontiers(grid.state()).any():
         return {"action": "done", "reason": "no_frontier"}, None
     rng = np.random.default_rng(params.seed)
     plan = None

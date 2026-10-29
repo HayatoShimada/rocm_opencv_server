@@ -378,3 +378,22 @@ def test_mask_cats_zeroes_points_in_cat_boxes_and_ignores_bad_input():
     assert n > 0 and conf[0, 9, 19] == 0 and conf[0, 0, 0] == 1
     assert conf[1].min() == 1 and conf[2].min() == 1
     assert mask_cats(conf, []) == 0
+
+
+def test_only_tiny_holes_left_means_done():
+    from app.roommap import Grid, Pose
+    from app.snoo_mapper import MapParams, StationResult, decide
+
+    g = Grid(size_m=6.0)
+    xs = np.arange(-1.0, 1.0, 0.025)
+    gx, gy = np.meshgrid(xs, xs)
+    g.mark_free(gx.ravel(), gy.ravel())
+    edge = np.concatenate([np.full_like(xs, -1.0), np.full_like(xs, 1.0)])
+    for _ in range(3):  # まわりは壁
+        g.mark_occupied(
+            np.concatenate([edge, np.tile(xs, 2)]), np.concatenate([np.tile(xs, 2), edge])
+        )
+    g.logodds[g.cell(0.5, 0.5)] = 0.0  # 床の中の 1 セルの穴（VGGT の点の抜け）
+    st = [StationResult("000", Pose(0.0, 0.0, 0.0), 0.08, 0.0, 10)]
+    action, _ = decide(g, st, MapParams(), [0.08])
+    assert action == {"action": "done", "reason": "no_frontier"}
