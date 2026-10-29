@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -360,3 +361,19 @@ def test_service_starts_a_new_segment_when_tracking_is_lost(tmp_path):
     assert len(rows) == 24 - 6  # 崩れたサブマップの 6 コマは位置が無い
     status = json.loads((session / "slam" / "status.json").read_text())
     assert status["state"] == "ok"  # 新しい区間もステーションで合わせられた
+
+
+def test_slam_waits_while_the_map_server_runs_vggt(tmp_path, monkeypatch):
+    from app import snoo_map_server, snoo_slam
+
+    busy = tmp_path / "map_busy"
+    monkeypatch.setattr(snoo_map_server, "GPU_BUSY_FILE", str(busy))
+    monkeypatch.setattr(snoo_slam, "MAP_BUSY_FILE", str(busy))
+    assert not snoo_slam.map_is_busy()
+    with snoo_map_server.gpu_busy():
+        assert busy.exists() and snoo_slam.map_is_busy()
+    assert not busy.exists() and not snoo_slam.map_is_busy()
+    busy.write_text("1")  # 落ちて残った古いファイルは見ない
+    old = time.time() - snoo_slam.MAP_BUSY_MAX_S - 1
+    os.utime(busy, (old, old))
+    assert not snoo_slam.map_is_busy()

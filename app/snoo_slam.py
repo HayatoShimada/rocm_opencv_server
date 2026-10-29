@@ -89,6 +89,19 @@ CAMERA_HEIGHT_M = float(os.getenv("SNOO_SLAM_CAMERA_HEIGHT_M", "0.08"))
 # 1 つのサブマップに入れる新しいコマ。前のサブマップと重ねる 1 コマが足される。
 # 8 なら 9 コマで VGGT が 1.2〜2 秒（72 CU、検出と同時）
 SUBMAP_SIZE = int(os.getenv("SNOO_SLAM_SUBMAP_SIZE", "8"))
+# 地図のサーバーが VGGT を回している間に置くファイル（app/snoo_map_server.py の GPU_BUSY_FILE）。
+# ある間はサブマップを回さない。地図のサーバーが落ちて残ったときのため、古いものは見ない
+MAP_BUSY_FILE = os.getenv("SNOO_GPU_BUSY_FILE", "/run/snoo/map_busy")
+MAP_BUSY_MAX_S = 60.0
+
+
+def map_is_busy() -> bool:
+    try:
+        return time.time() - os.path.getmtime(MAP_BUSY_FILE) < MAP_BUSY_MAX_S
+    except OSError:
+        return False
+
+
 # 新しいコマがこの秒数来なければ、submap_size に足りなくても回す（止まったとき）
 FLUSH_S = float(os.getenv("SNOO_SLAM_FLUSH_S", "1.5"))
 # ループを閉じるか（SALAD を使う。GPL-3.0）
@@ -901,7 +914,7 @@ class SlamService:
         return n
 
     def due(self) -> bool:
-        if not self.pending:
+        if not self.pending or map_is_busy():
             return False
         return len(self.pending) >= self.submap_size or self.clock() - self.last_new >= self.flush_s
 

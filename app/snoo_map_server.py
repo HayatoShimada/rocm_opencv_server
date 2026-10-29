@@ -61,7 +61,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -433,6 +433,27 @@ def clustered(poses: dict[int, Pose], station_id: int) -> bool:
     return snoo_mapper.clustered(recent)
 
 
+# VGGT を回している間置いておくファイル。走りながらの SLAM が同じ GPU で重なると、
+# 1 か所に止まるたびに両方が遅れ、Pi の待ち（25 秒）を越えかねない（2026-10-30）
+GPU_BUSY_FILE = os.getenv("SNOO_GPU_BUSY_FILE", "/run/snoo/map_busy")
+
+
+@contextmanager
+def gpu_busy():
+    """GPU_BUSY_FILE を置いてから中を走らせ、終われば（落ちても）消す。書けなくても止めない。"""
+    path = Path(GPU_BUSY_FILE) if GPU_BUSY_FILE else None
+    try:
+        if path is not None:
+            path.write_text(str(os.getpid()))
+    except OSError:
+        path = None
+    try:
+        yield
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
     """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。
 
@@ -457,7 +478,8 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         seed=station_id,
     )
     refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
-    rec = reconstruct(refs, session / "vggt.npz", marks)
+    with gpu_busy():  # SLAM（app/snoo_slam.py）は、この間サブマップを回さずに待つ
+        rec = reconstruct(refs, session / "vggt.npz", marks)
 
     t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)
