@@ -582,13 +582,14 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
     with gpu_busy():  # SLAM（app/snoo_slam.py）は、この間サブマップを回さずに待つ
         rec = reconstruct(refs, session / "vggt.npz", marks)
-    save_recon(station_dir(session, station_id) / RECON_FILE, refs, rec)
     # 写っていた猫を間取りに入れない（Pi が止まって撮ったコマごとに frames[].dets を付けたとき）
     dets = {(d.name, f["file"]): f.get("dets") for d, st in zip(dirs, stations, strict=True)
             for f in st.frames}  # fmt: skip
     marks["cat_points"] = mask_cats(
         rec.conf, [dets.get((Path(r.path).parent.name, Path(r.path).name)) for r in refs]
     )
+    # 猫を消した後の点を残す（make replay で決め直すと、同じ返事になるように）
+    save_recon(station_dir(session, station_id) / RECON_FILE, refs, rec)
 
     t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)

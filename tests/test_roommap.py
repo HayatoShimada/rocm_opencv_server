@@ -446,3 +446,18 @@ def test_big_frontiers_drop_tiny_holes_in_the_floor():
     ix, iy = np.nonzero(big)
     x, _ = g.center(ix, iy)
     assert len(ix) and np.all(np.abs(x - 0.775) < 0.06)  # 大きな境目だけが残る
+
+
+def test_clip_pieces_keeps_the_front_edge_off_a_wall_near_the_start():
+    """出発点のまわりは障害物を 10 cm しか広げないので、車の真ん中だけ見ると前の端が入った。"""
+    from app.roommap import CAR_FRONT_M, blocked_cells, clip_pieces, rear_axle
+
+    g, _ = _open_floor()
+    wall = np.linspace(-0.3, 0.3, 40)
+    for _ in range(4):
+        g.mark_occupied(np.full_like(wall, 0.27), wall)  # カメラの 27 cm 前に壁
+    pose = Pose(0.0, 0.0, 0.0)
+    pieces = clip_pieces(g, blocked_cells(g, g.state(), pose), pose, [(0.0, 0.40)])
+    run = sum(m for _, m in pieces)
+    front = rear_axle(pose).x + run + CAR_FRONT_M  # 走った後の前の端
+    assert front < 0.27 - 0.025  # 壁のセルの手前の縁より前に出ない

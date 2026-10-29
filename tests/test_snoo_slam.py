@@ -373,6 +373,8 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
     )  # fmt: skip
     again.start(session)
     assert len(again.kfs) == 27 and len(again.pending) == 27
+    # 読み直したコマも猫の箱を覚えている（SLAM に渡すときに塗る・点を使わない）
+    assert again.kfs[tap_rows[0]["file"]].boxes
 
 
 def test_service_starts_a_new_segment_when_tracking_is_lost(tmp_path):
