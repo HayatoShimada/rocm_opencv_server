@@ -29,8 +29,8 @@ services:
       USE_OPENCL: "true"
     restart: unless-stopped
 
-  # PiCar-X（85pi4）の猫の検出（app/snoo.py）。UDP 8710 を tailscale の IP だけで受ける。
-  # tailscale serve は UDP を通せないので、ホストのネットワークで動かし、tailscale の IP に直接 bind する
+  # PiCar-X（85pi4）の猫の検出（app/snoo.py）。UDP 8710 で受ける。
+  # tailscale serve は UDP を通せず、LAN からも受けるので、ホストのネットワークで動かす
   snoo:
     build:
       context: .
@@ -48,10 +48,16 @@ services:
     security_opt:
       - seccomp=unconfined
     environment:
-      SNOO_HOST: "${SNOO_HOST:-100.108.168.101}"
+      # 家の中では Pi は tailscale を通さず LAN の IP に送る（往復が約 3 ms 縮む）。
+      # 0.0.0.0 で受け、認証の無い UDP なので SNOO_ALLOW の送り元（85pi4 の LAN と tailscale の IP）以外は捨てる
+      SNOO_HOST: "${SNOO_HOST:-0.0.0.0}"
+      SNOO_ALLOW: "${SNOO_ALLOW:-192.168.0.188,100.73.14.8}"
       SNOO_PORT: "${SNOO_PORT:-8710}"
       # 検出を torch.compile（HIP グラフ）で動かす。準備の結果は torch-compile ボリュームに残す
       SNOO_COMPILE: "${SNOO_COMPILE:-1}"
+      # フレームを処理している間 1 秒ごとに触る。ホストの deploy/snoo-gpu-perf.sh がこれを見て、
+      # 検出が動いている間だけ GPU の時計を上げる（止まれば 3 秒で auto に戻す）
+      SNOO_ACTIVE_FILE: /run/snoo/active
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
       TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
     # snoo の見本（scripts/snoo_gallery.py で作る）と、
@@ -60,6 +66,7 @@ services:
       - ./data/snoo:/app/data/snoo:ro
       - hf-cache:/root/.cache/huggingface
       - torch-compile:/root/.cache/torch-compile
+      - /run/snoo:/run/snoo
     restart: unless-stopped
 
 volumes:

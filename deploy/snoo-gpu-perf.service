@@ -1,0 +1,15 @@
+# snoo の検出が動いている間だけ GPU の時計を上げる（deploy/snoo-gpu-perf.sh）。入れ方は README。
+[Unit]
+Description=snoo の検出が動いている間だけ GPU の時計を上げる
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/snoo-gpu-perf.sh
+# どんな止まり方でも（kill -9 で trap が走らなくても）auto に戻す
+ExecStopPost=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do echo auto > "$f"; done'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

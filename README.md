@@ -223,11 +223,21 @@ scripts/shopify_product_attributes.py # 商品の属性を判定し、AI 検索�
 
 85pi4（PiCar-X、snoo_trucar）から UDP で届くカメラ画像から猫を検出し、箱を返す（`app/snoo.py`）。やりとりの仕様は snoo_trucar の `docs/PROTOCOL.md`（20 バイトのヘッダー + JPEG を受け、JSON を返す）。
 
-- 検出: RT-DETR v2（`PekingU/rtdetr_v2_r18vd`、COCO の cat、Apache-2.0）を GPU で fp16 で動かす。640x480 で受けてから返すまで 11 ms ほど（JPEG の展開込み）、85pi4 からの往復で 21 ms ほど
-- snoo かどうかの判定はまだ無いので、`snoo` は `null` で返す
-- tailscale serve は UDP を通せないので、tailscale の IP で直接受ける（LAN には出さない）
+- 検出: RT-DETR v2（`PekingU/rtdetr_v2_r18vd`、COCO の cat、Apache-2.0）を GPU で fp16 で動かす（`--compile` で torch.compile）。60 fps で受けてから返すまで 8 ms ほど、85pi4 からの往復で 15 ms ほど
+- snoo らしさ: 猫の箱を CLIP で埋め込み、snoo の写真から作った見本（`scripts/snoo_gallery.py`）との近さを返す。見本が無ければ `null`
+- 家の中では、Pi は tailscale を通さず LAN の IP に送る（tailscale 経由より往復が約 3 ms 短い）。`0.0.0.0` で受け、認証の無い UDP なので `--allow`（`SNOO_ALLOW`）に書いた送り元（85pi4 の LAN と tailscale の IP）以外は捨てる。tailscale serve は UDP を通せないので、tailscale からも直接受ける
+- 10 秒ごとのログに、区間（受信・デコード・検出・CLIP・送信）ごとの p50/p95 を出す
+- compose では `snoo` サービスとして常に動かす（`docker compose up -d snoo`）
+- GPU の時計: 検出はフレームの合間に GPU が時計を下げるため、60 fps の間隔だと 7.8 ms かかる（休まず回すと 4.3 ms）。上げたままだと消費電力が増えるので、ホストの `deploy/snoo-gpu-perf.sh` が、検出がフレームを処理している間（`/run/snoo/active` が 3 秒以内に触られている間）だけ `high` にし、それ以外は `auto` に戻す。スクリプトが止まったときは trap と systemd の `ExecStopPost` で、起動し直したときは amdgpu の既定で `auto` になる
+
+  ```bash
+  sudo install -m 755 deploy/snoo-gpu-perf.sh /usr/local/bin/
+  sudo install -m 644 deploy/snoo-gpu-perf.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now snoo-gpu-perf
+  journalctl -u snoo-gpu-perf -f   # 「GPU の時計: high」「auto」が出る
+  ```
 
 ```bash
 uv sync --group clip --group clef-local   # torch（ROCm）と transformers
-uv run python -m app.snoo --host "$(tailscale ip -4)"   # 既定のポートは 8710
+uv run python -m app.snoo --host 0.0.0.0 --allow 192.168.0.188,100.73.14.8   # 既定のポートは 8710
 ```
