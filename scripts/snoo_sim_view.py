@@ -19,8 +19,8 @@ from pathlib import Path
 
 import cv2
 
-from app.snoo_mapper import grid_png
-from app.snoo_sim import Sim, room_from_map, synthetic_room
+from app.snoo_mapper import MapParams, grid_png
+from app.snoo_sim import CAM_H_M, Sim, room_from_map, synthetic_room
 
 
 def _rays(text: str) -> tuple[int, int]:
@@ -61,13 +61,16 @@ def main() -> None:
         "--backtrack",
         type=int,
         default=0,
-        help="行き場が無いとき下がって撮り直す回数（Pi には無い。試し）",
+        help="行き場が無いとき来た道を戻って撮り直す回数（Pi の reverse。サーバーは 2）",
     )
+    parser.add_argument("--sonar", action="store_true", help="前の超音波を格子に足す")
+    parser.add_argument("--segments", action="store_true", help="1 歩を曲がる → まっすぐで走る")
     parser.add_argument("--viewer", action="store_true", help="MuJoCo の窓で見る")
     args = parser.parse_args()
 
     room = room_from_map(args.room, args.high_board_m) if args.room else synthetic_room()
-    sim = Sim(room, rays=args.rays, seed=args.seed)
+    params = MapParams(camera_height_m=CAM_H_M, segments=args.segments)
+    sim = Sim(room, rays=args.rays, params=params, seed=args.seed, sonar_map=args.sonar)
     if args.viewer:
         run_viewer(sim, args.explore or 20, args.backtrack)
         return

@@ -40,7 +40,9 @@ from app.roommap import (
     CAR_FRONT_M,
     CAR_REAR_M,
     FREE,
+    MAX_SEGMENTS,
     OCCUPIED,
+    REVERSE_MAX_M,
     SONAR_HALF_DEG,
     SONAR_RANGE_M,
     UNKNOWN,
@@ -50,6 +52,9 @@ from app.roommap import (
     Plan,
     Pose,
     arc,
+    consume,
+    mark_sonar,
+    retrace,
 )
 from app.snoo_mapper import MapParams, StationResult, decide
 
@@ -73,8 +78,9 @@ PAN_LIMIT_DEG = 35.0
 STEER_LIMIT_DEG = 30.0  # URDF は ±40° だが、Pi が ±30° で止める
 # 前の超音波の高さ（円すいの広さ・届く距離は app/roommap.py）
 SONAR_H_M = 0.045
-# Pi の speed 1 あたりの速さ（m/s）。snoo_trucar の sim.py と同じ仮の値（測っていない）
-SPEED_M_S = 0.01
+# Pi の speed 1 あたりの速さ（m/s）。1 回目の実走（explore_20261029_210008）の VGGT の位置から
+# 測った（speed 12 で約 20 cm/s）
+SPEED_M_S = 0.017
 # 1 ステーションで撮る向き。実機の scan.json と同じ（パン -35〜35° を 10° おき × チルト 3 段）
 SCAN_PANS = tuple(range(-35, 36, 10))
 SCAN_TILTS = (-15, 0, 15)
@@ -85,9 +91,9 @@ DRIVE_TILT_DEG = -15.0
 # 通り道（clear_cm）の帯：車の幅の両脇に足す余裕と、先を見る長さ（app/clearance.py と同じ）
 CORRIDOR_MARGIN_M = 0.02
 CLEAR_MAX_M = 1.0
-# 行き場が無いときに下がる長さと速さ（explore の backtrack。シミュレーターだけの試し）
-BACKTRACK_M = 0.30
-SPEED_BACK = 10
+# 行き場が無いときに来た道を戻る長さと速さ（explore の backtrack。地図のサーバーの reverse と同じ）
+BACKTRACK_M = REVERSE_MAX_M
+SPEED_BACK = 12
 # 走っている間、前がこれより近くまでふさがったら止まる（Pi が clear_cm を見て止まる代わり）
 STOP_CLEAR_M = 0.05
 
@@ -741,6 +747,7 @@ class Sim:
         rays: tuple[int, int] = (320, 240),
         params: MapParams | None = None,
         seed: int = 0,
+        sonar_map: bool = False,
     ):
         self.room = room
         self.xml = build_mjcf(room)
@@ -748,6 +755,10 @@ class Sim:
         self.data = mujoco.MjData(self.model)
         self.rays = rays
         self.params = params or MapParams(camera_height_m=CAM_H_M)
+        # 前の超音波をステーションごとに格子に足す（地図のサーバーと同じ）
+        self.sonar_map = sonar_map
+        # 前へ走った道（走った順の区間 (ハンドル°, m)）。行き場が無いときに戻るのに使う
+        self.driven: list[tuple[float, float]] = []
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
         if snoo is None:
@@ -986,6 +997,8 @@ class Sim:
                 self.high[cells[:, 0], cells[:, 1]] += 1
         frames = len(self.station_hits)
         self.station_hits = []
+        if self.sonar_map:
+            mark_sonar(g, self.car.camera_pose(), self.sonar_m)
         st = StationResult(
             f"sim{len(self.stations):03d}", self.car.camera_pose(), CAM_H_M, 0.0, frames
         )
@@ -1056,16 +1069,24 @@ class Sim:
         if self.action.get("action") == "move":
             c = self.car
             x, y, yaw = c.x, c.y, c.yaw
-            n = max(2, int(self.action["distance_cm"] / 2))
-            ds = self.action["distance_cm"] / 100 / n
             self.step_arc = [(x, y, yaw)]
-            for _ in range(n):
-                x, y, yaw = arc(x, y, yaw, self.action["steer_deg"], ds)
-                self.step_arc.append((x, y, yaw))
+            for steer, cm in self.pieces(self.action):
+                n = max(2, int(cm / 2))
+                for _ in range(n):
+                    x, y, yaw = arc(x, y, yaw, steer, cm / 100 / n)
+                    self.step_arc.append((x, y, yaw))
         self.car.steer_deg = float(self.action.get("steer_deg", 0.0))
         self.car.tilt_deg = DRIVE_TILT_DEG
         self.sync()
         return self.action
+
+    @staticmethod
+    def pieces(action: dict) -> list[tuple[float, float]]:
+        """返事の区間 [(ハンドル°, cm), ...]。segments が無ければ steer_deg・distance_cm の 1 本"""
+        segs = action.get("segments")
+        if segs:
+            return [(float(x["steer_deg"]), float(x["distance_cm"])) for x in segs]
+        return [(float(action["steer_deg"]), float(action["distance_cm"]))]
 
     def drive(
         self,
@@ -1123,9 +1144,9 @@ class Sim:
         """撮る → 地図を直す → 1 歩走る、を cycles 回（やめる理由が出たらそこまで）。
 
         前にしか走らないので、角に入ると回れずに unreachable で止まることがある。
-        backtrack > 0 なら、そのときまっすぐ BACKTRACK_M 下がって撮り直す（続けて backtrack 回
-        まで）。Pi は今は後ろへ走らない（後ろにセンサーが無い）ので、足したらどうなるかを
-        見るための、シミュレーターだけの試し。来た道を戻るので、後ろは見えていた床のはず。
+        backtrack > 0 なら、そのとき来た道を同じハンドルで BACKTRACK_M まで戻って撮り直す
+        （続けて backtrack 回まで。地図のサーバーの reverse と同じ。さっき走った床の上だけを通る）。
+        params.segments なら、1 歩を「曲がる → まっすぐ」の区間で走る。
         """
         reason = "cycles"
         backs = 0
@@ -1139,15 +1160,27 @@ class Sim:
                 if on_frame:
                     on_frame(self)
             if action.get("action") != "move":
-                if action.get("reason") == "unreachable" and backs < backtrack:
+                back = retrace(self.driven, BACKTRACK_M, MAX_SEGMENTS)
+                if action.get("reason") == "unreachable" and backs < backtrack and back:
                     backs += 1
                     self.reverses += 1
-                    self.drive(0.0, SPEED_BACK, BACKTRACK_M * 100, on_frame, reverse=True)
+                    for steer, m in back:
+                        before = self.distance_m
+                        result = self.drive(steer, SPEED_BACK, m * 100, on_frame, reverse=True)
+                        self.driven = consume(self.driven, self.distance_m - before)
+                        if result != "ok":
+                            break
                     continue
                 reason = str(action.get("reason", "done"))
                 break
             backs = 0
-            self.drive(action["steer_deg"], action["speed"], action["distance_cm"], on_frame)
+            for steer, cm in self.pieces(action):
+                before = self.distance_m
+                result = self.drive(steer, action["speed"], cm, on_frame)
+                if self.distance_m - before > 1e-6:
+                    self.driven.append((steer, self.distance_m - before))
+                if result != "ok":
+                    break
         self.phase = "done"
         return self.summary(reason)
 
