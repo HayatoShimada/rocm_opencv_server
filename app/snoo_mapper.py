@@ -52,10 +52,12 @@ from app.roommap import (
     drive_poses,
     frontiers,
     mark_sonar,
+    moves_are_clear,
     next_best_view,
     plan_turn,
     random_step,
     retrace,
+    take,
     turning_reverse,
 )
 
@@ -973,7 +975,29 @@ def reverse_step(
     pieces: list[tuple[float, float]] = []
     if history.recent_reverses < MAX_RECENT_REVERSES:
         pieces = turning_reverse(grid, pose) or turning_reverse(grid, pose, length=0.15)
-    return pieces or retrace_step(history, segments)
+    return pieces or clear_retrace(grid, pose, retrace_step(history, segments))
+
+
+def clear_retrace(
+    grid: Grid, pose: Pose, pieces: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """来た道を戻る区間を、今の格子で確かめて縮める（来た後に障害物が増えたかもしれない）。
+
+    後ろにはセンサーが無い。来た道は Pi の見積もりや指令の弧で作ることもあり、実際に通った道と
+    違いうるので、切り返しと同じく頭の 15 cm だけ見ていない所を許し、その先は床だけ
+    （コードレビュー）。
+    """
+    if not pieces:
+        return []
+    state = grid.state()
+    total = sum(m for _, m in pieces)
+    for frac in (1.0, 0.75, 0.5):
+        cut = take(pieces, total * frac)
+        if sum(m for _, m in cut) < MIN_STEP_M:
+            break
+        if moves_are_clear(grid, state, pose, [(st, m, True) for st, m in cut]):
+            return cut
+    return []
 
 
 def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:

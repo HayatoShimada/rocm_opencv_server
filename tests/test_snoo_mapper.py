@@ -347,3 +347,19 @@ def test_mark_slam_ignores_a_lost_or_misaligned_slam(tmp_path):
     assert not mark_slam(Grid(), np.zeros((240, 240), np.int32), tmp_path / "none", MapParams())[
         "used"
     ]
+
+
+def test_retrace_is_cut_when_an_obstacle_appeared_behind():
+    from app.roommap import Grid, Pose
+    from app.snoo_mapper import clear_retrace
+
+    g = Grid(size_m=6.0)
+    xs = np.arange(-1.0, 1.0, 0.025)
+    gx, gy = np.meshgrid(xs, xs)
+    g.mark_free(gx.ravel(), gy.ravel())
+    pieces = [(0.0, 0.30)]  # まっすぐ 30 cm 戻る
+    assert clear_retrace(g, Pose(0.0, 0.0, 0.0), pieces) == pieces
+    for _ in range(4):  # 来た後に、後ろ 35 cm に物が置かれた
+        g.mark_occupied(np.full(10, -0.35), np.linspace(-0.1, 0.1, 10))
+    cut = clear_retrace(g, Pose(0.0, 0.0, 0.0), pieces)
+    assert sum(m for _, m in cut) < 0.30
