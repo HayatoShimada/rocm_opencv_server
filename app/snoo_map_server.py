@@ -52,6 +52,7 @@ VGGT は 1 つずつ回す（同時に来たものは順に待たせる）。
 """
 
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -308,13 +309,25 @@ def load_still(d: Path) -> Station:
     return Station(st.dir, [f for f in st.frames if not f.get("moving")])
 
 
+def read_meta(d: Path) -> dict:
+    """ステーションの meta.json。1 回のリクエストで同じものを何度も読むので、時刻と大きさが
+    同じ間は読み直さない（送り直されて書き換わったら読み直す）。返す dict は書き換えないこと。"""
+    st = (d / "meta.json").stat()
+    return _read_meta(str(d / "meta.json"), st.st_mtime_ns, st.st_size)
+
+
+@functools.lru_cache(maxsize=512)
+def _read_meta(path: str, mtime_ns: int, size: int) -> dict:
+    return json.loads(Path(path).read_text())
+
+
 def supports(d: Path) -> set[str]:
     """Pi ができると書いてきたこと（"reverse"・"segments"）。書いていない Pi は今までどおり。"""
-    return set(json.loads((d / "meta.json").read_text()).get("supports") or [])
+    return set(read_meta(d).get("supports") or [])
 
 
 def camera_height_m(d: Path) -> float:
-    h = json.loads((d / "meta.json").read_text()).get("camera_height_cm")
+    h = read_meta(d).get("camera_height_cm")
     return (h or DEFAULT_CAMERA_HEIGHT_CM) / 100
 
 
@@ -323,7 +336,7 @@ def ultrasonic_cm(d: Path) -> float | None:
     読みの中央値にする（1 回の読みはときどき跳ねる。実走で 34 cm の中に 61 cm が混じった）。
     MIN_ULTRASONIC_CM より短い・負の値は、測れなかった（Pi が -1・-2 を返すことがある）とする。
     """
-    meta = json.loads((d / "meta.json").read_text())
+    meta = read_meta(d)
     values = [meta.get("ultrasonic_cm")]
     values += [f.get("ultrasonic_cm") for f in meta["frames"] if not f.get("moving")]
     ok = [
@@ -732,7 +745,7 @@ def steps_driven(
     for i in station_ids(session):
         if i > station_id:
             break
-        prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+        prev = read_meta(station_dir(session, i)).get("prev_step")
         pieces = step_pieces(prev) if isinstance(prev, dict) else None
         if before is None or i != before + 1 or pieces is None:
             out.append((i, None, False))
@@ -776,7 +789,7 @@ def recent_reverses(session: Path, station_id: int) -> int:
     count = 0
     for i in station_ids(session):
         if station_id - RECENT_STATIONS < i <= station_id:
-            prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+            prev = read_meta(station_dir(session, i)).get("prev_step")
             if isinstance(prev, dict):
                 reverse = prev.get("reverse")
                 count += bool(reverse) if reverse is not None else (i - 1) in sent
