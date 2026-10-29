@@ -363,3 +363,18 @@ def test_retrace_is_cut_when_an_obstacle_appeared_behind():
         g.mark_occupied(np.full(10, -0.35), np.linspace(-0.1, 0.1, 10))
     cut = clear_retrace(g, Pose(0.0, 0.0, 0.0), pieces)
     assert sum(m for _, m in cut) < 0.30
+
+
+def test_mask_cats_zeroes_points_in_cat_boxes_and_ignores_bad_input():
+    from app.snoo_mapper import mask_cats
+
+    conf = np.ones((3, 10, 20), np.float32)
+    boxes = [
+        [{"box": [0.5, 0.5, 1.0, 1.0], "cat": 0.9}],  # 右下 1/4（広げて少し大きく）
+        [{"box": [0.0, 0.0, 0.5, 0.5], "cat": 0.3}],  # 猫らしくない箱は使わない
+        [{"box": "bad"}, None, {"cat": 0.9}],  # 壊れた形は飛ばす
+    ]
+    n = mask_cats(conf, boxes)
+    assert n > 0 and conf[0, 9, 19] == 0 and conf[0, 0, 0] == 1
+    assert conf[1].min() == 1 and conf[2].min() == 1
+    assert mask_cats(conf, []) == 0
