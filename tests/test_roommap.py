@@ -6,11 +6,13 @@ import pytest
 from app.roommap import (
     FREE,
     OCCUPIED,
+    SONAR_AHEAD_M,
     UNKNOWN,
     Grid,
     Pose,
     dubins,
     frontiers,
+    mark_sonar,
     next_best_view,
     sample_path,
     view_gain,
@@ -104,3 +106,47 @@ def test_first_step_goes_straight_for_a_straight_path():
     steer, step = first_step(g, blocked, Pose(0, 0, 0), path, 1.0)
     assert steer == pytest.approx(0, abs=0.5)
     assert step == pytest.approx(0.4)
+
+
+def test_sonar_marks_the_arc_as_obstacle_and_the_cone_before_it_as_floor():
+    g = Grid(size_m=8.0)
+    mark_sonar(g, Pose(0.0, 0.0, 0.0), 0.52)
+    s = g.state()
+    front = SONAR_AHEAD_M + 0.52
+    assert s[g.cell(front, 0.0)] == OCCUPIED
+    # 弧は円すいの幅いっぱい（±15°）
+    assert s[g.cell(SONAR_AHEAD_M + 0.52 * math.cos(math.radians(14)), 0.12)] == OCCUPIED
+    assert s[g.cell(0.30, 0.0)] == FREE  # 手前は床
+    assert s[g.cell(front - 0.06, 0.0)] != FREE  # 読みの手前の余裕は床にしない
+    assert s[g.cell(0.30, 0.25)] == UNKNOWN  # 円すいの外
+    assert s[g.cell(-0.30, 0.0)] == UNKNOWN  # 後ろ
+    assert s[g.cell(front + 0.15, 0.0)] == UNKNOWN  # 障害物の向こう
+
+
+def test_sonar_follows_the_station_pose():
+    g = Grid(size_m=8.0)
+    mark_sonar(g, Pose(1.0, -1.0, math.pi / 2), 0.42)  # +y を向いている
+    s = g.state()
+    assert s[g.cell(1.0, -1.0 + SONAR_AHEAD_M + 0.42)] == OCCUPIED
+    assert s[g.cell(1.0, -0.7)] == FREE
+    assert s[g.cell(1.3, -1.0)] == UNKNOWN
+
+
+def test_sonar_beyond_its_range_only_marks_floor_and_none_does_nothing():
+    g = Grid(size_m=8.0)
+    mark_sonar(g, Pose(0.0, 0.0, 0.0), None)
+    assert not g.logodds.any()
+    mark_sonar(g, Pose(0.0, 0.0, 0.0), 3.5)
+    s = g.state()
+    assert not (s == OCCUPIED).any()
+    assert s[g.cell(2.5, 0.0)] == FREE
+    assert s[g.cell(3.2, 0.0)] == UNKNOWN
+
+
+def test_sonar_floor_does_not_erase_an_obstacle_the_camera_saw():
+    """超音波は 4.5 cm の高さを見るので、それより低い物を床と言って消さない。"""
+    g = Grid(size_m=8.0)
+    g.mark_occupied(np.array([0.30]), np.array([0.0]))
+    for _ in range(5):
+        mark_sonar(g, Pose(0.0, 0.0, 0.0), 1.0)
+    assert g.state()[g.cell(0.30, 0.0)] == OCCUPIED

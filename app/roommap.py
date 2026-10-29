@@ -37,6 +37,10 @@ CAM_X_M = 0.16
 # 前の超音波（バンパーの真ん中）。±15° の円すいで、3 m まで測れる
 SONAR_HALF_DEG = 15.0
 SONAR_RANGE_M = 3.0
+# カメラの真下から超音波まで（車の前の端）
+SONAR_AHEAD_M = CAR_FRONT_M - CAM_X_M
+# 超音波の読みのこれだけ手前までを床にする（読みのぶれと、セルの大きさの分）
+SONAR_FREE_MARGIN_M = 0.10
 # 1 回の撮影で見える範囲：画角 54° の半分 + パン ±35°
 HALF_VIEW_DEG = 62.0
 VIEW_RANGE_M = 2.0
@@ -103,6 +107,45 @@ class Grid:
         s[self.logodds < -0.4] = FREE
         s[self.logodds > 0.4] = OCCUPIED
         return s
+
+
+def mark_sonar(grid: Grid, camera: Pose, distance_m: float | None) -> None:
+    """前の超音波の 1 回の読みを格子に足す。camera はそのステーションの位置（カメラの真下）。
+
+    超音波は ±SONAR_HALF_DEG の円すいでいちばん近い物までの距離を返すので、どの向きに
+    あったかは分からない。そこで読みの距離の弧（円すいの幅いっぱい）を障害物にし、
+    それより SONAR_FREE_MARGIN_M 手前までを床にする。SONAR_RANGE_M より遠い（届かなかった）
+    ときは床だけ。測れなかった（None）ときは何もしない。
+    床は、もう障害物と見ているセルには足さない。超音波は床から 4.5 cm の高さで、それより
+    低い物（カメラが見た段差など）を見落とすので、カメラの障害物を消さないようにする。
+    """
+    if distance_m is None or not math.isfinite(distance_m) or distance_m <= 0:
+        return
+    hit = distance_m <= SONAR_RANGE_M
+    c, s = math.cos(camera.yaw), math.sin(camera.yaw)
+    ox, oy = camera.x + SONAR_AHEAD_M * c, camera.y + SONAR_AHEAD_M * s
+    half = math.radians(SONAR_HALF_DEG)
+    step = grid.res / 2
+
+    def cone(r: np.ndarray):
+        # 弧の上の点が step より離れないよう、いちばん遠い所に合わせて向きを刻む
+        n = int(math.ceil(2 * half * float(r.max()) / step)) + 1
+        a = camera.yaw + np.linspace(-half, half, n)
+        rr, aa = np.meshgrid(r, a)
+        return ox + rr * np.cos(aa), oy + rr * np.sin(aa)
+
+    if hit:
+        grid.mark_occupied(*cone(np.array([distance_m])))
+    free_to = distance_m - SONAR_FREE_MARGIN_M if hit else SONAR_RANGE_M
+    if free_to <= step:
+        return
+    x, y = cone(np.arange(step, free_to, step))
+    ix, iy = grid.cell(x.ravel(), y.ravel())
+    ok = grid.inside(ix, iy)
+    cells = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0)
+    cells = cells[grid.logodds[cells[:, 0], cells[:, 1]] <= 0]
+    grid.logodds[cells[:, 0], cells[:, 1]] += FREE_HIT
+    np.clip(grid.logodds, -4, 4, out=grid.logodds)
 
 
 def inflate(occupied: np.ndarray, radius_cells: int) -> np.ndarray:

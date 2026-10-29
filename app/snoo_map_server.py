@@ -83,6 +83,8 @@ LOW_BATTERY_V = 6.8
 WINDOW = 6
 # 床からレンズの中心まで。2026-10-29 に SD カードの長い辺（32 mm）2.5 枚分と測った
 DEFAULT_CAMERA_HEIGHT_CM = 8.0
+# 超音波がこれより短く読んだら測れなかったとする（PiCar-X の超音波は 2 cm から）
+MIN_ULTRASONIC_CM = 2.0
 
 # 置き場の名前になるので、/ や . を含めない（../ で外に書かせない）
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -134,6 +136,7 @@ def parse_meta(text: str | None) -> dict:
         raise BadRequest("station_id は 0〜999 の整数にする")
     _number(meta.get("battery_v"), "battery_v")
     _number(meta.get("tilt_offset_deg"), "tilt_offset_deg")
+    _number(meta.get("ultrasonic_cm"), "ultrasonic_cm")
     h = _number(meta.get("camera_height_cm"), "camera_height_cm")
     if h is not None and not 0 < h <= 100:
         raise BadRequest("camera_height_cm は 0 より大きく 100 以下にする")
@@ -227,6 +230,25 @@ def load_still(d: Path) -> Station:
 def camera_height_m(d: Path) -> float:
     h = json.loads((d / "meta.json").read_text()).get("camera_height_cm")
     return (h or DEFAULT_CAMERA_HEIGHT_CM) / 100
+
+
+def ultrasonic_cm(d: Path) -> float | None:
+    """そのステーションの前の超音波の読み（cm）。meta の ultrasonic_cm と、止まって撮ったコマごとの
+    読みの中央値にする（1 回の読みはときどき跳ねる。実走で 34 cm の中に 61 cm が混じった）。
+    MIN_ULTRASONIC_CM より短い・負の値は、測れなかった（Pi が -1・-2 を返すことがある）とする。
+    """
+    meta = json.loads((d / "meta.json").read_text())
+    values = [meta.get("ultrasonic_cm")]
+    values += [f.get("ultrasonic_cm") for f in meta["frames"] if not f.get("moving")]
+    ok = [
+        float(v)
+        for v in values
+        if isinstance(v, int | float)
+        and not isinstance(v, bool)
+        and math.isfinite(v)
+        and v >= MIN_ULTRASONIC_CM
+    ]
+    return float(np.median(ok)) if ok else None
 
 
 def read_poses(session: Path) -> dict[int, Pose]:
@@ -337,7 +359,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     window = choose_window(ids, station_id, poses)
     dirs = [station_dir(session, i) for i in window]
     stations = [load_still(d) for d in dirs]
-    params = MapParams(camera_height_m=[camera_height_m(d) for d in dirs])
+    params = MapParams(
+        camera_height_m=[camera_height_m(d) for d in dirs],
+        ultrasonic_cm=[ultrasonic_cm(d) for d in dirs],
+    )
     refs = select_frames(stations, MAX_FRAMES)
     rec = reconstruct(refs, session / "vggt.npz", marks)
 

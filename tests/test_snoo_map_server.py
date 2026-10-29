@@ -14,7 +14,14 @@ from test_snoo_mapper import PANS, STATIONS, TILTS, _scene
 
 from app.roommap import Pose
 from app.snoo import parse_allow
-from app.snoo_map_server import Recon, choose_window, create_app, save_station, to_session
+from app.snoo_map_server import (
+    Recon,
+    choose_window,
+    create_app,
+    save_station,
+    to_session,
+    ultrasonic_cm,
+)
 
 PI = ("192.168.0.188", 40000)
 JPEG = cv2.imencode(".jpg", np.full((48, 64, 3), 128, np.uint8))[1].tobytes()
@@ -127,6 +134,18 @@ def test_two_stations_return_the_next_step(tmp_path):
     assert "vggt" in plan["timing_s"]
 
 
+def test_ultrasonic_is_the_median_of_the_station_readings(tmp_path):
+    session = tmp_path / "s"
+    m = _meta(0, ultrasonic_cm=34.5)
+    for f, v in zip(m["frames"], [34.4, 61.3, 34.5, -1, 34.6, None, 34.5, 34.4], strict=False):
+        f["ultrasonic_cm"] = v
+    m["frames"][-1]["ultrasonic_cm"] = 150.0  # 走りながら測った値は使わない
+    d = save_station(session, 0, m, {})
+    assert ultrasonic_cm(d) == pytest.approx(34.5)
+    d = save_station(session, 1, _meta(1), {})
+    assert ultrasonic_cm(d) is None
+
+
 def test_station_is_saved(tmp_path):
     c = _client(tmp_path)
     meta = _meta(3)
@@ -162,6 +181,7 @@ def _all_images(m):
         (_set(station_id=1000), _all_images, "station_id"),
         (_set(battery_v="7.8"), _all_images, "battery_v"),
         (_set(camera_height_cm=0), _all_images, "camera_height_cm"),
+        (_set(ultrasonic_cm="34"), _all_images, "ultrasonic_cm"),
         (lambda m: {**m, "frames": m["frames"][-1:]}, _all_images, "止まって撮った"),
         (lambda m: m, lambda m: ["00_pan-035_tilt-15.jpg"], "画像が無い"),
         (lambda m: m, lambda m: _all_images(m) + ["other.jpg"], "frames に無い"),

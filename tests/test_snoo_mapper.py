@@ -202,6 +202,23 @@ def test_select_frames_drops_the_upward_row_and_thins_pans():
     assert any(r.tilt_deg == 0 and r.pan_deg == -5 for r in first)
 
 
+def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
+    """VGGT が見落とした物（白い壁など）を、超音波で格子に足す。"""
+    stations, refs, ext, points, conf = _scene()
+    params = MapParams(camera_height_m=CAM_H, ultrasonic_cm=[None, 40])
+    r = build_map(stations, refs, ext, points, conf, params)
+    g, state = r.grid, r.grid.state()
+    last = r.stations[-1].pose
+    d = 0.05 + 0.40  # 超音波（カメラの 5 cm 前）から 40 cm
+    ahead = g.cell(last.x + d * math.cos(last.yaw), last.y + d * math.sin(last.yaw))
+    # 作り物の部屋ではカメラがそこに床を 2 回見ているので、障害物 1 回と足して「分からない」になる。
+    # それでも床ではないので、車はそこへ行かない
+    assert state[ahead] != FREE
+    assert result.grid.state()[ahead] == FREE  # 超音波が無ければ床
+    with pytest.raises(ValueError):
+        build_map(stations, refs, ext, points, conf, MapParams(CAM_H, ultrasonic_cm=[1.0]))
+
+
 def test_decide_stops_on_step_limit_and_bad_registration(result):
     g = result.grid
     st = result.stations

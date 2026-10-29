@@ -3,7 +3,8 @@
 
     uv run python -m scripts.snoo_map_build data/snoo_map/map_A data/snoo_map/map_B \\
         --camera-height-cm 10 --out out/
-車には車輪の回転計も、使える距離センサーも無い（超音波は None を返す）ので、位置も画像から出す。
+車には車輪の回転計が無いので、位置も画像から出す。前の超音波は、測れたステーションでは
+格子に足す（MapParams.ultrasonic_cm）。
 全ステーションの画像をまとめて 1 回 VGGT に通し、同じ座標に並べる（別々に通すと座標がそろわない）。
 VGGT の座標は大きさ（m）も向きも決まっていないので、次のように決める。
 - 床：点の中から RANSAC で平面を探す。カメラより下で、カメラの「上」に近い向きの平面だけを見る
@@ -32,7 +33,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.roommap import FREE, OCCUPIED, UNKNOWN, Grid, Plan, Pose, frontiers, next_best_view
+from app.roommap import (
+    FREE,
+    OCCUPIED,
+    UNKNOWN,
+    Grid,
+    Plan,
+    Pose,
+    frontiers,
+    mark_sonar,
+    next_best_view,
+)
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
 # 検出サーバーと分け合うので余裕を見る）
@@ -69,6 +80,10 @@ class MapParams:
     # 車のすぐ前の「障害物」になって、どこへも行けなくなった
     border_px: int = 8
     max_stations: int = MAX_STATIONS
+    # ステーションごとの前の超音波の読み（cm。None は測れなかった）。そのステーションの位置から
+    # 格子に足す（app/roommap.mark_sonar）。VGGT は白い壁や近すぎる物を見落とすことがあり、
+    # 1 回目の実走（explore_20261029_210008）では 3 歩とも超音波で止まった
+    ultrasonic_cm: list[float | None] | None = None
 
 
 @dataclass
@@ -476,6 +491,8 @@ def build_map(
     heights = list(heights) if isinstance(heights, list | tuple) else [heights] * n_st
     if len(heights) != n_st:
         raise ValueError("camera_height_m の数がステーションの数と合わない")
+    if params.ultrasonic_cm is not None and len(params.ultrasonic_cm) != n_st:
+        raise ValueError("ultrasonic_cm の数がステーションの数と合わない")
 
     finite = np.isfinite(pts).all(-1) & (cf > 0)
     good = finite & (cf >= np.percentile(cf[finite], params.conf_percentile))
@@ -526,6 +543,8 @@ def build_map(
         hx, hy = _cells_with(grid, p[is_high, 0], p[is_high, 1], MIN_POINTS_PER_CELL)
         hix, hiy = grid.cell(hx, hy)
         high[hix, hiy] += 1
+        if params.ultrasonic_cm is not None and params.ultrasonic_cm[s] is not None:
+            mark_sonar(grid, pose, params.ultrasonic_cm[s] / 100)
         res.floor_points, res.obstacle_points = int(is_floor.sum()), int(is_obst.sum())
         res.high_points = int(is_high.sum())
         if cols is not None:
