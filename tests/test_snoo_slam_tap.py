@@ -130,3 +130,16 @@ def test_serve_does_not_wait_for_a_slow_write(tmp_path):
     tap.flush()
     info = json.loads(sorted(tmp_path.glob("*/*.json"))[0].read_text())
     assert info["seq"] == 1 and info["dets"][0]["cat"] == 0.9
+
+
+def test_tap_clears_the_sender_dir_when_the_pi_clock_goes_back(tmp_path):
+    from app.snoo import Frame
+    from app.snoo_slam_tap import SlamTap
+
+    tap = SlamTap(tmp_path, hz=1000)
+    old = Frame(1, 500 * 10**9, 640, 480, b"\xff\xd8", 0.0, 12.0, 0.0, -15.0, 1)
+    tap._write("10.0.0.1", old, [], 0.0)
+    new = Frame(2, 3 * 10**9, 640, 480, b"\xff\xd8", 0.0, 12.0, 0.0, -15.0, 1)  # 起動し直した
+    tap._write("10.0.0.1", new, [], 1.0)
+    names = sorted(p.name for p in (tmp_path / "10.0.0.1").glob("*.json"))
+    assert len(names) == 1 and int(names[0][:-5]) == 3 * 10**9

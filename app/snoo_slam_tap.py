@@ -125,6 +125,7 @@ class SlamTap:
         d = self.root / name
         d.mkdir(exist_ok=True)
         stem = file_stem(frame.t_capture_ns)
+        self._drop_if_clock_went_back(d, stem)
         info = {
             "v": 1,
             "sender": name,
@@ -153,6 +154,18 @@ class SlamTap:
         _replace(d / f"{stem}.json", json.dumps(info, ensure_ascii=False).encode())
         self._trim(d)
 
+    def _drop_if_clock_went_back(self, d: Path, stem: str) -> None:
+        """Pi が起動し直すと撮った時刻（CLOCK_MONOTONIC）が戻る。名前は撮った時刻なので、
+        そのままだと新しいフレームがいちばん古い名前になり、_trim がすぐ消してしまう。
+        前の起動のフレームも残って、SLAM が新しいセッションに混ぜる。
+        CLOCK_BACK_S より戻ったら空にする。
+        """
+        names = sorted(p.name for p in d.glob("*.json"))
+        if names and int(names[-1][: -len(".json")]) - int(stem) > CLOCK_BACK_S * 1e9:
+            log.info("%s の撮った時刻が戻った（Pi を起動し直した）。前のフレームを消す", d.name)
+            for p in d.iterdir():
+                p.unlink(missing_ok=True)
+
     def _trim(self, d: Path) -> None:
         """古いものから消して max_files 枚にする。"""
         names = sorted(p.name for p in d.glob("*.json"))
@@ -160,6 +173,10 @@ class SlamTap:
             stem = old[: -len(".json")]
             for suffix in (".json", ".jpg"):
                 (d / f"{stem}{suffix}").unlink(missing_ok=True)
+
+
+# 撮った時刻がこの秒数より前に戻ったら、Pi が起動し直したとみなす
+CLOCK_BACK_S = 60.0
 
 
 def _replace(path: Path, data: bytes) -> None:

@@ -464,3 +464,12 @@ def test_each_station_keeps_its_points_and_reply_and_can_be_replayed(tmp_path):
     # 最後でないステーションも、残した点で決め直せる
     station, again, before, _ = replay(session, tmp_path / "out", station=0)
     assert station == 0 and before == replies[0] and same_reply(again, before)
+
+
+def test_no_floor_returns_done_instead_of_500(tmp_path, monkeypatch):
+    import app.snoo_mapper as mapper
+
+    monkeypatch.setattr(mapper, "fit_floor", lambda *a, **k: None)
+    c = _client(tmp_path)
+    r = _post(c, _meta(0))
+    assert r.status_code == 200 and r.json()["action"] == "done"
