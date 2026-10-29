@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: help test-fast test lint fmt deploy-detector deploy-map status replay
+.PHONY: run-report help test-fast test lint fmt deploy-detector deploy-map status replay
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -36,6 +36,10 @@ deploy-map:
 
 status:
 	$(PYTHON) -m scripts.snoo_dev status
+
+run-report:
+	@test -n "$(SESSION)" || { echo "make run-report SESSION=<セッション> [CLEAR=clear.jsonl] [BASE=<セッション>]"; exit 2; }
+	$(PYTHON) -m scripts.snoo_run_report $(SESSION) $(if $(CLEAR),--clear $(CLEAR)) $(if $(BASE),--base $(BASE))
 
 replay:
 	@test -n "$(SESSION)" || { echo "make replay SESSION=<セッションの名前か置き場>"; exit 2; }
