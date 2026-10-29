@@ -102,6 +102,9 @@ def map_is_busy() -> bool:
         return False
 
 
+# VGGT を読んだあと、この秒数サブマップを回さなければ、プロセスを終えて GPU を手放す
+# （0 なら手放さない）
+GPU_IDLE_S = float(os.getenv("SNOO_SLAM_GPU_IDLE_S", "60"))
 # 新しいコマがこの秒数来なければ、submap_size に足りなくても回す（止まったとき）
 FLUSH_S = float(os.getenv("SNOO_SLAM_FLUSH_S", "1.5"))
 # ループを閉じるか（SALAD を使う。GPL-3.0）
@@ -828,6 +831,10 @@ class SlamService:
             self._model = load_vggt_model()
         return VggtSlam(self._model, loop=self.loop)
 
+    def loaded(self) -> bool:
+        """GPU にモデルを載せたか（GPU を握っているか）。"""
+        return self.slam is not None or getattr(self, "_model", None) is not None
+
     def preload(self) -> None:
         """VGGT と SALAD を先に読んでおく（最初のサブマップを 5〜10 秒待たせない）。"""
         self._spare = self._new_slam()
@@ -1054,10 +1061,19 @@ class SlamService:
         while self.pending:
             self.step()
 
-    def run_forever(self, interval: float = 0.2) -> None:
+    def run_forever(self, interval: float = 0.2, idle_s: float = 0.0) -> None:
+        """idle_s > 0 なら、VGGT を読んだあと idle_s 秒何も回さなければプロセスを終える
+        （GPU を手放す。systemd がすぐ起動し直し、次のコマで読み直す）。"""
+        last = time.monotonic()
         while True:
             try:
-                if not self.poll():
+                if self.poll():
+                    last = time.monotonic()
+                else:
+                    if idle_s > 0 and self.loaded() and time.monotonic() - last > idle_s:
+                        log.info("%.0f 秒回していないので、終えて GPU を手放す", idle_s)
+                        logging.shutdown()
+                        os._exit(0)
                     time.sleep(interval)
             except Exception:  # 1 つのセッションの失敗でサービスを止めない
                 log.exception("SLAM で失敗した。このセッションをやめて、次を待つ")
@@ -1085,9 +1101,10 @@ def main() -> None:
     svc = SlamService(
         args.data, args.queue, args.submap_size, args.flush_s, args.loop, args.station_moving
     )
-    svc.preload()
+    # VGGT は最初のコマが来てから読む。起動したときに読むと、Pi が走っていない間も GPU を握り、
+    # 検出と合わせて GPU が休めない（GPU を握ったプロセスが 2 つ以上だと 120 W、1 つなら 6 W）
     log.info("待ち受け（置き場 %s、タップ %s）", args.data, args.queue)
-    svc.run_forever()
+    svc.run_forever(idle_s=GPU_IDLE_S)
 
 
 def quiet_vggt_slam() -> None:

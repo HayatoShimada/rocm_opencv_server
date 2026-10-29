@@ -24,7 +24,8 @@ Environment=PYTHONUNBUFFERED=1
 Environment=HF_HUB_OFFLINE=1
 # 送り元・置き場などを変えるときは ~/.config/snoo-map.env に SNOO_MAP_ALLOW=... の形で書く
 EnvironmentFile=-%h/.config/snoo-map.env
-Restart=on-failure
+# GPU を手放すために自分で終える（終了コード 0）ので、always で起動し直す
+Restart=always
 RestartSec=3
 # 止めるとき、VGGT を GPU から下ろすのを待ちすぎない
 TimeoutStopSec=10

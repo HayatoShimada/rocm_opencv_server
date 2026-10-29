@@ -391,13 +391,34 @@ class Recon:
 Reconstruct = Callable[[list[FrameRef], Path, dict], Recon]
 
 
+# VGGT を読んだまま、この秒数ステーションが来なければプロセスを終えて GPU を手放す
+# （systemd がすぐ起動し直し、次のステーションで読み直す。読むのは 7 秒ほど）。
+# RX 7900 XTX は GPU を握ったプロセスが 2 つ以上あると、何もしていなくても休めず
+# 120 W ほど食う（2026-10-30 に測った。1 つなら 6 W）。0 なら手放さない
+GPU_IDLE_S = float(os.getenv("SNOO_MAP_GPU_IDLE_S", "120"))
+
+
 class VggtReconstruct:
-    """VGGT を GPU に載せたまま持つ（ステーションごとに読み直すと 5 秒以上かかる）。
-    GPU を 5 GB 使い続けるが、検出（Docker の snoo）は 2 GB ほどなので、24 GB に収まる。
+    """VGGT を GPU に載せて持つ（ステーションごとに読み直すと 5 秒以上かかる）。
+
+    起動したときには読まず、最初のステーションで読む。GPU_IDLE_S 秒使わなければ、
+    プロセスごと終えて GPU を手放す（GPU を握ったままだと、検出と合わせて GPU が休めない）。
     """
 
-    def __init__(self):
+    def __init__(self, idle_s: float = GPU_IDLE_S):
         self.model = None
+        self.idle_s = idle_s
+        self.last_used = time.monotonic()
+        if idle_s > 0:
+            threading.Thread(target=self._watch_idle, daemon=True, name="vggt-idle").start()
+
+    def _watch_idle(self) -> None:
+        while True:
+            time.sleep(5)
+            if self.model is not None and time.monotonic() - self.last_used > self.idle_s:
+                log.info("VGGT を %.0f 秒使っていないので、終えて GPU を手放す", self.idle_s)
+                logging.shutdown()
+                os._exit(0)
 
     def load(self) -> None:
         t = time.perf_counter()
@@ -407,6 +428,7 @@ class VggtReconstruct:
     def __call__(self, refs: list[FrameRef], npz: Path, marks: dict) -> Recon:
         import torch
 
+        self.last_used = time.monotonic()
         if self.model is None:
             self.load()
         params = MapParams()
@@ -421,6 +443,7 @@ class VggtReconstruct:
         points, conf = unproject(v, params.stride, params.border_px)
         colors = frame_colors(paths, v.depth.shape[1:], params.stride)
         marks["points"] = time.perf_counter() - t
+        self.last_used = time.monotonic()
         return Recon(v.extrinsic, points, conf, colors)
 
 
@@ -741,10 +764,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        # 最初のステーションも 20 秒に収まるよう、VGGT は起動したときに読んでおく
-        load = getattr(reconstruct, "load", None)
-        if load is not None:
-            load()
+        # VGGT は最初のステーションで読む（7 秒ほど。Pi は 25 秒待つ）。起動したときに読むと、
+        # Pi が探っていない間も GPU を握り、検出と合わせて GPU が休めない
         yield
 
     app = FastAPI(title="snoo map", lifespan=lifespan)

@@ -26,7 +26,8 @@ Environment=HF_HUB_OFFLINE=1
 # サブマップの大きさ・ループを閉じるかなどは ~/.config/snoo-slam.env に書く
 # （SNOO_SLAM_SUBMAP_SIZE=8、SNOO_SLAM_LOOP=0 など）
 EnvironmentFile=-%h/.config/snoo-slam.env
-Restart=on-failure
+# GPU を手放すために自分で終える（終了コード 0）ので、always で起動し直す
+Restart=always
 RestartSec=5
 TimeoutStopSec=10
 
