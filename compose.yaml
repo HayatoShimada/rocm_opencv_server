@@ -69,6 +69,10 @@ services:
       SNOO_CAMERA_HEIGHT_CM: "${SNOO_CAMERA_HEIGHT_CM:-8}"
       SNOO_TILT_GAIN: "${SNOO_TILT_GAIN:-1.0}"
       SNOO_TILT_OFFSET_DEG: "${SNOO_TILT_OFFSET_DEG:-0.0}"
+      # 送り元ごとに最新のフレームと返事を 1 秒に 1 回ほど書く（app/snoo_live.py）。地図のサーバー
+      # （ホストのプロセス）が /twin で見せる。/run/snoo は下のボリュームでホストと分け合う。
+      # 空にすれば書かない
+      SNOO_LIVE_DIR: "${SNOO_LIVE_DIR-/run/snoo/live}"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
       TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
     # snoo の見本（scripts/snoo_gallery.py で作る）と、
