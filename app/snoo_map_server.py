@@ -105,11 +105,10 @@ from app.snoo_mapper import (
     load_station,
     load_vggt_model,
     mark_slam,
+    or_reverse,
     pose_dict,
     registration_is_bad,
     retrace_step,
-    reverse_action,
-    reverse_step,
     run_vggt,
     save_vggt,
     select_frames,
@@ -118,6 +117,9 @@ from app.snoo_mapper import (
     unproject,
     write_outputs,
     xy_to_frame,
+)
+from app.snoo_mapper import (
+    WINDOW as MAPPER_WINDOW,
 )
 
 HOST = os.getenv("SNOO_MAP_HOST", "0.0.0.0")
@@ -147,7 +149,7 @@ MAX_REQUEST_BYTES = 40 * 1024 * 1024
 #     窓 6 と比べて中央値 0.5 cm・いちばん大きいとき 11 cm、向き 3° まで
 #   窓 4・前は 2 コマ（16 コマ）：合わせて 3.1 秒だが、1 か所で位置が 24 cm・向きが 12° ずれ、
 #     1 か所は位置合わせが崩れた。使わない
-WINDOW = 4
+WINDOW = MAPPER_WINDOW
 OLD_FRAMES: int | None = 6
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGES = 64
@@ -603,16 +605,13 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     t = time.perf_counter()
     raw = r.action
     action = dict(raw)
-    if action == {"action": "done", "reason": "unreachable"} and params.reverse:
-        pose = r.stations[-1].pose
-        pieces = reverse_step(r.grid, pose, history(session, station_id, poses), params.segments)
-        if pieces:
-            action = reverse_action(pieces, params.segments)
-            # 戻る弧を上から見た絵に描き、戻った先を target にする
-            r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
-            action["target"] = pose_dict(r.step_path[-1])
-            remember_reverse(session, station_id, action)
-            r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
+    pose = r.stations[-1].pose
+    action, pieces = or_reverse(action, r.grid, pose, history(session, station_id, poses), params)
+    if pieces:  # 戻る弧を上から見た絵に描き、戻った先を target にする
+        r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
+        action["target"] = pose_dict(r.step_path[-1])
+        remember_reverse(session, station_id, action)
+        r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
     if action.get("reverse") and station_id not in read_reverses(session):
         # 向きを変える 1 歩（turn）も後ろへ走る。prev_step に reverse を書かない Pi のために残す
         # （残さないと、後ろへの turn を前へ走ったものとして来た道と床を逆側にしていた）
