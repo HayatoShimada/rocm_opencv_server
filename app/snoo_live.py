@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.snoo import Detection, Frame
 
+from app import atomic
+
 log = logging.getLogger("snoo")
 
 # 書く所。空なら書かない
@@ -135,11 +137,7 @@ class LiveWriter:
         if clear is not None:
             info.update(clear)
         # 画像を先に置く（JSON の seq を見て画像を取りに来るので）
-        _replace(self.root / f"{name}.jpg", frame.jpeg)
-        _replace(self.root / f"{name}.json", json.dumps(info, ensure_ascii=False).encode())
-
-
-def _replace(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+        atomic.write_bytes(self.root / f"{name}.jpg", frame.jpeg)
+        atomic.write_bytes(
+            self.root / f"{name}.json", json.dumps(info, ensure_ascii=False).encode()
+        )

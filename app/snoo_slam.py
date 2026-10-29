@@ -79,6 +79,8 @@ from pathlib import Path
 
 import numpy as np
 
+from app import atomic
+
 log = logging.getLogger("snoo_slam")
 
 QUEUE_DIR = os.getenv("SNOO_SLAM_QUEUE_DIR", "/run/snoo/slam")
@@ -559,14 +561,10 @@ def voxel_down(xyz: np.ndarray, rgb: np.ndarray, voxel: float):
 # --- 書き出し ---
 
 
-def _replace(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
-
-
 def write_trajectory(out: Path, rows: list[dict]) -> None:
-    _replace(out / "trajectory.jsonl", "".join(json.dumps(r) + "\n" for r in rows).encode())
+    atomic.write_bytes(
+        out / "trajectory.jsonl", "".join(json.dumps(r) + "\n" for r in rows).encode()
+    )
 
 
 def write_points(out: Path, xyz, rgb, count, voxel: float) -> None:
@@ -577,7 +575,9 @@ def write_points(out: Path, xyz, rgb, count, voxel: float) -> None:
 
 
 def write_status(out: Path, status: dict) -> None:
-    _replace(out / "status.json", json.dumps(status, ensure_ascii=False, indent=1).encode())
+    atomic.write_bytes(
+        out / "status.json", json.dumps(status, ensure_ascii=False, indent=1).encode()
+    )
 
 
 def read_trajectory(out: Path) -> list[dict]:
