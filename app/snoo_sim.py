@@ -69,8 +69,7 @@ from app.snoo_mapper import (
     choose_window,
     clustered,
     decide,
-    reverse_action,
-    reverse_step,
+    or_reverse,
 )
 
 # GL の選び方は mujoco を読み込む前に決める（画面の無いマシンでも描けるよう EGL にする）
@@ -1199,11 +1198,8 @@ class Sim:
             self.params, seed=len(self.stations) - 1, force_random=clustered(recent)
         )
         self.action, self.plan = decide(self.grid, self.stations, params, heights)
-        if self.action == {"action": "done", "reason": "unreachable"} and params.reverse:
-            pose = self.stations[-1].pose
-            pieces = reverse_step(self.grid, pose, self.history(), params.segments)
-            if pieces:
-                self.action = reverse_action(pieces, params.segments)
+        pose = self.stations[-1].pose
+        self.action, _ = or_reverse(self.action, self.grid, pose, self.history(), params)
         a = self.action
         kind = "reverse" if a.get("reverse") else "random" if a.get("random") else "nbv"
         kind = "turn" if a.get("turn") else kind

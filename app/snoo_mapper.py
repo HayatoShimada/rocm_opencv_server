@@ -910,9 +910,10 @@ CLUSTER_STATIONS = 4
 CLUSTER_RADIUS_M = 0.30
 
 
-# 1 回に VGGT に入れるステーションの数。48 コマを 6 か所で分けると 1 か所 8 コマ（下向きと
-# 正面の 2 段 × パン 4 つ）。これより多いと 1 か所のコマが少なすぎて向きと位置がぶれる
-WINDOW = 6
+# 1 回に VGGT に入れるステーションの数（地図のサーバーもこれを使う）。最後のステーションの
+# 全部のコマと、近くの前の 3 か所の 6 コマずつで 28 コマ（VGGT 4.5 秒ほど）。6 か所・48 コマでは
+# 6.5 秒かかり、位置はほとんど変わらなかった
+WINDOW = 4
 
 
 def choose_window(
@@ -998,6 +999,21 @@ def clear_retrace(
         if moves_are_clear(grid, state, pose, [(st, m, True) for st, m in cut]):
             return cut
     return []
+
+
+def or_reverse(
+    action: dict, grid: Grid, pose: Pose, history: History, params: MapParams
+) -> tuple[dict, list[tuple[float, float]]]:
+    """前へ行ける所が無い（unreachable）とき、Pi が下がれるなら下がる 1 歩に替える。
+
+    (返事, 下がる区間)。替えなければ区間は空。地図のサーバーとシミュレーターで同じ決め方にする。
+    """
+    if action != {"action": "done", "reason": "unreachable"} or not params.reverse:
+        return action, []
+    pieces = reverse_step(grid, pose, history, params.segments)
+    if not pieces:
+        return action, []
+    return reverse_action(pieces, params.segments), pieces
 
 
 def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
