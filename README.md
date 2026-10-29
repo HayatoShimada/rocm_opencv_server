@@ -241,3 +241,34 @@ scripts/shopify_product_attributes.py # 商品の属性を判定し、AI 検索�
 uv sync --group clip --group clef-local   # torch（ROCm）と transformers
 uv run python -m app.snoo --host 0.0.0.0 --allow 192.168.0.188,100.73.14.8   # 既定のポートは 8710
 ```
+
+## 開発の流れ（snoo のサーバー）
+
+main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make help` で一覧）。待つものは、いまどの準備をしているかと経った秒数を出し、上限の秒数を超えたらやめる。
+
+| やること | コマンド | かかる時間（2026-10-29） |
+|---|---|---|
+| 重いテストを飛ばして試す | `make test-fast` | 約 20 秒（200 個） |
+| すべてのテスト | `make test` | 約 50 秒（6 個の pytest に分けて同時に。1 つだと約 4 分） |
+| ruff | `make lint`（直すときは `make fmt`） | 1 秒 |
+| 検出（app/snoo.py など）を直して試す | `make deploy-detector` | 約 15〜20 秒（待ち受けまで）＋ p50/p95 が出るまで最大 10 秒 |
+| 地図（app/snoo_map_server.py など）を直して試す | `make deploy-map` | 約 7 秒 |
+| 両方の様子を見る | `make status` | 0.1 秒 |
+| 保存したセッションの最後の 1 歩を GPU なしで決め直す | `make replay SESSION=explore_20261029_223944` | 1 秒 |
+
+- **検出**: `compose.dev.yaml` が `./app` をコンテナに読み取り専用で重ねるので、app/ を直したら作り直さずに起動し直すだけで新しいコードで動く。`make deploy-detector` は、上書きの無いコンテナなら一度だけ作り直し（`docker compose -f compose.yaml -f compose.dev.yaml up -d snoo`）、あとは `restart` して「待ち受け」まで待ち、最初の p50/p95 の行を出す。起動に失敗したら Traceback を出してやめる。torch.compile の準備は torch-compile ボリュームのキャッシュが効く（検出 約 11 秒・clear_cm の深度 約 2.5 秒）。もっと速く試すときは `SNOO_CLEARANCE=0`（約 16 秒）・`SNOO_COMPILE=0`（clear も切って約 9 秒）を付けて `make deploy-detector`（作り直しになる）。pyproject.toml・uv.lock・Dockerfile を変えたときは `docker compose build snoo` が要る（`make deploy-detector` が知らせる）。本番の形（上書きなし）に戻すのは `docker compose up -d snoo`、その後に待つだけなら `.venv/bin/python -m scripts.snoo_dev wait-detector`
+- **地図**: systemd のユーザーのサービス（`deploy/snoo-map.service`）で動かす。落ちたら 3 秒後に起動し直し、ホストを起動し直しても動く。入れ方（sudo は要らない。手で起動したものを先に止める）:
+
+  ```bash
+  pkill -f 'python -m app.snoo_map_server'          # 手で起動したもの（8720）を止める
+  mkdir -p ~/.config/systemd/user
+  ln -sf ~/orca/rocm_opencv_server/deploy/snoo-map.service ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now snoo-map
+  loginctl show-user "$USER" -p Linger              # Linger=yes なら、ログインしていなくても動く
+  journalctl --user -u snoo-map -f                  # ログ
+  ```
+
+  送り元（`SNOO_MAP_ALLOW`）などを変えるときは `~/.config/snoo-map.env` に書いて `make deploy-map`
+- **走っている間の SLAM**: 検出が走っている間のフレームを 4 枚/秒ほど `/run/snoo/slam` に書き（`SNOO_SLAM_TAP_DIR`、app/snoo_slam_tap.py）、ホストの app/snoo_slam.py（VGGT-SLAM 2.0）がステーションと合わせて読み、`<セッション>/slam/` に trajectory.jsonl・points.npz・status.json を書く（形は app/snoo_slam.py の先頭）。torch・gtsam は別の venv にあるので、`deploy/snoo-slam-venv.sh` で作ってから `deploy/snoo-slam.service` を地図と同じやり方で入れる（`systemctl --user enable --now snoo-slam`）。保存したセッションを流し直して poses.json と比べるのは `HSA_CU_MASK=0:0-71 ~/orca/vggt-slam-venv/bin/python -m scripts.snoo_slam_replay <セッションの置き場> --out /tmp/slam`
+- **テスト**: 重いテストの印（slow）は `tests/conftest.py` の `SLOW` に名前で書く（テストのファイルは直さない）。`make test-fast` で、印が無いのに 3 秒を超えたテストは最後に名前が出る。`make test ARGS='-x'` のように pytest に引数を渡せる
+- **replay**: 地図のサーバーはステーションごとに VGGT の出力をセッションの `vggt.npz` に上書きするので、決め直せるのはそれを作ったステーション（ふつうは最後）の 1 歩。VGGT の代わりに `vggt.npz` を読み、サーバーと同じ `plan_station` を通す。もとのセッションには書かず、`/tmp/snoo-replay/<セッション>` に room.json・topdown.png・plan.json を作る。前に Pi に返したものと違えば終了コード 1（`ARGS=--allow-diff` で 0）

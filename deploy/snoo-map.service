@@ -1,0 +1,34 @@
+# 地図のサーバー（app/snoo_map_server.py、ポート 8720）を systemd のユーザーのサービスで動かす。
+# VGGT・scipy・einops は main の .venv にだけあるので、コンテナではなくホストで動かす。
+# 入れ方（sudo は要らない。README の「開発の流れ」）:
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/orca/rocm_opencv_server/deploy/snoo-map.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now snoo-map
+#   journalctl --user -u snoo-map -f
+# ログインしていなくても（再起動の後も）動かすには linger が要る（loginctl show-user で Linger=yes）
+[Unit]
+Description=snoo の地図のサーバー（VGGT、ポート 8720）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/orca/rocm_opencv_server
+ExecStart=%h/orca/rocm_opencv_server/.venv/bin/python -m app.snoo_map_server
+# VGGT に使わせる CU。検出（Docker の snoo）のために 96 CU のうち 72 CU にする
+# （app/snoo_map_server.py の SNOO_MAP_CU_MASK と同じ値。サーバーは HSA_CU_MASK があればそちらを使う）
+Environment=HSA_CU_MASK=0:0-71
+# ログに日本語がそのまま出るように、出力を貯めない
+Environment=PYTHONUNBUFFERED=1
+# VGGT の重みは ~/.cache/huggingface にあるので、Hugging Face に問い合わせない
+Environment=HF_HUB_OFFLINE=1
+# 送り元・置き場などを変えるときは ~/.config/snoo-map.env に SNOO_MAP_ALLOW=... の形で書く
+EnvironmentFile=-%h/.config/snoo-map.env
+# GPU を手放すために自分で終える（終了コード 0）ので、always で起動し直す
+Restart=always
+RestartSec=3
+# 止めるとき、VGGT を GPU から下ろすのを待ちすぎない
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

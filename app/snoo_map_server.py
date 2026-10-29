@@ -9,7 +9,28 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
   JSON）と images（meta の frames[].file と同じ名前の画像）。返事は次の 1 歩（action=move）か、
   やめる理由（action=done）。Pi は 20 秒待って返事が無ければ自分で探るので、1 ステーションを
   20 秒以内に返す
+  - meta の ultrasonic_cm（と止まって撮ったコマごとの読み）は、そのステーションの前の超音波として
+    格子に足す
+  - meta の supports（Pi ができること）に "segments" があれば、move に
+    segments: [{steer_deg, distance_cm}, ...]（曲がる → まっすぐ、合わせて 40 cm まで）を付ける。
+    上の steer_deg・distance_cm は最初の区間
+  - supports に "reverse" があれば、前へ行ける所が無い（unreachable）とき、来た道を戻る
+    {"action": "move", "reverse": true, steer_deg, speed, distance_cm（30 cm まで）, [segments]}
+    を返す（続けて 2 回まで）。見たい所が後ろ（100° より後ろ）のときも、前へ輪を描く代わりに
+    切り返し（いっぱいに切って下がる）を返すことがある。そのときは "turn": true が付く
+    （形は reverse の返事と同じ）
+  - supports に "long_step"（と "segments"）があれば、まっすぐの区間が地図で床と分かっている
+    ときは、1 歩を 60 cm まで延ばす（40 cm を超えるのは、最後のまっすぐの区間だけ）。
+    Pi は今までどおり超音波・clear_cm・動かないときに止まる
+  - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
+- GET /twin：車と部屋をブラウザで見る画面（app/snoo_twin.py）。地図・ステーション・次の 1 歩・
+  撮った画像と、検出サーバーの今のフレーム（SNOO_MAP_LIVE_DIR）を 1〜2 秒ごとに読み直して出す。
+  このマシンのブラウザなら http://127.0.0.1:8720/twin で開ける。tailnet や LAN の別の機械から
+  見るときは、その機械の IP を SNOO_MAP_ALLOW に足して起動し直す（既定には入れていない。
+  認証が無く、撮った部屋の画像が見えるため）。例：
+      SNOO_MAP_ALLOW=192.168.0.188,100.73.14.8,127.0.0.1,100.x.y.z \\
+          .venv/bin/python -m app.snoo_map_server
 
 受けたステーションは <SNOO_MAP_DATA>/<session_id>/<station_id:03d>/ に画像と meta.json で残し、
 結果（vggt.npz・room.json・topdown.png・plan.json など）はセッションの置き場に書く。
@@ -20,13 +41,17 @@ VGGT は 48 コマで 9 秒ほどかかる（RX 7900 XTX）。実データ（23 
 その近くのステーション（合わせて WINDOW 個）だけにする。そのときの間取りの原点は窓のいちばん
 古いステーションになるので、前に求めたそのステーションの位置を足して、返す位置をセッションの
 座標（最初のステーションが原点）に直す。
-窓の外のステーションは間取りに入らない（room.json・topdown.png は窓の中だけ）。
+最後のステーションで見たもの（床・障害物・上の層のセルと超音波）は、セッションの座標にして
+<station>/obs.npz に 1 回だけ残し、次の 1 歩は全部のステーションの分を足した間取りで決める
+（窓の外で見た所も忘れない）。room.json・topdown.png もセッションの座標で書く
+（window.origin_pose は (0, 0, 0)、VGGT の窓の原点は window.vggt_origin_pose）。
 
 認証が無いので、SNOO_MAP_ALLOW に書いた送り元（Pi の LAN と tailscale の IP）以外には 403 を返す
 （app/snoo.py の検出サーバーと同じやり方）。GPU は猫の検出（Docker の snoo）と分け合うので、
 VGGT は 1 つずつ回す（同時に来たものは順に待たせる）。
 """
 
+import dataclasses
 import json
 import logging
 import math
@@ -36,7 +61,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -46,25 +71,53 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.roommap import Pose
+from app import snoo_mapper
+from app.roommap import (
+    FIT_TOL_M,
+    LONG_STEP_M,
+    MAX_STEP_M,
+    Pose,
+    camera_of,
+    consume,
+    drive_poses,
+    fit_driven,
+    mark_driven,
+    take,
+)
 from app.snoo import _allowed, parse_allow
 from app.snoo_mapper import (
+    CLUSTER_STATIONS,
     MAX_FRAMES,
+    MAX_RECENT_REVERSES,  # noqa: F401  REVERSE_SPEED などはここからも使う
+    MAX_REVERSES,  # noqa: F401
     MAX_STATIONS,
+    RECENT_STATIONS,
+    REVERSE_SPEED,  # noqa: F401
     FrameRef,
+    History,
     MapParams,
+    Observation,
     Station,
     build_map,
+    choose_window,
+    decide,
     frame_colors,
     load_station,
     load_vggt_model,
+    mark_slam,
     pose_dict,
     registration_is_bad,
+    retrace_step,
+    reverse_action,
+    reverse_step,
     run_vggt,
     save_vggt,
     select_frames,
+    session_grid,
+    to_frame,
     unproject,
     write_outputs,
+    xy_to_frame,
 )
 
 HOST = os.getenv("SNOO_MAP_HOST", "0.0.0.0")
@@ -72,17 +125,40 @@ PORT = int(os.getenv("SNOO_MAP_PORT", "8720"))
 # 受ける送り元（IP か CIDR をカンマで区切る）。Pi の LAN・Pi の tailscale・このマシン
 ALLOW = os.getenv("SNOO_MAP_ALLOW", "192.168.0.188,100.73.14.8,127.0.0.1")
 DATA = os.getenv("SNOO_MAP_DATA", "data/snoo_map/sessions")
+# 検出サーバー（Docker の snoo）が今のフレームを書く所（compose.yaml の SNOO_LIVE_DIR と同じ所）。
+# 空なら /twin に今のフレームを出さない
+LIVE_DIR = os.getenv("SNOO_MAP_LIVE_DIR", "/run/snoo/live")
+# VGGT に使わせる GPU の CU（ROCm の HSA_CU_MASK の形「GPU 番号:CU の範囲」）。空なら全部使う。
+# VGGT が GPU を全部使うと、同じ GPU の猫の検出（Docker の snoo）が 1 枚 4.4 ms → p50 37 ms・
+# p95 185 ms（60 fps → 15 fps）まで遅れた。RX 7900 XTX（96 CU）で 72 CU（0-71）にすると、検出は
+# p50 8.7 ms・p95 11.5 ms（55 fps）、VGGT は 40 コマで 6.5 → 7.4 秒（2026-10-29 に測った）。
+# 48 CU（0-47）なら検出 p50 6.2 ms・p95 8.5 ms だが、VGGT が 9.9 秒になり、48 コマの窓では
+# Pi の待ち（20 秒）に近づくので、余裕のある 0-71 にする。
+# HSA_CU_MASK を直に付けて起動したときは、そちらを使う
+CU_MASK = os.getenv("SNOO_MAP_CU_MASK", "0:0-71")
 # 1 回の POST の上限。Pi の画像は 640x480 の JPEG で 1 枚 30 KB ほど、1 ステーション 24 枚ほど
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
+# VGGT に入れるのは、最後のステーションの全部のコマ（10 コマ）と、近くの前の WINDOW - 1 か所の
+# OLD_FRAMES コマずつ（パン -30・0・30 × チルト 2 段）。前のステーションは位置がもう決まって
+# いて、見たものも obs.npz に残してあるので、最後のステーションを同じ座標に置く手がかりで足りる。
+# 3 回目の実走の 15 か所を流し直して測った（scripts/snoo_map_replay.py、72 CU、2026-10-29）：
+#   窓 6・等分（36 コマ）：VGGT 6.5 秒、合わせて 7.4 秒（いちばん遅いとき 9.8 秒）
+#   窓 4・前は 6 コマ（28 コマ）：VGGT 4.5 秒、合わせて 5.3 秒（7.8 秒）。位置の差は
+#     窓 6 と比べて中央値 0.5 cm・いちばん大きいとき 11 cm、向き 3° まで
+#   窓 4・前は 2 コマ（16 コマ）：合わせて 3.1 秒だが、1 か所で位置が 24 cm・向きが 12° ずれ、
+#     1 か所は位置合わせが崩れた。使わない
+WINDOW = 4
+OLD_FRAMES: int | None = 6
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGES = 64
 # これより電池の電圧が低ければ探るのをやめる（2 セルのリチウムイオンで、走ると電圧が落ちる）
 LOW_BATTERY_V = 6.8
-# 1 回に VGGT に入れるステーションの数。48 コマを 6 か所で分けると 1 か所 8 コマ（下向きと
-# 正面の 2 段 × パン 4 つ）。これより多いと 1 か所のコマが少なすぎて向きと位置がぶれる
-WINDOW = 6
 # 床からレンズの中心まで。2026-10-29 に SD カードの長い辺（32 mm）2.5 枚分と測った
 DEFAULT_CAMERA_HEIGHT_CM = 8.0
+# 超音波がこれより短く読んだら測れなかったとする（PiCar-X の超音波は 2 cm から）
+MIN_ULTRASONIC_CM = 2.0
+# Pi の speed 1 あたりの速さ（cm/s）。1 回目の実走の VGGT の位置から測った（speed 12 で約 20 cm/s）
+PI_CM_PER_S_PER_SPEED = 1.7
 
 # 置き場の名前になるので、/ や . を含めない（../ で外に書かせない）
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -134,11 +210,17 @@ def parse_meta(text: str | None) -> dict:
         raise BadRequest("station_id は 0〜999 の整数にする")
     _number(meta.get("battery_v"), "battery_v")
     _number(meta.get("tilt_offset_deg"), "tilt_offset_deg")
+    _number(meta.get("ultrasonic_cm"), "ultrasonic_cm")
     h = _number(meta.get("camera_height_cm"), "camera_height_cm")
     if h is not None and not 0 < h <= 100:
         raise BadRequest("camera_height_cm は 0 より大きく 100 以下にする")
     if meta.get("prev_step") is not None and not isinstance(meta["prev_step"], dict):
         raise BadRequest("prev_step はオブジェクトか null にする")
+    sup = meta.get("supports")
+    if sup is not None and (
+        not isinstance(sup, list) or len(sup) > 16 or not all(isinstance(x, str) for x in sup)
+    ):
+        raise BadRequest("supports は文字列のリストにする")
     frames = meta.get("frames")
     if not isinstance(frames, list) or not frames:
         raise BadRequest("meta の frames が無い")
@@ -224,9 +306,33 @@ def load_still(d: Path) -> Station:
     return Station(st.dir, [f for f in st.frames if not f.get("moving")])
 
 
+def supports(d: Path) -> set[str]:
+    """Pi ができると書いてきたこと（"reverse"・"segments"）。書いていない Pi は今までどおり。"""
+    return set(json.loads((d / "meta.json").read_text()).get("supports") or [])
+
+
 def camera_height_m(d: Path) -> float:
     h = json.loads((d / "meta.json").read_text()).get("camera_height_cm")
     return (h or DEFAULT_CAMERA_HEIGHT_CM) / 100
+
+
+def ultrasonic_cm(d: Path) -> float | None:
+    """そのステーションの前の超音波の読み（cm）。meta の ultrasonic_cm と、止まって撮ったコマごとの
+    読みの中央値にする（1 回の読みはときどき跳ねる。実走で 34 cm の中に 61 cm が混じった）。
+    MIN_ULTRASONIC_CM より短い・負の値は、測れなかった（Pi が -1・-2 を返すことがある）とする。
+    """
+    meta = json.loads((d / "meta.json").read_text())
+    values = [meta.get("ultrasonic_cm")]
+    values += [f.get("ultrasonic_cm") for f in meta["frames"] if not f.get("moving")]
+    ok = [
+        float(v)
+        for v in values
+        if isinstance(v, int | float)
+        and not isinstance(v, bool)
+        and math.isfinite(v)
+        and v >= MIN_ULTRASONIC_CM
+    ]
+    return float(np.median(ok)) if ok else None
 
 
 def read_poses(session: Path) -> dict[int, Pose]:
@@ -252,28 +358,20 @@ def write_poses(session: Path, poses: dict[int, Pose]) -> None:
 
 def to_session(anchor: Pose, p: Pose) -> Pose:
     """窓の座標（原点は窓のいちばん古いステーション）の位置を、セッションの座標に直す。"""
-    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
-    yaw = anchor.yaw + p.yaw
-    return Pose(
-        anchor.x + c * p.x - s * p.y,
-        anchor.y + s * p.x + c * p.y,
-        math.atan2(math.sin(yaw), math.cos(yaw)),
-    )
+    return to_frame(anchor, p)
 
 
-def choose_window(
-    ids: list[int], latest: int, poses: dict[int, Pose], k: int = WINDOW
-) -> list[int]:
-    """VGGT に入れるステーション。最後のステーションと、位置が分かっている前のステーションのうち、
-    1 つ前の位置（今の車の近く）に近い k - 1 個。原点にする窓のいちばん古いステーションの位置が
-    分かっていないと座標を直せないので、位置の分からないステーションは入れない。
-    """
-    known = [i for i in ids if i < latest and i in poses]
-    if not known:
-        return [latest]
-    here = poses[max(known)]
-    near = sorted(known, key=lambda i: (math.hypot(poses[i].x - here.x, poses[i].y - here.y), -i))
-    return sorted(near[: k - 1]) + [latest]
+def obs_path(session: Path, station_id: int) -> Path:
+    return station_dir(session, station_id) / "obs.npz"
+
+
+def read_observations(session: Path, upto: int) -> list[Observation]:
+    """upto までのステーションで見たもの（置き場の obs.npz）。無いステーションは飛ばす。"""
+    out = []
+    for i in station_ids(session):
+        if i <= upto and obs_path(session, i).is_file():
+            out.append(Observation.load(obs_path(session, i)))
+    return out
 
 
 # --- VGGT ---
@@ -294,13 +392,34 @@ class Recon:
 Reconstruct = Callable[[list[FrameRef], Path, dict], Recon]
 
 
+# VGGT を読んだまま、この秒数ステーションが来なければプロセスを終えて GPU を手放す
+# （systemd がすぐ起動し直し、次のステーションで読み直す。読むのは 7 秒ほど）。
+# RX 7900 XTX は GPU を握ったプロセスが 2 つ以上あると、何もしていなくても休めず
+# 120 W ほど食う（2026-10-30 に測った。1 つなら 6 W）。0 なら手放さない
+GPU_IDLE_S = float(os.getenv("SNOO_MAP_GPU_IDLE_S", "120"))
+
+
 class VggtReconstruct:
-    """VGGT を GPU に載せたまま持つ（ステーションごとに読み直すと 5 秒以上かかる）。
-    GPU を 5 GB 使い続けるが、検出（Docker の snoo）は 2 GB ほどなので、24 GB に収まる。
+    """VGGT を GPU に載せて持つ（ステーションごとに読み直すと 5 秒以上かかる）。
+
+    起動したときには読まず、最初のステーションで読む。GPU_IDLE_S 秒使わなければ、
+    プロセスごと終えて GPU を手放す（GPU を握ったままだと、検出と合わせて GPU が休めない）。
     """
 
-    def __init__(self):
+    def __init__(self, idle_s: float = GPU_IDLE_S):
         self.model = None
+        self.idle_s = idle_s
+        self.last_used = time.monotonic()
+        if idle_s > 0:
+            threading.Thread(target=self._watch_idle, daemon=True, name="vggt-idle").start()
+
+    def _watch_idle(self) -> None:
+        while True:
+            time.sleep(5)
+            if self.model is not None and time.monotonic() - self.last_used > self.idle_s:
+                log.info("VGGT を %.0f 秒使っていないので、終えて GPU を手放す", self.idle_s)
+                logging.shutdown()
+                os._exit(0)
 
     def load(self) -> None:
         t = time.perf_counter()
@@ -310,6 +429,7 @@ class VggtReconstruct:
     def __call__(self, refs: list[FrameRef], npz: Path, marks: dict) -> Recon:
         import torch
 
+        self.last_used = time.monotonic()
         if self.model is None:
             self.load()
         params = MapParams()
@@ -324,68 +444,306 @@ class VggtReconstruct:
         points, conf = unproject(v, params.stride, params.border_px)
         colors = frame_colors(paths, v.depth.shape[1:], params.stride)
         marks["points"] = time.perf_counter() - t
+        self.last_used = time.monotonic()
         return Recon(v.extrinsic, points, conf, colors)
 
 
 # --- 1 ステーションを処理する ---
 
 
+def clustered(poses: dict[int, Pose], station_id: int) -> bool:
+    """station_id の直前 CLUSTER_STATIONS か所が狭い所に固まっているか（snoo_mapper.clustered）。"""
+    recent = [poses[i] for i in range(station_id - CLUSTER_STATIONS, station_id) if i in poses]
+    return snoo_mapper.clustered(recent)
+
+
+# 走りながらの SLAM（app/snoo_slam.py）の点と道筋を間取りに足すか
+USE_SLAM = os.getenv("SNOO_MAP_USE_SLAM", "1") == "1"
+# VGGT を回している間置いておくファイル。走りながらの SLAM が同じ GPU で重なると、
+# 1 か所に止まるたびに両方が遅れ、Pi の待ち（25 秒）を越えかねない（2026-10-30）
+GPU_BUSY_FILE = os.getenv("SNOO_GPU_BUSY_FILE", "/run/snoo/map_busy")
+
+
+@contextmanager
+def gpu_busy():
+    """GPU_BUSY_FILE を置いてから中を走らせ、終われば（落ちても）消す。書けなくても止めない。"""
+    path = Path(GPU_BUSY_FILE) if GPU_BUSY_FILE else None
+    try:
+        if path is not None:
+            path.write_text(str(os.getpid()))
+    except OSError:
+        path = None
+    try:
+        yield
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
-    """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。"""
+    """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。
+
+    VGGT は窓（WINDOW か所）だけに通し、最後のステーションの位置と見たものをセッションの座標に
+    直して置き場に残す（obs.npz）。次の 1 歩は、全部のステーションの見たものを足した
+    セッションの間取り（session_grid）で決める。窓の外で見た所も覚えているので、見た所へ
+    戻らない。room.json などもセッションの座標で書く。
+    """
     ids = station_ids(session)
     poses = read_poses(session)
-    window = choose_window(ids, station_id, poses)
+    window = choose_window(ids, station_id, poses, WINDOW)
     dirs = [station_dir(session, i) for i in window]
     stations = [load_still(d) for d in dirs]
-    params = MapParams(camera_height_m=[camera_height_m(d) for d in dirs])
-    refs = select_frames(stations, MAX_FRAMES)
-    rec = reconstruct(refs, session / "vggt.npz", marks)
-
-    t = time.perf_counter()
-    r = build_map(stations, refs, rec.extrinsic, rec.points, rec.conf, params, rec.colors)
-    marks["map"] = time.perf_counter() - t
+    can = supports(dirs[-1])
+    params = MapParams(
+        camera_height_m=[camera_height_m(d) for d in dirs],
+        ultrasonic_cm=[ultrasonic_cm(d) for d in dirs],
+        segments="segments" in can,
+        force_random=clustered(poses, station_id),
+        reverse="reverse" in can,
+        max_step_m=LONG_STEP_M if {"long_step", "segments"} <= can else MAX_STEP_M,
+        seed=station_id,
+    )
+    refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
+    with gpu_busy():  # SLAM（app/snoo_slam.py）は、この間サブマップを回さずに待つ
+        rec = reconstruct(refs, session / "vggt.npz", marks)
 
     t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)
     anchor = poses.get(window[0], Pose(0.0, 0.0, 0.0))
-    for i, s, h in zip(window, r.stations, params.camera_height_m, strict=True):
+    r = build_map(
+        stations, refs, rec.extrinsic, rec.points, rec.conf, params, rec.colors,
+        anchor=anchor, plan=False,
+    )  # fmt: skip
+    for i, s, h, o in zip(window, r.stations, params.camera_height_m, r.observations, strict=True):
         # 一度求めた位置は変えない（変えると、それを原点にした後の窓と座標がずれる）
         if i not in poses and s.frames and not registration_is_bad(s, h):
             poses[i] = to_session(anchor, s.pose)
+        # 見たものも 1 回だけ残す（ふつうは最後のステーション。前の版で受けたステーションも）
+        if i in poses and o is not None and not obs_path(session, i).is_file():
+            o.save(obs_path(session, i))
     write_poses(session, poses)
 
-    action = dict(r.action)
+    # 窓の結果をセッションの座標に直し、セッションの間取りで次の 1 歩を決める
+    r.stations = [dataclasses.replace(s, pose=to_session(anchor, s.pose)) for s in r.stations]
+    r.points = xy_to_frame(anchor, r.points) if len(r.points) else r.points
+    if r.floor.inliers:
+        r.grid, r.high = session_grid(read_observations(session, station_id))
+        if params.driven_free:
+            mark_steps_driven(r.grid, session, station_id, poses)
+        if USE_SLAM:  # 走りながらの SLAM で見た所も足す（app/snoo_slam.py が書く）
+            r.slam = mark_slam(r.grid, r.high, session / "slam", params)
+        r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
+        r.step_path = []
+        if r.plan is not None:
+            pieces = r.plan.segments or [(r.plan.steer_deg, r.plan.step_m)]
+            r.step_path = [camera_of(p) for _, p in drive_poses(r.stations[-1].pose, pieces)]
+    marks["map"] = time.perf_counter() - t
+
+    t = time.perf_counter()
+    raw = r.action
+    action = dict(raw)
+    if action == {"action": "done", "reason": "unreachable"} and params.reverse:
+        pose = r.stations[-1].pose
+        pieces = reverse_step(r.grid, pose, history(session, station_id, poses), params.segments)
+        if pieces:
+            action = reverse_action(pieces, params.segments)
+            # 戻る弧を上から見た絵に描き、戻った先を target にする
+            r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
+            action["target"] = pose_dict(r.step_path[-1])
+            remember_reverse(session, station_id, action)
+            r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
     if action["action"] == "move":
         here = poses.get(station_id)
         if here is None:  # 位置合わせが崩れていれば decide が done にするので、ふつうは来ない
-            here = to_session(anchor, r.stations[-1].pose)
+            here = r.stations[-1].pose
         action["pose"] = pose_dict(here)
-        action["target"] = pose_dict(to_session(anchor, r.plan.target))
+        if not action.get("reverse") and r.plan is not None:  # でたらめな 1 歩には目標が無い
+            action["target"] = pose_dict(r.plan.target)
         action["station_index"] = ids.index(station_id)
         action["map_url"] = f"/v1/snoo/map/{session.name}/topdown.png"
     else:
         # bad_registration:<名前> の名前は Pi には要らない（plan.json には残す）
         action = {"action": "done", "reason": action["reason"].split(":")[0]}
-    write_results(session, r, window, anchor, r.action, marks)
+    write_results(session, r, window, anchor, raw, marks, action)
     marks["write"] = time.perf_counter() - t
     return action
 
 
-def write_results(session: Path, r, window: list[int], anchor: Pose, raw: dict, marks: dict):
+# --- 行き場が無いときに来た道を戻る ---
+
+
+def step_pieces(prev: dict) -> list[tuple[float, float]] | None:
+    """prev_step の区間 [(ハンドル°, m), ...]。segments（返した形のまま）があればそれ、
+    無ければ steer_deg の 1 本の弧（長さは分からないので 0 にし、測った分だけ伸ばす）。
+    """
+    segs = prev.get("segments")
+    if isinstance(segs, list) and segs:
+        out = []
+        for x in segs:
+            st = x.get("steer_deg") if isinstance(x, dict) else None
+            cm = x.get("distance_cm") if isinstance(x, dict) else None
+            if not _finite(st) or not _finite(cm) or cm < 0:
+                return None
+            out.append((float(st), float(cm) / 100))
+        return out
+    st = prev.get("steer_deg")
+    return [(float(st), 0.0)] if _finite(st) else None
+
+
+def _finite(v) -> bool:
+    return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def pi_distance_m(prev: dict) -> float | None:
+    """Pi が見積もった、走った長さ（m）。est_distance_cm、無ければ 秒 × speed × 1.7 cm/s。"""
+    est = prev.get("est_distance_cm")
+    if _finite(est) and est >= 0:
+        return float(est) / 100
+    sec, speed = prev.get("seconds"), prev.get("speed")
+    if _finite(sec) and _finite(speed) and sec >= 0:
+        return float(sec) * abs(float(speed)) * PI_CM_PER_S_PER_SPEED / 100
+    return None
+
+
+def moved_m(prev: dict, pieces, a: Pose | None, b: Pose | None, reverse: bool) -> float | None:
+    """ステーション a から b まで、区間に沿って実際に走った長さ（m）。
+
+    VGGT の 2 つの位置に、区間を自転車モデルで走らせた位置を合わせて測る（Pi の見積もりより
+    確か。1 回目の実走では Pi の見積もりは本当の 0.6 倍だった）。合わなければ（位置が無い・
+    ずれが大きい）Pi の見積もりを使う。
+    """
+    if a is not None and b is not None:
+        s, err = fit_driven(a, b, pieces, reverse)
+        if err <= FIT_TOL_M:
+            return s
+    return pi_distance_m(prev)
+
+
+def driven_trail(
+    session: Path, station_id: int, poses: dict[int, Pose]
+) -> tuple[list[tuple[float, float]], int]:
+    """station_id までに前へ走った道（走った順の区間）と、続けて後ろへ戻った回数。
+
+    ステーションの meta の prev_step を順に見る。前へ走ったら区間を足し、後ろへ戻ったら
+    その分を終わりから除く。どう動いたか分からない所（prev_step が無い・ステーションが
+    飛んでいる・長さが測れない）があれば、そこより前へは戻らない。
+    prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
+    """
+    trail: list[tuple[float, float]] = []
+    backs = 0
+    for _, pieces, reverse in steps_driven(session, station_id, poses):
+        if pieces is None:
+            trail, backs = [], 0
+        elif reverse:
+            trail, backs = consume(trail, sum(m for _, m in pieces)), backs + 1
+        else:
+            trail, backs = trail + pieces, 0
+    return trail, backs
+
+
+def steps_driven(
+    session: Path, station_id: int, poses: dict[int, Pose]
+) -> list[tuple[int, list[tuple[float, float]] | None, bool]]:
+    """station_id までの、ステーションの間に走った 1 歩ごとの (前のステーション, 区間, 後ろへか)。
+    区間は実際に走った長さまで（moved_m）。どう動いたか分からない所は区間が None。
+    prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
+    """
+    sent = read_reverses(session)
+    out: list[tuple[int, list[tuple[float, float]] | None, bool]] = []
+    before = None
+    for i in station_ids(session):
+        if i > station_id:
+            break
+        prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+        pieces = step_pieces(prev) if isinstance(prev, dict) else None
+        if before is None or i != before + 1 or pieces is None:
+            out.append((i, None, False))
+        else:
+            reverse = prev.get("reverse")
+            reverse = before in sent if reverse is None else bool(reverse)
+            s = moved_m(prev, pieces, poses.get(before), poses.get(i), reverse)
+            out.append((before, None if s is None else take(pieces, s), reverse))
+        before = i
+    return out
+
+
+def mark_steps_driven(grid, session: Path, station_id: int, poses: dict[int, Pose]) -> None:
+    """走ってきた道（車の外形の下）を、セッションの間取りの床にする（roommap.mark_driven）。"""
+    for before, pieces, reverse in steps_driven(session, station_id, poses):
+        if pieces and before in poses:
+            mark_driven(grid, poses[before], pieces, reverse)
+
+
+def history(session: Path, station_id: int, poses: dict[int, Pose]) -> History:
+    """station_id までの走り方（来た道・続けて戻った回数・直近で戻った回数）。"""
+    trail, backs = driven_trail(session, station_id, poses)
+    return History(trail, backs, recent_reverses(session, station_id))
+
+
+def backtrack(
+    session: Path, station_id: int, poses: dict[int, Pose], segments: bool
+) -> list[tuple[float, float]]:
+    """前へ行ける所が無いときに、来た道を戻る区間（戻る順）。戻れなければ空
+    （app.snoo_mapper.retrace_step）。
+    """
+    return retrace_step(history(session, station_id, poses), segments)
+
+
+def recent_reverses(session: Path, station_id: int) -> int:
+    """直近 RECENT_STATIONS か所（station_id まで）のうち、後ろへ戻って着いたステーションの数。"""
+    sent = read_reverses(session)
+    count = 0
+    for i in station_ids(session):
+        if station_id - RECENT_STATIONS < i <= station_id:
+            prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+            if isinstance(prev, dict):
+                reverse = prev.get("reverse")
+                count += bool(reverse) if reverse is not None else (i - 1) in sent
+    return count
+
+
+def read_reverses(session: Path) -> dict[int, dict]:
+    """後ろへ戻れと返したステーションと、その返事（reverse.json）。"""
+    p = session / "reverse.json"
+    if not p.exists():
+        return {}
+    return {int(k): v for k, v in json.loads(p.read_text()).items()}
+
+
+def remember_reverse(session: Path, station_id: int, action: dict) -> None:
+    data = read_reverses(session)
+    data[station_id] = {k: v for k, v in action.items() if k != "map_url"}
+    tmp = session / ".reverse.json"
+    tmp.write_text(json.dumps({str(k): v for k, v in sorted(data.items())}, indent=1))
+    tmp.replace(session / "reverse.json")
+
+
+def write_results(
+    session: Path, r, window: list[int], anchor: Pose, raw: dict, marks: dict, reply: dict
+):
     """room.json などを書く。ブラウザで見ている途中に半端なファイルを読ませないよう、
     別の置き場に書いてから 1 つずつ名前を変える。
     """
     tmp = session / ".out"
     shutil.rmtree(tmp, ignore_errors=True)
     write_outputs(r, tmp)
-    info = {"stations": window, "origin_pose": pose_dict(anchor)}
+    # 間取り・ステーション・目標はセッションの座標（原点 (0, 0, 0)）で書く。
+    # vggt_origin_pose は VGGT の窓の原点（vggt.npz の座標）
+    info = {
+        "stations": window,
+        "origin_pose": pose_dict(Pose(0.0, 0.0, 0.0)),
+        "vggt_origin_pose": pose_dict(anchor),
+        "map": "session",
+    }
     room = json.loads((tmp / "room.json").read_text())
     room["window"] = info
     (tmp / "room.json").write_text(json.dumps(room, ensure_ascii=False, indent=1))
     plan = json.loads((tmp / "plan.json").read_text())
     plan["next"] = raw
+    plan["reply"] = reply  # Pi に返したもの（後ろへ戻るときは next と違う）
     plan["window"] = info
     plan["timing_s"] = {k: round(v, 3) for k, v in marks.items()}
+    plan["slam"] = getattr(r, "slam", None)  # 走りながらの SLAM を間取りに足したか
     (tmp / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
     for f in tmp.iterdir():
         f.replace(session / f.name)
@@ -399,7 +757,10 @@ def create_app(
     root: Path | str = DATA,
     allow: list | None = None,
     reconstruct: Reconstruct | None = None,
+    live_dir: Path | str | None = LIVE_DIR,
 ) -> FastAPI:
+    from app.snoo_twin import add_twin  # snoo_twin がこのモジュールを使うので、ここで読む
+
     root = Path(root)
     allow = parse_allow(ALLOW) if allow is None else allow
     reconstruct = VggtReconstruct() if reconstruct is None else reconstruct
@@ -409,10 +770,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        # 最初のステーションも 20 秒に収まるよう、VGGT は起動したときに読んでおく
-        load = getattr(reconstruct, "load", None)
-        if load is not None:
-            load()
+        # VGGT は最初のステーションで読む（7 秒ほど。Pi は 25 秒待つ）。起動したときに読むと、
+        # Pi が探っていない間も GPU を握り、検出と合わせて GPU が休めない
         yield
 
     app = FastAPI(title="snoo map", lifespan=lifespan)
@@ -456,7 +815,8 @@ def create_app(
         marks = {"save": time.perf_counter() - t0}
 
         battery = m.get("battery_v")
-        if battery is not None and battery < LOW_BATTERY_V:
+        # 0 V 以下は読めなかった（2 回目の実走の最後で 0.0 が来た）ので、電池切れにしない
+        if battery is not None and 0 < battery < LOW_BATTERY_V:
             log.info("%s/%03d: 電池が %.2f V なのでやめる", session.name, sid, battery)
             return {"action": "done", "reason": "low_battery"}
         if len(station_ids(session)) >= MAX_STATIONS:
@@ -494,6 +854,7 @@ def create_app(
             raise HTTPException(404, "まだ作っていない")
         return FileResponse(path, media_type=OUTPUTS[name], headers={"Cache-Control": "no-store"})
 
+    add_twin(app, root, Path(live_dir) if live_dir else None)
     return app
 
 
@@ -501,8 +862,16 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # GPU の実行時（HSA）は torch を初めて使うときに環境変数を読むので、VGGT を読む前に決める
+    if CU_MASK:
+        os.environ.setdefault("HSA_CU_MASK", CU_MASK)
     log.info(
-        "%s:%d で待ち受け（受ける送り元: %s、置き場: %s）", HOST, PORT, ALLOW or "すべて", DATA
+        "%s:%d で待ち受け（受ける送り元: %s、置き場: %s、VGGT の CU: %s）",
+        HOST,
+        PORT,
+        ALLOW or "すべて",
+        DATA,
+        os.environ.get("HSA_CU_MASK") or "すべて",
     )
     uvicorn.run(create_app(), host=HOST, port=PORT)
 

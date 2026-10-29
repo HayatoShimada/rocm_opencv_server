@@ -3,7 +3,8 @@
 
     uv run python -m scripts.snoo_map_build data/snoo_map/map_A data/snoo_map/map_B \\
         --camera-height-cm 10 --out out/
-車には車輪の回転計も、使える距離センサーも無い（超音波は None を返す）ので、位置も画像から出す。
+車には車輪の回転計が無いので、位置も画像から出す。前の超音波は、測れたステーションでは
+格子に足す（MapParams.ultrasonic_cm）。
 全ステーションの画像をまとめて 1 回 VGGT に通し、同じ座標に並べる（別々に通すと座標がそろわない）。
 VGGT の座標は大きさ（m）も向きも決まっていないので、次のように決める。
 - 床：点の中から RANSAC で平面を探す。カメラより下で、カメラの「上」に近い向きの平面だけを見る
@@ -32,7 +33,31 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.roommap import FREE, OCCUPIED, UNKNOWN, Grid, Plan, Pose, frontiers, next_best_view
+from app.roommap import (
+    BEHIND_DEG,
+    FREE,
+    MAX_SEGMENTS,
+    MAX_STEP_M,
+    MIN_STEP_M,
+    OCCUPIED,
+    REVERSE_MAX_M,
+    TURN_GAIN_DEG,
+    UNKNOWN,
+    Grid,
+    Plan,
+    Pose,
+    Turn,
+    bearing,
+    camera_of,
+    drive_poses,
+    frontiers,
+    mark_sonar,
+    next_best_view,
+    plan_turn,
+    random_step,
+    retrace,
+    turning_reverse,
+)
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
 # 検出サーバーと分け合うので余裕を見る）
@@ -40,7 +65,8 @@ MAX_FRAMES = 48
 # 次の位置へ走る速さ（Pi の forward の値）。床が見えている所しか走らないが、ゆっくり行く
 SPEED = 12
 # ステーションの数の上限（これ以上は探らない）
-MAX_STATIONS = 30
+# 1 周が 17 秒ほどになり、30 か所では 8 分で止まるので、電池（10〜20 分）に合わせる
+MAX_STATIONS = 50
 # 床・障害物と見る点の、格子 1 マスあたりの最少の数（1 回の撮影で）。
 # VGGT の点は外れ値があるので 1 点では決めない
 MIN_POINTS_PER_CELL = 3
@@ -69,6 +95,29 @@ class MapParams:
     # 車のすぐ前の「障害物」になって、どこへも行けなくなった
     border_px: int = 8
     max_stations: int = MAX_STATIONS
+    # ステーションごとの前の超音波の読み（cm。None は測れなかった）。そのステーションの位置から
+    # 格子に足す（app/roommap.mark_sonar）。VGGT は白い壁や近すぎる物を見落とすことがあり、
+    # 1 回目の実走（explore_20261029_210008）では 3 歩とも超音波で止まった
+    ultrasonic_cm: list[float | None] | None = None
+    # 1 歩を「曲がる → まっすぐ」の区間（segments）で返す。Pi が meta の supports に
+    # "segments" を書いたときだけ（古い Pi は 1 本の弧しか走れない）
+    segments: bool = False
+    # 行き場が無いときに後ろへ下がってよい（Pi が supports に "reverse" を書いたとき。
+    # 下がり方は reverse_step で決める）
+    reverse: bool = False
+    # 走ってきた道（車の外形の下）を床にする（roommap.mark_driven。地図のサーバーと
+    # シミュレーターが間取りに足す）
+    driven_free: bool = True
+    # 1 歩の長さの上限。Pi が supports に "long_step"（と "segments"）を書いたときは
+    # roommap.LONG_STEP_M（60 cm）まで。超えた分はまっすぐの区間だけ
+    max_step_m: float = MAX_STEP_M
+    # 見たい所が後ろなら、先に向きを変える（roommap.plan_turn。reverse のときだけ）
+    plan_turns: bool = True
+    # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
+    random_p: float = 0.15
+    # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
+    force_random: bool = False
+    seed: int = 0
 
 
 @dataclass
@@ -107,16 +156,28 @@ def load_station(d: str | Path, scan_file: str = "scan.json") -> Station:
 
 
 def select_frames(
-    stations: list[Station], max_frames: int = MAX_FRAMES, drop_tilt_above: float = 5.0
+    stations: list[Station],
+    max_frames: int = MAX_FRAMES,
+    drop_tilt_above: float = 5.0,
+    old_frames: int | None = None,
 ) -> list[FrameRef]:
     """VGGT に入れるコマを選ぶ。上向き（tilt > drop_tilt_above）の段は床がほとんど写らないので外し、
     それでも 1 ステーションの割り当て（max_frames ÷ ステーション数）を超えれば、パンを
     1 つおき、2 つおき…に間引く。それでも多ければ tilt 0 から遠い段から外す。
     パン 0 に近いコマ（向きを出すのに使う）は残す。
+
+    old_frames を渡すと、最後でないステーションは old_frames コマまで、最後のステーションは
+    残り（max_frames - 前の分）までにする。前のステーションは、位置がもう決まっていて、
+    最後のステーションを同じ座標に置くための手がかりでしかない。見たものも前に残してある
+    （obs.npz）。最後のステーションのコマを減らさず、VGGT に入れるコマを減らせる。
     """
-    budget = max(1, max_frames // max(1, len(stations)))
+    n = max(1, len(stations))
+    budgets = [max(1, max_frames // n)] * n
+    if old_frames is not None:
+        budgets = [old_frames] * (n - 1) + [max(1, max_frames - old_frames * (n - 1))]
     refs: list[FrameRef] = []
     for si, st in enumerate(stations):
+        budget = budgets[si]
         frames = [f for f in st.frames if f["tilt_deg"] <= drop_tilt_above] or list(st.frames)
         rows: dict[int, list[dict]] = {}
         for f in frames:
@@ -428,6 +489,124 @@ class StationResult:
 
 
 @dataclass
+class Observation:
+    """1 ステーションで見たもの。セッションの座標（最初のステーションが原点）の格子のセルの中心
+    (K, 2)。地図のサーバーはステーションごとに 1 回だけ（そのステーションが最後のとき）作って
+    置き場に残し、全部のステーションの分を足してセッションの間取りにする（session_grid）。
+    窓（WINDOW か所）だけで間取りを作ると、窓の外で見た所を忘れて、そこへまた行こうとする。
+    """
+
+    free: np.ndarray
+    occupied: np.ndarray
+    high: np.ndarray
+    pose: Pose  # ステーションの位置（セッションの座標）
+    sonar_m: float | None = None
+
+    def save(self, path: Path) -> None:
+        p = self.pose
+        np.savez(
+            path,
+            free=self.free.astype(np.float32),
+            occupied=self.occupied.astype(np.float32),
+            high=self.high.astype(np.float32),
+            pose=np.array([p.x, p.y, p.yaw]),
+            sonar_m=np.array(np.nan if self.sonar_m is None else self.sonar_m),
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> Observation:
+        d = np.load(path)
+        sonar = float(d["sonar_m"])
+        return cls(
+            d["free"], d["occupied"], d["high"], Pose(*map(float, d["pose"])),
+            None if math.isnan(sonar) else sonar,
+        )  # fmt: skip
+
+
+def session_grid(observations: list[Observation]) -> tuple[Grid, np.ndarray]:
+    """ステーションごとに見たものを順に足した格子と「上」の層（build_map と同じ足し方）。"""
+    grid = Grid()
+    high = np.zeros_like(grid.logodds, np.int32)
+    for o in observations:
+        grid.mark_free(o.free[:, 0], o.free[:, 1])
+        grid.mark_occupied(o.occupied[:, 0], o.occupied[:, 1])
+        hix, hiy = grid.cell(o.high[:, 0], o.high[:, 1])
+        ok = grid.inside(hix, hiy)
+        high[hix[ok], hiy[ok]] += 1
+        if o.sonar_m is not None:
+            mark_sonar(grid, o.pose, o.sonar_m)
+    return grid, high
+
+
+# SLAM（app/snoo_slam.py）の結果を間取りに足すのは、座標合わせのずれがこれより小さいときだけ
+SLAM_MAX_RMSE_M = 0.08
+# SLAM の点のボクセル（3 cm）に、これより少ない点しか入っていなければ使わない（ノイズ）
+SLAM_MIN_COUNT = 2
+
+
+def mark_slam(grid: Grid, high: np.ndarray, slam_dir: Path, params: MapParams) -> dict:
+    """走りながらの SLAM の点と道筋を、セッションの間取りに足す。足したセルの数を返す。
+
+    止まって撮った VGGT だけでは、走った道の両脇と、ステーションの間で見えた所が地図に入らない。
+    SLAM は 4 枚/秒で走りながら見ているので、そこを埋める。高さの分け方は build_map と同じ。
+    state が ok でないとき・座標合わせが崩れているときは足さない（壊れた点で道をふさがない）。
+    """
+    try:
+        status = json.loads((slam_dir / "status.json").read_text())
+        rmse = (status.get("alignment") or {}).get("rmse_m")
+        if status.get("state") != "ok" or rmse is None or rmse > SLAM_MAX_RMSE_M:
+            return {"used": False, "reason": f"state={status.get('state')} rmse={rmse}"}
+        d = np.load(slam_dir / "points.npz")
+        xyz, count = d["xyz"], d["count"]
+    except (OSError, ValueError, KeyError) as e:
+        return {"used": False, "reason": type(e).__name__}
+    xyz = xyz[count >= SLAM_MIN_COUNT]
+    z = xyz[:, 2]
+    top = params.car_height_m + params.obstacle_margin_m
+    floor = xyz[np.abs(z) <= params.floor_tol_m]
+    obst = xyz[(z > params.floor_tol_m) & (z <= top)]
+    above = xyz[z > top]
+    grid.mark_free(floor[:, 0], floor[:, 1])
+    grid.mark_occupied(obst[:, 0], obst[:, 1])
+    hix, hiy = grid.cell(above[:, 0], above[:, 1])
+    ok = grid.inside(hix, hiy)
+    high[hix[ok], hiy[ok]] += 1
+    # 車が通った所（カメラの真下）は床
+    path = []
+    try:
+        for line in (slam_dir / "trajectory.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            path.append((row["x"], row["y"]))
+    except (OSError, ValueError, KeyError):
+        pass
+    if path:
+        xy = np.array(path)
+        grid.mark_free(xy[:, 0], xy[:, 1])
+    return {"used": True, "floor": len(floor), "obstacle": len(obst), "high": len(above),
+            "path": len(path), "rmse_m": rmse}  # fmt: skip
+
+
+def to_frame(anchor: Pose, p: Pose) -> Pose:
+    """anchor を原点にした座標の位置を、anchor のある座標に直す（窓 → セッション）。"""
+    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
+    yaw = anchor.yaw + p.yaw
+    return Pose(
+        anchor.x + c * p.x - s * p.y,
+        anchor.y + s * p.x + c * p.y,
+        math.atan2(math.sin(yaw), math.cos(yaw)),
+    )
+
+
+def xy_to_frame(anchor: Pose, xy: np.ndarray) -> np.ndarray:
+    """点 (N, 2 以上) の x・y を to_frame と同じに直す（3 列目からはそのまま）。"""
+    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
+    out = np.array(xy, dtype=np.float64, copy=True)
+    out[:, 0] = anchor.x + c * xy[:, 0] - s * xy[:, 1]
+    out[:, 1] = anchor.y + s * xy[:, 0] + c * xy[:, 1]
+    return out.astype(np.asarray(xy).dtype)
+
+
+@dataclass
 class MapResult:
     grid: Grid
     high: np.ndarray  # (n, n) の int。「上」の層の点が見つかった回数
@@ -440,6 +619,13 @@ class MapResult:
     # 上から見た絵に使う点（間取りの座標、m）と色（BGR）。間引いてある
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.float32))
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
+    # 次の 1 歩で車（カメラの真下）が通る所。上から見た絵に描く（後ろへ戻るときはサーバーが入れる）
+    step_path: list[Pose] = field(default_factory=list)
+    # build_map に anchor を渡したときの、ステーションごとに見たもの（セッションの座標）。
+    # 位置合わせが崩れたステーションは None
+    observations: list[Observation | None] = field(default_factory=list)
+    # 走りながらの SLAM を足したか（mark_slam の答え。地図のサーバーが入れる）
+    slam: dict | None = None
 
 
 def _cells_with(grid: Grid, x: np.ndarray, y: np.ndarray, min_count: int):
@@ -461,9 +647,14 @@ def build_map(
     conf: np.ndarray,
     params: MapParams | None = None,
     colors: np.ndarray | None = None,
+    anchor: Pose | None = None,
+    plan: bool = True,
 ) -> MapResult:
     """VGGT の点（コマごと、(F, ..., 3)）から床・座標・ステーションの位置・格子を作り、
-    次の 1 歩を決める。
+    次の 1 歩を決める（plan が False なら決めない。地図のサーバーはセッションの間取りで決める）。
+    anchor（最初のステーションのセッションの座標での位置）を渡すと、ステーションごとに見たものを
+    セッションの座標の格子のセルにして observations に入れる（点を直してからセルにする。
+    セルの中心を回すと、セルの抜けや重なりができる）。
     GPU は使わない（VGGT の出力を差し替えて試せるよう、ここは numpy だけ）。
     """
     params = params or MapParams()
@@ -476,6 +667,8 @@ def build_map(
     heights = list(heights) if isinstance(heights, list | tuple) else [heights] * n_st
     if len(heights) != n_st:
         raise ValueError("camera_height_m の数がステーションの数と合わない")
+    if params.ultrasonic_cm is not None and len(params.ultrasonic_cm) != n_st:
+        raise ValueError("ultrasonic_cm の数がステーションの数と合わない")
 
     finite = np.isfinite(pts).all(-1) & (cf > 0)
     good = finite & (cf >= np.percentile(cf[finite], params.conf_percentile))
@@ -493,6 +686,7 @@ def build_map(
     high = np.zeros_like(grid.logodds, np.int32)
     top = params.car_height_m + params.obstacle_margin_m
     results: list[StationResult] = []
+    observations: list[Observation | None] = []
     keep_pts, keep_cols = [], []
     rng = np.random.default_rng(0)
     for s, st in enumerate(stations):
@@ -510,6 +704,7 @@ def build_map(
             len(idx),
         )
         results.append(res)
+        observations.append(None)
         if registration_is_bad(res, heights[s]):
             continue  # 位置の合っていない点は地図に入れない（decide で止める）
         p = world.apply(pts[idx][good[idx]])
@@ -526,6 +721,17 @@ def build_map(
         hx, hy = _cells_with(grid, p[is_high, 0], p[is_high, 1], MIN_POINTS_PER_CELL)
         hix, hiy = grid.cell(hx, hy)
         high[hix, hiy] += 1
+        sonar = None
+        if params.ultrasonic_cm is not None and params.ultrasonic_cm[s] is not None:
+            sonar = params.ultrasonic_cm[s] / 100
+            mark_sonar(grid, pose, sonar)
+        if anchor is not None:
+            q = xy_to_frame(anchor, p)
+            cells = []
+            for sel in (is_floor, is_obst, is_high):
+                cx, cy = _cells_with(grid, q[sel, 0], q[sel, 1], MIN_POINTS_PER_CELL)
+                cells.append(np.stack([cx, cy], 1).reshape(-1, 2))
+            observations[-1] = Observation(*cells, to_frame(anchor, pose), sonar)
         res.floor_points, res.obstacle_points = int(is_floor.sum()), int(is_obst.sum())
         res.high_points = int(is_high.sum())
         if cols is not None:
@@ -533,7 +739,11 @@ def build_map(
             keep_pts.append(p[sel])
             keep_cols.append(cols[idx][good[idx]][near][sel])
 
-    action, plan = decide(grid, results, params, heights)
+    action, nbv = decide(grid, results, params, heights) if plan else ({}, None)
+    step_path = []
+    if nbv is not None:
+        pieces = nbv.segments or [(nbv.steer_deg, nbv.step_m)]
+        step_path = [camera_of(p) for _, p in drive_poses(results[-1].pose, pieces)]
     return MapResult(
         grid,
         high,
@@ -541,10 +751,12 @@ def build_map(
         floor,
         world,
         action,
-        plan,
+        nbv,
         params,
         np.concatenate(keep_pts) if keep_pts else np.zeros((0, 3), np.float32),
         np.concatenate(keep_cols) if keep_cols else np.zeros((0, 3), np.uint8),
+        step_path,
+        observations,
     )
 
 
@@ -594,17 +806,172 @@ def decide(
     pose = stations[-1].pose
     if not frontiers(grid.state()).any():
         return {"action": "done", "reason": "no_frontier"}, None
-    plan = next_best_view(grid, pose)
-    if plan is None:  # 境目はあるが、見えている床を通って行ける所が無い
-        return {"action": "done", "reason": "unreachable"}, None
-    return {
+    rng = np.random.default_rng(params.seed)
+    plan = None
+    if not params.force_random and rng.random() >= params.random_p:
+        plan = next_best_view(grid, pose, segments=params.segments, max_step_m=params.max_step_m)
+        if params.reverse and params.plan_turns:
+            turn = turn_instead(grid, pose, plan, params)
+            if turn is not None:
+                return turn_action(turn, pose, params), None
+    if plan is None:
+        # 行き詰まった・同じ所に固まった・ときどき：でたらめな 1 歩
+        step = random_step(grid, pose, rng)
+        if step is None:  # 境目はあるが、見えている床を通って行ける所が無い
+            return {"action": "done", "reason": "unreachable"}, None
+        steer, run = step
+        action = {
+            "action": "move",
+            "steer_deg": round(steer, 1),
+            "speed": SPEED,
+            "distance_cm": round(run * 100, 1),
+            "pose": pose_dict(pose),
+            "random": True,
+        }
+        if params.segments:
+            action["segments"] = segments_json([(steer, run)])
+        return action, None
+    action = {
         "action": "move",
         "steer_deg": round(plan.steer_deg, 1),
         "speed": SPEED,
         "distance_cm": round(plan.step_m * 100, 1),
         "pose": pose_dict(pose),
         "target": pose_dict(plan.target),
-    }, plan
+    }
+    if params.segments:
+        # 上の steer_deg・distance_cm は最初の区間（segments を知らない Pi でも同じに動く）
+        action["segments"] = segments_json(plan.segments)
+    return action, plan
+
+
+def turn_instead(grid: Grid, pose: Pose, plan: Plan | None, params: MapParams) -> Turn | None:
+    """前へ進む 1 歩の代わりに向きを変えるか。行ける所が無い（plan が None）か、見たい所が
+    BEHIND_DEG より後ろで、向きを変えるとそれが TURN_GAIN_DEG 以上前に寄るとき。
+
+    前は行き場が無くなるまで前へ進み（unreachable）、それから下がっていた。3 回目の実走は、
+    その間に 1 周（撮る・地図・走る、27 秒）ずつ使った。
+    """
+    if plan is None:
+        return plan_turn(grid, pose, None)
+    off = abs(bearing(pose, plan.target))
+    if off < math.radians(BEHIND_DEG):
+        return None
+    turn = plan_turn(grid, pose, plan.target)
+    if turn is None or abs(bearing(turn.end, plan.target)) > off - math.radians(TURN_GAIN_DEG):
+        return None
+    return turn
+
+
+def turn_action(turn: Turn, pose: Pose, params: MapParams) -> dict:
+    """向きを変える 1 歩の返事。形は後ろへ戻る返事（reverse）と同じなので、今の Pi が走れる。
+    向きを変えたと分かるよう "turn": true を付ける。"""
+    action = reverse_action([(st, m) for st, m, _ in turn.moves], params.segments)
+    action["turn"] = True
+    action["pose"] = pose_dict(pose)
+    action["target"] = pose_dict(turn.end)
+    return action
+
+
+def segments_json(pieces: list[tuple[float, float]]) -> list[dict]:
+    return [{"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1)} for st, m in pieces]
+
+
+# --- 行き場が無いときに後ろへ下がる（地図のサーバーとシミュレーターで同じ決め方にする） ---
+
+# 行き場が無いときに来た道を戻るのは、続けてこの回数まで
+MAX_REVERSES = 2
+# 間に前へ走っても、直近 RECENT_STATIONS か所で戻るのはこの回数まで。戻る → 前へ → 戻るを
+# 繰り返して同じ所を回り続けないため（シミュレーターで周の多くを使った）
+MAX_RECENT_REVERSES = 3
+RECENT_STATIONS = 6
+# 後ろにはセンサーが無く、シミュレーターでは後ろに来た snoo に当たることがあった。
+# 当たっても弱くなるよう、前（12）より遅く戻る（約 14 cm/s）
+REVERSE_SPEED = 8
+# 直近 CLUSTER_STATIONS か所が、この半径に固まっていたら、でたらめな 1 歩で抜け出す
+CLUSTER_STATIONS = 4
+CLUSTER_RADIUS_M = 0.30
+
+
+# 1 回に VGGT に入れるステーションの数。48 コマを 6 か所で分けると 1 か所 8 コマ（下向きと
+# 正面の 2 段 × パン 4 つ）。これより多いと 1 か所のコマが少なすぎて向きと位置がぶれる
+WINDOW = 6
+
+
+def choose_window(
+    ids: list[int], latest: int, poses: dict[int, Pose], k: int = WINDOW
+) -> list[int]:
+    """VGGT に入れるステーション。最後のステーションと、位置が分かっている前のステーションのうち、
+    1 つ前の位置（今の車の近く）に近い k - 1 個。原点にする窓のいちばん古いステーションの位置が
+    分かっていないと座標を直せないので、位置の分からないステーションは入れない。
+    """
+    known = [i for i in ids if i < latest and i in poses]
+    if not known:
+        return [latest]
+    here = poses[max(known)]
+    near = sorted(known, key=lambda i: (math.hypot(poses[i].x - here.x, poses[i].y - here.y), -i))
+    return sorted(near[: k - 1]) + [latest]
+
+
+@dataclass
+class History:
+    """前のステーションまでの走り方。地図のサーバーは置き場（meta の prev_step・reverse.json）
+    から、シミュレーターは覚えたものから作る。
+    """
+
+    # 前へ走った道（走った順の区間 (ハンドル°, m)）。来た道を戻るのに使う
+    trail: list[tuple[float, float]] = field(default_factory=list)
+    backs: int = 0  # 続けて後ろへ戻った回数
+    recent_reverses: int = 0  # 直近 RECENT_STATIONS か所のうち、後ろへ戻って着いた数
+
+
+def clustered(recent: list[Pose]) -> bool:
+    """直近のステーション（CLUSTER_STATIONS か所）が狭い所に固まっているか。"""
+    if len(recent) < CLUSTER_STATIONS:
+        return False
+    cx = sum(p.x for p in recent) / len(recent)
+    cy = sum(p.y for p in recent) / len(recent)
+    return all(math.hypot(p.x - cx, p.y - cy) <= CLUSTER_RADIUS_M for p in recent)
+
+
+def retrace_step(history: History, segments: bool) -> list[tuple[float, float]]:
+    """来た道を戻る区間（戻る順）。続けて戻りすぎていれば・戻れる長さが無ければ空。
+
+    前にしか走らないと、壁に向いて止まったときに回れずに終わる（1 回目の実走の 4 か所目。
+    シミュレーターでも角で 74 % で止まり、30 cm 下がると 95 % まで調べられた）。
+    segments を受けない Pi には、最後に走った区間の 1 本だけを返す。
+    """
+    if history.backs >= MAX_REVERSES or history.recent_reverses >= MAX_RECENT_REVERSES:
+        return []
+    pieces = retrace(history.trail, REVERSE_MAX_M, MAX_SEGMENTS if segments else 1)
+    return pieces if sum(m for _, m in pieces) >= MIN_STEP_M else []
+
+
+def reverse_step(
+    grid: Grid, pose: Pose, history: History, segments: bool
+) -> list[tuple[float, float]]:
+    """前へ行ける所が無い（unreachable）ときに後ろへ下がる区間。下がれなければ空。
+
+    まず切り返し（曲がりながら下がって向きを変える）、だめなら来た道を戻る。
+    後ろは見ていないので 30 cm 下がれなければ、見ていない所に入る 15 cm だけ下がる。
+    """
+    pieces: list[tuple[float, float]] = []
+    if history.recent_reverses < MAX_RECENT_REVERSES:
+        pieces = turning_reverse(grid, pose) or turning_reverse(grid, pose, length=0.15)
+    return pieces or retrace_step(history, segments)
+
+
+def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
+    action = {
+        "action": "move",
+        "reverse": True,
+        "steer_deg": round(pieces[0][0], 1) + 0.0,
+        "speed": REVERSE_SPEED,
+        "distance_cm": round(pieces[0][1] * 100, 1),
+    }
+    if segments:
+        action["segments"] = segments_json(pieces)
+    return action
 
 
 # --- 書き出し ---
@@ -685,8 +1052,8 @@ def write_outputs(r: MapResult, out: Path) -> None:
 
 def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) -> np.ndarray:
     """上から見た絵。左は格子（白 = 床、黒 = 障害物、青 = 上の層、灰 = 見ていない）に、
-    ステーション（丸と向き）、道のり（緑）、次の位置（赤）を描く。右は点の色を上から
-    見たもの。格子の線は 1 m ごと。
+    ステーション（丸と向き）、道のり（緑）、次の位置（赤）、次の 1 歩（紫）を描く。
+    右は点の色を上から見たもの。格子の線は 1 m ごと。
     """
     g = r.grid
     state = g.state()
@@ -745,6 +1112,9 @@ def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) ->
             )
             cv2.circle(canvas, a, 6, (0, 0, 220), 2)
             cv2.arrowedLine(canvas, a, b, (0, 0, 220), 2, tipLength=0.3)
+        if len(r.step_path) > 1:  # 次の 1 歩（Pi が走る所）
+            step = np.array([to_px(p.x, p.y) for p in r.step_path], np.int32)
+            cv2.polylines(canvas, [step], False, (200, 0, 200), 3)
         for i, s in enumerate(r.stations):
             p = s.pose
             a, b = (
@@ -756,6 +1126,7 @@ def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) ->
             cv2.putText(canvas, str(i + 1), (a[0] + 8, a[1] - 8), 0, 0.5, (220, 120, 0), 1)
     sep = np.full((left.shape[0], 4, 3), 255, np.uint8)
     img = np.concatenate([left, sep, right], 1)
-    text = f"1 grid = 1 m  next: {r.action.get('action')} {r.action.get('reason', '')}"
+    what = "reverse" if r.action.get("reverse") else r.action.get("reason", "")
+    text = f"1 grid = 1 m  next: {r.action.get('action')} {what}"
     cv2.putText(img, text, (6, 18), 0, 0.5, (0, 0, 200), 1)
     return img

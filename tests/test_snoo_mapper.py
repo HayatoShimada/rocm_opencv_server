@@ -202,6 +202,45 @@ def test_select_frames_drops_the_upward_row_and_thins_pans():
     assert any(r.tilt_deg == 0 and r.pan_deg == -5 for r in first)
 
 
+def test_select_frames_keeps_the_latest_station_whole_and_thins_the_older_ones():
+    pans = [-30, -15, 0, 15, 30]  # 3 回目の実走の首振り
+    frames = _scan([-15, 0], pans)
+    sts = [Station(Path(str(i)), frames) for i in range(4)]
+    refs = select_frames(sts, 48, old_frames=6)
+    for i in range(3):
+        old = [r for r in refs if r.station == i]
+        assert sorted({r.pan_deg for r in old}) == [-30, 0, 30] and len(old) == 6
+    assert len([r for r in refs if r.station == 3]) == 10  # 最後は全部
+
+
+def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
+    """VGGT が見落とした物（白い壁など）を、超音波で格子に足す。"""
+    stations, refs, ext, points, conf = _scene()
+    params = MapParams(camera_height_m=CAM_H, ultrasonic_cm=[None, 40])
+    r = build_map(stations, refs, ext, points, conf, params)
+    g, state = r.grid, r.grid.state()
+    last = r.stations[-1].pose
+    d = 0.05 + 0.40  # 超音波（カメラの 5 cm 前）から 40 cm
+    ahead = g.cell(last.x + d * math.cos(last.yaw), last.y + d * math.sin(last.yaw))
+    # 作り物の部屋ではカメラがそこに床を 2 回見ているので、障害物 1 回と足して「分からない」になる。
+    # それでも床ではないので、車はそこへ行かない
+    assert state[ahead] != FREE
+    assert result.grid.state()[ahead] == FREE  # 超音波が無ければ床
+    with pytest.raises(ValueError):
+        build_map(stations, refs, ext, points, conf, MapParams(CAM_H, ultrasonic_cm=[1.0]))
+
+
+def test_decide_returns_segments_only_when_asked(result):
+    heights = [CAM_H, CAM_H]
+    a, plan = decide(result.grid, result.stations, MapParams(segments=True), heights)
+    assert a["action"] == "move"
+    segs = a["segments"]
+    assert 1 <= len(segs) <= 3
+    assert (a["steer_deg"], a["distance_cm"]) == (segs[0]["steer_deg"], segs[0]["distance_cm"])
+    assert sum(x["distance_cm"] for x in segs) <= 40.05
+    assert "segments" not in result.action  # 頼まなければ今までどおり
+
+
 def test_decide_stops_on_step_limit_and_bad_registration(result):
     g = result.grid
     st = result.stations
@@ -210,3 +249,98 @@ def test_decide_stops_on_step_limit_and_bad_registration(result):
     bad = [StationResult("x", Pose(0, 0, 0), CAM_H, 0.3, 8)]
     a, _ = decide(g, bad, MapParams(), [CAM_H])
     assert a["action"] == "done" and a["reason"].startswith("bad_registration")
+
+
+def test_observations_add_up_to_the_same_grid_and_move_with_the_anchor(tmp_path):
+    """ステーションごとに見たもの（セッションの座標）を足すと、窓で作った格子と同じになる。
+    窓の原点が (1, 2, 90°) なら、見たものも同じだけずれて回る。
+    """
+    from app.snoo_mapper import Observation, session_grid
+
+    stations, refs, ext, points, conf = _scene()
+    params = MapParams(camera_height_m=CAM_H, ultrasonic_cm=[80.0, None])
+    r = build_map(stations, refs, ext, points, conf, params, anchor=Pose(0, 0, 0), plan=False)
+    assert r.action == {} and r.plan is None
+    grid, _ = session_grid(r.observations)
+    assert (grid.state() == r.grid.state()).all()
+    assert r.observations[0].sonar_m == pytest.approx(0.8)
+    r.observations[1].save(tmp_path / "obs.npz")
+    back = Observation.load(tmp_path / "obs.npz")
+    assert back.pose == pytest.approx(r.observations[1].pose) and back.sonar_m is None
+    assert np.allclose(back.free, r.observations[1].free)
+
+    moved = build_map(
+        stations, refs, ext, points, conf, params, anchor=Pose(1.0, 2.0, math.pi / 2), plan=False
+    )
+    o, p = moved.observations[1], r.observations[1]
+    assert (o.pose.x, o.pose.y) == pytest.approx((1.0 - p.pose.y, 2.0 + p.pose.x), abs=1e-6)
+    assert len(o.free) == pytest.approx(len(p.free), rel=0.05)  # 回してもセルが抜けない
+
+
+def test_decide_turns_instead_of_looping_when_the_target_is_behind():
+    """見ていない所が真後ろだけなら、前へ輪を描かず、切り返す（Pi が reverse を受けるとき）。"""
+    from app.roommap import Grid
+
+    g = Grid(size_m=6.0)
+    xs = np.arange(-0.2, 1.6, 0.025)
+    gx, gy = np.meshgrid(xs, np.arange(-0.8, 0.8, 0.025))
+    g.mark_free(gx.ravel(), gy.ravel())  # 前と足元だけ床。後ろ（x < -0.2）は見ていない
+    wall = np.arange(-0.8, 0.8, 0.02)
+    g.mark_occupied(np.full_like(wall, 1.6), wall)
+    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, 0.8))
+    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, -0.8))
+    st = [StationResult("000", Pose(0.3, 0.0, 0.0), CAM_H, 0.0, 8)]
+    a, plan = decide(g, st, MapParams(segments=True, reverse=True, random_p=0.0), [CAM_H])
+    assert a["action"] == "move" and a.get("turn") and a["reverse"] is True and plan is None
+    a, _ = decide(g, st, MapParams(segments=True, random_p=0.0), [CAM_H])
+    assert not a.get("turn")  # reverse を受けない Pi には今までどおり
+
+
+def _slam_dir(tmp_path, state="ok", rmse=0.03):
+    import json as _json
+
+    d = tmp_path / "slam"
+    d.mkdir()
+    (d / "status.json").write_text(_json.dumps({"state": state, "alignment": {"rmse_m": rmse}}))
+    xs = np.arange(0.0, 1.0, 0.03)
+    floor = np.stack([xs, np.zeros_like(xs), np.zeros_like(xs)], 1)
+    wall = np.array([[1.2, 0.0, 0.06], [1.2, 0.03, 0.06]])
+    table = np.array([[0.5, 0.5, 0.6]])
+    xyz = np.concatenate([floor, wall, table]).astype(np.float32)
+    count = np.full(len(xyz), 3)
+    count[-1] = 1  # 点が 1 つだけのボクセルは使わない
+    np.savez(d / "points.npz", xyz=xyz, count=count)
+    (d / "trajectory.jsonl").write_text(_json.dumps({"x": -0.3, "y": 0.0}) + "\n")
+    return d
+
+
+def test_mark_slam_adds_floor_obstacles_and_the_driven_path(tmp_path):
+    from app.roommap import FREE, OCCUPIED, UNKNOWN, Grid
+    from app.snoo_mapper import MapParams, mark_slam
+
+    g = Grid()
+    high = np.zeros_like(g.logodds, np.int32)
+    info = mark_slam(g, high, _slam_dir(tmp_path), MapParams())
+    s = g.state()
+    assert info["used"] and info["obstacle"] == 2
+    assert s[g.cell(0.5, 0.0)] == FREE
+    assert s[g.cell(1.2, 0.0)] == OCCUPIED
+    assert s[g.cell(-0.3, 0.0)] == FREE  # 走った所
+    assert high.sum() == 0  # 点が少ないボクセルは使わない
+    assert s[g.cell(0.5, 1.0)] == UNKNOWN
+
+
+def test_mark_slam_ignores_a_lost_or_misaligned_slam(tmp_path):
+    from app.roommap import Grid
+    from app.snoo_mapper import MapParams, mark_slam
+
+    for state, rmse in (("lost", 0.03), ("ok", 0.2)):
+        g = Grid()
+        sub = tmp_path / f"{state}{rmse}"
+        sub.mkdir()
+        info = mark_slam(g, np.zeros_like(g.logodds, np.int32), _slam_dir(sub, state, rmse),
+                         MapParams())  # fmt: skip
+        assert not info["used"] and not g.logodds.any()
+    assert not mark_slam(Grid(), np.zeros((240, 240), np.int32), tmp_path / "none", MapParams())[
+        "used"
+    ]

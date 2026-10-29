@@ -262,6 +262,7 @@ class _FakeEstimator:
 
 def _worker(estimator, **kw):
     kw.setdefault("interval_ms", 0)  # 間を空けずに回す（間のテストだけ別に渡す）
+    kw.setdefault("settle_ms", 0)  # サーボが止まるのを待たない（待つテストだけ別に渡す）
     worker = snoo.ClearanceWorker(lambda: estimator, **kw)
     assert worker.wait_ready(5)
     return worker
@@ -308,7 +309,7 @@ def test_moving_frames_get_the_latest_value_from_an_earlier_frame():
     assert worker.submit(ADDR, first, IMAGE)
     _wait_idle(worker)
     assert estimator.calls == [(-15.0, -12.0, -12.0)]  # tilt・pan・舵はヘッダーの値
-    second = parse_frame(_packet_v2(seq=2, t=10**12 + 16_700_000))
+    second = parse_frame(_packet_v2(seq=2, t=10**12 + 16_700_000, pan=-12.0))
     assert worker.fields(ADDR, second) == {
         "clear_cm": 42.0,
         "clear_conf": 0.83,
@@ -345,9 +346,10 @@ def test_clear_fields_are_skipped_when_the_path_is_out_of_view_or_reversing():
     turning = _worker(_FakeEstimator(cm=None, conf=0.0, blind=100.0))
     turning.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0, steer=-25.0, pan=-25.0)), IMAGE)
     _wait_idle(turning)
-    fields = turning.fields(ADDR, _at(t0, 10))
+    same_turn = parse_frame(_packet_v2(seq=2, t=t0 + 10_000_000, steer=-25.0, pan=-25.0))
+    fields = turning.fields(ADDR, same_turn)
     assert fields == {"clear_skip": "out_of_view"}
-    reply = json.loads(encode_reply(_at(t0, 10), [], 1.0, fields))
+    reply = json.loads(encode_reply(same_turn, [], 1.0, fields))
     assert "clear_cm" not in reply  # Pi は「欄が無い」として止まらない
 
     worker = _worker(_FakeEstimator())
@@ -359,6 +361,26 @@ def test_clear_fields_are_skipped_when_the_path_is_out_of_view_or_reversing():
     unsure.submit(ADDR, parse_frame(_packet_v2(seq=1, t=t0)), IMAGE)
     _wait_idle(unsure)
     assert unsure.fields(ADDR, _at(t0, 10))["clear_cm"] is None
+
+
+def test_clear_waits_for_the_servos_to_settle_after_the_head_moves():
+    # 首を動かした・走り出した直後のフレームは、指令と実際の向きが違うので見積もらない。
+    # その間の値は「止まれ」（null）にせず settling として欄を載せない
+    worker = _worker(_FakeEstimator(), settle_ms=400)
+    t0 = 10**12
+    first = parse_frame(_packet_v2(seq=1, t=t0, pan=0.0))
+    assert worker.fields(ADDR, first) == {"clear_skip": "settling"}
+    assert not worker.submit(ADDR, first, IMAGE)
+    later = parse_frame(_packet_v2(seq=2, t=t0 + 410_000_000, pan=0.0))
+    assert worker.fields(ADDR, later) == snoo.NO_CLEAR  # 止まった後、まだ値が無い
+    assert worker.submit(ADDR, later, IMAGE)
+    _wait_idle(worker)
+    assert worker.fields(ADDR, parse_frame(_packet_v2(seq=3, t=t0 + 450_000_000)))["clear_cm"]
+    # 首を振ったら、また待つ。前の値も使わない
+    turned = parse_frame(_packet_v2(seq=4, t=t0 + 460_000_000, pan=-15.0))
+    assert worker.fields(ADDR, turned) == {"clear_skip": "settling"}
+    after = parse_frame(_packet_v2(seq=5, t=t0 + 870_000_000, pan=-15.0))
+    assert worker.fields(ADDR, after) == snoo.NO_CLEAR
 
 
 def test_only_one_estimate_runs_at_a_time_and_busy_frames_are_dropped():

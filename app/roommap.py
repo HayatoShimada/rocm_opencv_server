@@ -2,7 +2,8 @@
 
 ルンバのように、止まって首を振って撮る → 地図を更新する → 次の位置へ少し走る、を繰り返して
 部屋を探る。車は前輪で曲がる（その場で向きを変えられない）ので、道のりは最小の回転半径を
-考えた Dubins 経路（前進だけ）で測る。後ろにはセンサーが無いので後退はしない。
+考えた Dubins 経路（前進だけ）で測る。後ろにはセンサーが無いので、後ろへ走るのは、行き場が
+無くなったときに来た道をそのまま戻るとき（retrace）だけにする。
 
 次の位置は「新しく見えるはずの未知のセル × exp(-道のり / 距離の重み)」がいちばん大きい所にする。
 見える範囲はカメラの画角とパンの振り幅（± HALF_VIEW_DEG）、見通せる距離（VIEW_RANGE_M）で、
@@ -15,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -27,6 +28,20 @@ CAR_RADIUS_M = 0.17
 # （後輪の軸から前輪の操舵軸まで）。ハンドル ±30° で 14 / tan 30° = 24.2 cm なので、余裕を見て 26 cm
 TURN_RADIUS_M = 0.26
 WHEELBASE_M = 0.14
+# 車の前後の端と、カメラ（パンの軸）の位置。どれも後ろの車軸の中央から前へ測る（m）。
+# 前後の端は写真から見積もった（測っていない）。カメラの位置も測っていない。
+# ステーションの位置（Pose）はカメラの真下なので、車の動き（自転車モデル）を当てるときは
+# 後ろの車軸に直してから動かす（app/snoo_sim.py もここの値を使う）
+CAR_REAR_M = -0.05
+CAR_FRONT_M = 0.21
+CAM_X_M = 0.16
+# 前の超音波（バンパーの真ん中）。±15° の円すいで、3 m まで測れる
+SONAR_HALF_DEG = 15.0
+SONAR_RANGE_M = 3.0
+# カメラの真下から超音波まで（車の前の端）
+SONAR_AHEAD_M = CAR_FRONT_M - CAM_X_M
+# 超音波の読みのこれだけ手前までを床にする（読みのぶれと、セルの大きさの分）
+SONAR_FREE_MARGIN_M = 0.10
 # 1 回の撮影で見える範囲：画角 54° の半分 + パン ±35°
 HALF_VIEW_DEG = 62.0
 VIEW_RANGE_M = 2.0
@@ -34,6 +49,11 @@ VIEW_RANGE_M = 2.0
 DISTANCE_SCALE_M = 1.5
 # 1 回に走る長さの上限
 MAX_STEP_M = 0.40
+# Pi が long_step を受けるときの上限。40 cm を超える分は、まっすぐの区間で、地図で床と
+# 分かっている所だけ（turn_then_straight）。3 回目の実走は 15 か所が 47 x 65 cm に収まった
+LONG_STEP_M = 0.60
+# でたらめな 1 歩の長さの下限
+MIN_RANDOM_STEP_M = 0.20
 # 1 歩の向きは、経路のこの距離だけ先の点を目指して決める（pure pursuit）
 LOOKAHEAD_M = 0.30
 # 1 回の観測で足す log-odds。障害物は強く、床は弱く数える（同じセルに両方あれば障害物になる。
@@ -95,6 +115,45 @@ class Grid:
         return s
 
 
+def mark_sonar(grid: Grid, camera: Pose, distance_m: float | None) -> None:
+    """前の超音波の 1 回の読みを格子に足す。camera はそのステーションの位置（カメラの真下）。
+
+    超音波は ±SONAR_HALF_DEG の円すいでいちばん近い物までの距離を返すので、どの向きに
+    あったかは分からない。そこで読みの距離の弧（円すいの幅いっぱい）を障害物にし、
+    それより SONAR_FREE_MARGIN_M 手前までを床にする。SONAR_RANGE_M より遠い（届かなかった）
+    ときは床だけ。測れなかった（None）ときは何もしない。
+    床は、もう障害物と見ているセルには足さない。超音波は床から 4.5 cm の高さで、それより
+    低い物（カメラが見た段差など）を見落とすので、カメラの障害物を消さないようにする。
+    """
+    if distance_m is None or not math.isfinite(distance_m) or distance_m <= 0:
+        return
+    hit = distance_m <= SONAR_RANGE_M
+    c, s = math.cos(camera.yaw), math.sin(camera.yaw)
+    ox, oy = camera.x + SONAR_AHEAD_M * c, camera.y + SONAR_AHEAD_M * s
+    half = math.radians(SONAR_HALF_DEG)
+    step = grid.res / 2
+
+    def cone(r: np.ndarray):
+        # 弧の上の点が step より離れないよう、いちばん遠い所に合わせて向きを刻む
+        n = int(math.ceil(2 * half * float(r.max()) / step)) + 1
+        a = camera.yaw + np.linspace(-half, half, n)
+        rr, aa = np.meshgrid(r, a)
+        return ox + rr * np.cos(aa), oy + rr * np.sin(aa)
+
+    if hit:
+        grid.mark_occupied(*cone(np.array([distance_m])))
+    free_to = distance_m - SONAR_FREE_MARGIN_M if hit else SONAR_RANGE_M
+    if free_to <= step:
+        return
+    x, y = cone(np.arange(step, free_to, step))
+    ix, iy = grid.cell(x.ravel(), y.ravel())
+    ok = grid.inside(ix, iy)
+    cells = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0)
+    cells = cells[grid.logodds[cells[:, 0], cells[:, 1]] <= 0]
+    grid.logodds[cells[:, 0], cells[:, 1]] += FREE_HIT
+    np.clip(grid.logodds, -4, 4, out=grid.logodds)
+
+
 def inflate(occupied: np.ndarray, radius_cells: int) -> np.ndarray:
     """障害物を radius_cells だけ広げる（車の中心がそこに入るとぶつかる）。"""
     out = occupied.copy()
@@ -116,24 +175,30 @@ def frontiers(state: np.ndarray) -> np.ndarray:
     return (state == FREE) & near
 
 
-def view_gain(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> int:
-    """pose で首を振って撮ったときに見えるはずの未知のセルの数（障害物の陰は数えない）。"""
-    seen: set[tuple[int, int]] = set()
+def view_cells(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> np.ndarray:
+    """pose で首を振って撮ったときに見えるはずの未知のセル（格子の通し番号 ix * n + iy）。
+    光線は障害物か格子の外で止める（障害物の陰は数えない）。
+    """
     half = math.radians(HALF_VIEW_DEG)
     steps = int(VIEW_RANGE_M / (grid.res * 0.5))
-    for a in np.linspace(pose.yaw - half, pose.yaw + half, rays):
-        ca, sa = math.cos(a), math.sin(a)
-        for k in range(1, steps + 1):
-            d = k * grid.res * 0.5
-            ix, iy = grid.cell(pose.x + d * ca, pose.y + d * sa)
-            if not grid.inside(ix, iy):
-                break
-            s = state[ix, iy]
-            if s == OCCUPIED:
-                break
-            if s == UNKNOWN:
-                seen.add((int(ix), int(iy)))
-    return len(seen)
+    a = np.linspace(pose.yaw - half, pose.yaw + half, rays)[:, None]
+    d = np.arange(1, steps + 1)[None, :] * grid.res * 0.5
+    ix, iy = grid.cell(pose.x + d * np.cos(a), pose.y + d * np.sin(a))
+    inside = grid.inside(ix, iy)
+    s = np.where(inside, state[np.clip(ix, 0, grid.n - 1), np.clip(iy, 0, grid.n - 1)], OCCUPIED)
+    # 光線ごとに、最初の障害物（か格子の外）より手前だけ
+    ok = np.cumsum(s == OCCUPIED, axis=1) == 0
+    hit = ok & (s == UNKNOWN)
+    return np.unique(ix[hit] * grid.n + iy[hit])
+
+
+def view_gain(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> int:
+    """pose で首を振って撮ったときに見えるはずの未知のセルの数（障害物の陰は数えない）。
+
+    1 マスずつ Python で辿ると 1 回 5 ms ほどかかり、次の 1 歩を決めるのに 2 秒かかっていた。
+    numpy でまとめて辿る（view_cells）。
+    """
+    return int(len(view_cells(grid, state, pose, rays)))
 
 
 # --- Dubins 経路（前進だけ・最小回転半径 r）。Shkel & Lumelsky の形 ---
@@ -218,6 +283,40 @@ def sample_path(start: Pose, kind: str, segs: tuple, r: float = TURN_RADIUS_M, s
     return poses
 
 
+# --- 車の動き（自転車モデル）。Pi と同じ指令（steer_deg は右が +、距離は後ろの車輪の進み） ---
+
+
+def curvature(steer_deg: float) -> float:
+    """後ろの車軸の中心が描く円の曲率（1/m、左が +）。steer_deg は右が +（Pi と同じ）。"""
+    return -math.tan(math.radians(steer_deg)) / WHEELBASE_M
+
+
+def arc(x: float, y: float, yaw: float, steer_deg: float, ds: float) -> tuple[float, float, float]:
+    """後ろの車軸の中心を、ハンドル steer_deg のまま ds m 進めた姿勢（ちょうど円弧の上）。
+    ds が負なら同じ弧を後ろへ戻る。
+    """
+    k = curvature(steer_deg)
+    if abs(k) < 1e-9:
+        return x + ds * math.cos(yaw), y + ds * math.sin(yaw), yaw
+    nyaw = yaw + k * ds
+    return (
+        x + (math.sin(nyaw) - math.sin(yaw)) / k,
+        y - (math.cos(nyaw) - math.cos(yaw)) / k,
+        nyaw,
+    )
+
+
+def rear_axle(camera: Pose) -> Pose:
+    """カメラの真下の姿勢（ステーションの位置）から、後ろの車軸の中央の姿勢へ。"""
+    c, s = math.cos(camera.yaw), math.sin(camera.yaw)
+    return Pose(camera.x - CAM_X_M * c, camera.y - CAM_X_M * s, camera.yaw)
+
+
+def camera_of(rear: Pose) -> Pose:
+    c, s = math.cos(rear.yaw), math.sin(rear.yaw)
+    return Pose(rear.x + CAM_X_M * c, rear.y + CAM_X_M * s, rear.yaw)
+
+
 def path_is_clear(grid: Grid, blocked: np.ndarray, poses: list[Pose]) -> bool:
     for p in poses:
         ix, iy = grid.cell(p.x, p.y)
@@ -234,21 +333,88 @@ class Plan:
     path: list[Pose]
     steer_deg: float  # 最初の 1 歩のハンドル（右が +。Pi の steer と同じ向き）
     step_m: float
+    # segments で決めたときの 1 歩の区間 [(ハンドル°, m), ...]。steer_deg・step_m は最初の区間
+    segments: list[tuple[float, float]] = field(default_factory=list)
 
 
-def next_best_view(grid: Grid, pose: Pose, candidates_max: int = 400, rng=None) -> Plan | None:
-    """次に撮りに行く位置と、そこへの最初の 1 歩。行ける所に見るものが無ければ None。"""
-    rng = rng or np.random.default_rng(0)
-    state = grid.state()
+# 1 歩先までの道で曲がる角度の合計の上限。これより大きいのは、その場で輪を描く道
+MAX_TURN_RAD = 1.25 * math.pi
+
+
+def turning(route: tuple) -> float:
+    """Dubins 経路で曲がる角度の合計（rad）。曲がりの区間は r で割った長さ＝角度。"""
+    _, kind, segs = route
+    return sum(seg for c, seg in zip(kind, segs, strict=True) if c != "S")
+
+
+# 車の幅の半分と余裕。いま居る所のまわりだけは、障害物をこれだけ広げて見る（blocked_cells）
+NEAR_RADIUS_M = 0.10
+
+
+def blocked_cells(grid: Grid, state: np.ndarray, pose: Pose, unseen_ok: bool = False) -> np.ndarray:
+    """車の中心が入れないセル：車の大きさ分を広げた障害物と、床が見えていない所
+    （unseen_ok なら見えていない所は入れる）。"""
     occupied = state == OCCUPIED
-    # 車の中心が入れない所：広げた障害物と、床が見えていない所
-    blocked = inflate(occupied, int(math.ceil(CAR_RADIUS_M / grid.res))) | (state != FREE)
-    # いま居るセルの周りは撮ったときに足元が写らないので、走れることにする
+    inflated = inflate(occupied, int(math.ceil(CAR_RADIUS_M / grid.res)))
+    blocked = inflated if unseen_ok else inflated | (state != FREE)
+    # いま居るセルの周りは撮ったときに足元が写らないので、見ていなくても走れることにする。
+    # 障害物は車の幅の半分（NEAR_RADIUS_M）だけ広げて見る。車の大きさ分（17 cm）で見ると、
+    # 家具のそばで止まったとき自分の居る所がふさがり、どこへも行けなくなる（3 回目の実走の
+    # 最後は、左前 14 cm の障害物で周りが全部ふさがって unreachable だった）。
+    # 少し先からは車の大きさ分で見るので、離れる向きの道だけが通る
     ix0, iy0 = grid.cell(pose.x, pose.y)
     r0 = int(math.ceil(CAR_RADIUS_M / grid.res))
-    blocked[max(ix0 - r0, 0) : ix0 + r0 + 1, max(iy0 - r0, 0) : iy0 + r0 + 1] &= occupied[
-        max(ix0 - r0, 0) : ix0 + r0 + 1, max(iy0 - r0, 0) : iy0 + r0 + 1
-    ]
+    near = (slice(max(ix0 - r0, 0), ix0 + r0 + 1), slice(max(iy0 - r0, 0), iy0 + r0 + 1))
+    blocked[near] = inflate(occupied, int(math.ceil(NEAR_RADIUS_M / grid.res)))[near]
+    return blocked
+
+
+def random_step(grid: Grid, pose: Pose, rng, tries: int = 40) -> tuple[float, float] | None:
+    """床が見えている所に収まる、ハンドル角と長さがでたらめな 1 歩（ハンドル°、m）。
+
+    次に撮る位置の選び方は、同じ所で行き詰まったり、同じ所を回り続けたりする（2 回目の実走で
+    15 か所が半径 30 cm に固まった）。ルンバのように、ときどきでたらめに動いて抜け出す。
+    ぶつからない弧のうち、着いた所から新しく見えそうなセルが多いものを選ぶ。
+    """
+    state = grid.state()
+    blocked = blocked_cells(grid, state, pose)
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    best, best_gain = None, -1
+    for _ in range(tries):
+        steer = float(rng.uniform(-max_steer, max_steer))
+        run = float(rng.uniform(MIN_RANDOM_STEP_M, MAX_STEP_M))
+        k = -math.tan(math.radians(steer)) / WHEELBASE_M  # 左が +
+        if abs(k) < 1e-3:
+            arc = sample_path(pose, "S", (run,), r=1.0)
+        else:
+            arc = sample_path(pose, "L" if k > 0 else "R", (run * abs(k),), r=1 / abs(k))
+        if any(
+            not grid.inside(*grid.cell(p.x, p.y)) or blocked[grid.cell(p.x, p.y)] for p in arc[1:]
+        ):
+            continue
+        gain = view_gain(grid, state, arc[-1], rays=21)
+        if gain > best_gain:
+            best, best_gain = (steer, run), gain
+    return best
+
+
+def next_best_view(
+    grid: Grid,
+    pose: Pose,
+    candidates_max: int = 400,
+    rng=None,
+    segments: bool = False,
+    max_step_m: float = MAX_STEP_M,
+) -> Plan | None:
+    """次に撮りに行く位置と、そこへの最初の 1 歩。行ける所に見るものが無ければ None。
+
+    segments なら、1 歩を「曲がる → まっすぐ」の区間に分ける（turn_then_straight。
+    合わせて max_step_m まで）。分けられない候補（Dubins 経路が曲がる・曲がる・曲がるの形など）は、
+    今までの 1 本の弧にする（MAX_STEP_M まで）。
+    """
+    rng = rng or np.random.default_rng(0)
+    state = grid.state()
+    blocked = blocked_cells(grid, state, pose)
     front = np.argwhere(frontiers(state))
     if not len(front):
         return None
@@ -271,28 +437,38 @@ def next_best_view(grid: Grid, pose: Pose, candidates_max: int = 400, rng=None) 
     best_utility = 0.0
     for i in idx:
         x, y = float(cx[i]), float(cy[i])
-        # 向きは、いちばん近い境目のほうを向く
+        # 向きは、いちばん近い境目のほうを基本に、その左右 60° も試す（首を振れば見える）。
+        # 決めた向きにぴったり着こうとすると、Dubins 経路がその場で一周する輪になり、
+        # 少し進んでは撮り直すのを繰り返す（2 回目の実走の 15 か所）
         j = int(np.argmin((fx - x) ** 2 + (fy - y) ** 2))
-        yaw = math.atan2(fy[j] - y, fx[j] - x)
-        target = Pose(x, y, yaw)
-        gain = view_gain(grid, state, target)
-        if gain == 0:
+        face = math.atan2(fy[j] - y, fx[j] - x)
+        options = []
+        for yaw in (face, face - math.pi / 3, face + math.pi / 3):
+            target = Pose(x, y, yaw)
+            gain = view_gain(grid, state, target)
+            route = dubins(pose, target) if gain else None
+            if route is None or turning(route) > MAX_TURN_RAD:
+                continue
+            options.append((gain * math.exp(-route[0] / DISTANCE_SCALE_M), target, gain, route))
+        if not options:
             continue
-        route = dubins(pose, target)
-        if route is None:
-            continue
+        utility, target, gain, route = max(options, key=lambda o: o[0])
         length, kind, segs = route
-        utility = gain * math.exp(-length / DISTANCE_SCALE_M)
         if utility <= best_utility:
             continue
         path = sample_path(pose, kind, segs)
         if not path_is_clear(grid, blocked, path):
             continue
-        steer, step = first_step(grid, blocked, pose, path, length)
-        if step <= 0:
-            continue
+        pieces = turn_then_straight(grid, blocked, pose, target, max_step_m) if segments else []
+        if pieces:
+            steer, step = pieces[0]
+        else:
+            steer, step = first_step(grid, blocked, pose, path, length)
+            if step <= 0:
+                continue
+            pieces = [(steer, step)] if segments else []
         best_utility = utility
-        best = Plan(target, gain, length, path, steer, step)
+        best = Plan(target, gain, length, path, steer, step, pieces)
     return best
 
 
@@ -334,3 +510,347 @@ def first_step(
         return 0.0, 0.0
     steer = -math.degrees(math.atan(WHEELBASE_M * curvature))
     return steer, min(run, clear)
+
+
+# --- 曲がってから、まっすぐ走る（Pi が segments を受けるとき） ---
+
+# まっすぐの区間のハンドルはこれより小さくする（Pi の clear_cm は、ハンドルが小さいときだけ
+# 通り道の帯がカメラの画角 54° に収まって測れる。1 回目の実走では 1 歩がみな大きな弧で、
+# 241 回とも画角の外だった）
+STRAIGHT_STEER_DEG = 8.0
+# 曲がる区間がこれより短ければ省く（向きのずれは 0.02 / 0.26 rad = 4° ほど）
+MIN_TURN_M = 0.02
+# 1 歩がこれより短ければ走らない
+MIN_STEP_M = 0.05
+# Pi が 1 回に受ける区間の数の上限
+MAX_SEGMENTS = 3
+# 車の外形の真ん中（後ろの車軸から前へ）。ぶつかるかは、ここが広げた障害物に入るかで見る
+CAR_CENTER_M = (CAR_FRONT_M + CAR_REAR_M) / 2
+
+
+def turn_steer(direction: str) -> float:
+    """最小の回転半径で曲がるハンドル角（右が +）。direction は 'L' か 'R'。"""
+    deg = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    return -deg if direction == "L" else deg
+
+
+def drive_poses(
+    start: Pose, pieces: list[tuple[float, float]], reverse: bool = False, step: float = 0.01
+) -> list[tuple[float, Pose]]:
+    """カメラの真下が start の車が、区間 [(ハンドル°, m), ...] を順に走ったときの
+    (走った長さ, 後ろの車軸の姿勢) の列（step m ごと）。reverse なら後ろへ走る。
+    """
+    r = rear_axle(start)
+    x, y, yaw = r.x, r.y, r.yaw
+    out = [(0.0, Pose(x, y, yaw))]
+    done = 0.0
+    sign = -1.0 if reverse else 1.0
+    for steer, length in pieces:
+        n = max(1, int(math.ceil(length / step)))
+        for _ in range(n):
+            x, y, yaw = arc(x, y, yaw, steer, sign * length / n)
+            done += length / n
+            out.append((done, Pose(x, y, yaw)))
+    return out
+
+
+# 車の幅の半分（外形 約 26 x 19 cm）
+CAR_HALF_WIDTH_M = 0.095
+# 走った所を床にするとき、外形からこれだけ内側だけにする（位置のずれの分）
+DRIVEN_SHRINK_M = 0.03
+# 走った所の床の強さ（log-odds）。見た床（1 回 -0.85）より確か（車がそこに居た）
+DRIVEN_FREE = -1.5
+
+
+def mark_driven(
+    grid: Grid, start: Pose, pieces: list[tuple[float, float]], reverse: bool = False
+) -> None:
+    """カメラの真下が start の車が区間を走った所（外形の下）を、床にする。
+
+    カメラは前しか見ず、足元も写らないので、走ってきた道（とくに車の後ろ）は見ていないことが多い。
+    けれど車が通れたのだから、車の高さより低い物は無い。そこを床にすると、後ろへ下がる・
+    切り返す道を地図で確かめられる。障害物と見ているセルは消さない（動く猫かもしれない）。
+    """
+    if not pieces:
+        return
+    xs = np.arange(CAR_REAR_M + DRIVEN_SHRINK_M, CAR_FRONT_M - DRIVEN_SHRINK_M + 1e-9, grid.res / 2)
+    half = CAR_HALF_WIDTH_M - DRIVEN_SHRINK_M
+    ys = np.arange(-half, half + 1e-9, grid.res / 2)
+    fx, fy = (a.ravel() for a in np.meshgrid(xs, ys))
+    px, py = [], []
+    for _, r in drive_poses(start, pieces, reverse, step=grid.res / 2):
+        c, s = math.cos(r.yaw), math.sin(r.yaw)
+        px.append(r.x + c * fx - s * fy)
+        py.append(r.y + s * fx + c * fy)
+    ix, iy = grid.cell(np.concatenate(px), np.concatenate(py))
+    ok = grid.inside(ix, iy)
+    cells = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0)
+    lo = grid.logodds[cells[:, 0], cells[:, 1]]
+    keep = lo <= 0.4  # 障害物と見ているセルはそのまま
+    grid.logodds[cells[keep, 0], cells[keep, 1]] = np.minimum(lo[keep], DRIVEN_FREE)
+
+
+def take(pieces: list[tuple[float, float]], total: float) -> list[tuple[float, float]]:
+    """区間の頭から total m だけ（足りなければ最後の区間を伸ばす）。"""
+    out: list[tuple[float, float]] = []
+    left = total
+    for i, (steer, length) in enumerate(pieces):
+        if left <= 1e-9:
+            break
+        use = left if i == len(pieces) - 1 else min(length, left)
+        out.append((steer, use))
+        left -= use
+    return out
+
+
+def clip_pieces(
+    grid: Grid, blocked: np.ndarray, start: Pose, pieces: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """区間を自転車モデルで走らせ、車の真ん中が blocked に入る手前までに縮める。
+    MIN_STEP_M も進めなければ空。
+    """
+    clear = 0.0
+    for done, r in drive_poses(start, pieces)[1:]:
+        ix, iy = grid.cell(
+            r.x + CAR_CENTER_M * math.cos(r.yaw), r.y + CAR_CENTER_M * math.sin(r.yaw)
+        )
+        if not grid.inside(ix, iy) or blocked[ix, iy]:
+            break
+        clear = done
+    if clear < MIN_STEP_M:
+        return []
+    out = take(pieces, min(clear, sum(m for _, m in pieces)))
+    return [(st, m) for st, m in out if m >= 0.005]
+
+
+def turn_then_straight(
+    grid: Grid, blocked: np.ndarray, pose: Pose, target: Pose, max_m: float = MAX_STEP_M
+) -> list[tuple[float, float]]:
+    """target へ向かう 1 歩を、最小の回転半径の曲がり（要る分だけ）→ まっすぐ、の区間にする。
+
+    後ろの車軸どうしの Dubins 経路（最小半径 TURN_RADIUS_M）の、最初の曲がりとその後の直線を
+    そのまま使う。曲がりの長さは、直線が次の位置のほうを向くまでの分だけになる。
+    最後の曲がりは使わない（次のステーションで撮って決め直す）。直線の無い形（RLR・LRL）は
+    分けられないので空を返す。区間は自転車モデルで走らせて blocked に当て、ぶつかる手前までにする。
+    MAX_STEP_M を超えて走るのは、超えた分がまっすぐの区間のときだけ（Pi の clear_cm は、
+    ハンドルが小さいときだけ通り道を測れる）。
+    """
+    route = dubins(rear_axle(pose), rear_axle(target))
+    if route is None or route[1][1] != "S":
+        return []
+    _, kind, segs = route
+    pieces = []
+    if segs[0] * TURN_RADIUS_M >= MIN_TURN_M:
+        pieces.append((turn_steer(kind[0]), segs[0] * TURN_RADIUS_M))
+    if segs[1] * TURN_RADIUS_M > 0:
+        pieces.append((0.0, segs[1] * TURN_RADIUS_M))
+    total = sum(m for _, m in pieces)
+    if total <= 0:
+        return []
+    if max_m > MAX_STEP_M and pieces[-1][0] != 0.0:
+        max_m = MAX_STEP_M
+    if max_m > MAX_STEP_M and len(pieces) > 1 and pieces[0][1] > MAX_STEP_M:
+        max_m = MAX_STEP_M
+    pieces = take(pieces, min(max_m, total))
+    return clip_pieces(grid, blocked, pose, pieces)
+
+
+# --- 来た道を戻る（Pi が reverse を受けられるとき） ---
+
+# 1 回に戻る長さの上限（Pi も 30 cm で止める）
+REVERSE_MAX_M = 0.30
+# VGGT の位置と、自転車モデルで走らせた位置のずれがこれより大きければ、位置からは測らない
+FIT_TOL_M = 0.08
+
+
+def fit_driven(
+    start: Pose, end: Pose, pieces: list[tuple[float, float]], reverse: bool = False,
+    s_max: float = 1.2,
+) -> tuple[float, float]:  # fmt: skip
+    """start（カメラの真下）から区間を走って end に着いたとして、走った長さ（m）と、
+    そのときの end とのずれ（位置の m + 向きの rad × 0.1）。
+
+    途中で止まったなら区間の途中、頼んだより長く走ったなら最後の区間の先になるよう、
+    最後の区間を s_max まで伸ばして探す（1 回目の実走では、Pi の距離の見積もりが本当の
+    0.6 倍だったので、頼んだ長さの 1.7 倍ほど走っていた）。
+    """
+    best = (0.0, math.inf)
+    for done, r in drive_poses(start, take(pieces, s_max), reverse):
+        c = camera_of(r)
+        err = math.hypot(c.x - end.x, c.y - end.y)
+        err += 0.1 * abs(math.remainder(c.yaw - end.yaw, 2 * math.pi))
+        if err < best[1]:
+            best = (done, err)
+    return best
+
+
+def consume(trail: list[tuple[float, float]], m: float) -> list[tuple[float, float]]:
+    """来た道（走った順の区間）の終わりから m だけ除く（後ろへ戻った分）。"""
+    out = list(trail)
+    while out and m > 1e-9:
+        steer, length = out.pop()
+        if length > m:
+            out.append((steer, length - m))
+        m -= length
+    return out
+
+
+def turning_reverse(
+    grid: Grid, pose: Pose, length: float = 0.30, unseen_ok_m: float = 0.15
+) -> list[tuple[float, float]]:
+    """切り返し：ハンドルをいっぱいに切って後ろへ下がる 1 本の弧（ハンドル°、m）。走れなければ空。
+
+    来た道をそのまま戻ると、同じ位置・同じ向きに戻って同じ 1 歩を選び直す（3 回目の実走では
+    15 か所・4.7 m 走って、半径 30 cm から出られなかった）。曲がりながら下がると向きが
+    40〜60° 変わり、次の 1 歩で別のほうへ進める。
+
+    カメラは前（パン ±35°）しか見ないので、車の後ろはいつも見ていない（3 回目の実走の地図でも
+    後ろ側が空いていた）。見えている床だけを通ると、後ろへはほとんど下がれない。そこで
+    頭の unseen_ok_m だけは、障害物と分かっていない（見ていない）所も通ってよいことにする
+    （Pi は遅く下がり、画像が動かなければ止まる）。その先は見えている床だけ。
+    左右のうち、下がった先から新しく見えそうなセルが多いほうを選ぶ。
+    """
+    state = grid.state()
+    blocked = blocked_cells(grid, state, pose)
+    hard = blocked_cells(grid, state, pose, unseen_ok=True)
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    best, best_gain = [], -1
+    for steer in (max_steer, -max_steer):
+        pieces = [(steer, length)]
+        ok = True
+        for done, rear in drive_poses(pose, pieces, reverse=True)[1:]:
+            cx = rear.x + CAR_CENTER_M * math.cos(rear.yaw)
+            c = grid.cell(cx, rear.y + CAR_CENTER_M * math.sin(rear.yaw))
+            if not grid.inside(*c) or (hard if done <= unseen_ok_m else blocked)[c]:
+                ok = False
+                break
+        if not ok:
+            continue
+        end = camera_of(drive_poses(pose, pieces, reverse=True)[-1][1])
+        gain = view_gain(grid, state, end, rays=21)
+        if gain > best_gain:
+            best, best_gain = pieces, gain
+    return best
+
+
+# --- 向きを変える（切り返し・3 点ターン）を、次の 1 歩の候補にする ---
+
+# 見たい所がこれより後ろ（車の向きから）なら、前へ輪を描くより先に向きを変える
+BEHIND_DEG = 100.0
+# 向きを変えたら、見たい所の向きがこれだけは前に寄ること
+TURN_GAIN_DEG = 40.0
+
+
+@dataclass
+class Turn:
+    """向きを変える 1 歩。moves は [(ハンドル°, m, 後ろへか), ...]（走る順）。"""
+
+    moves: list[tuple[float, float, bool]]
+    end: Pose  # 着いた所（カメラの真下）
+    gain: int
+
+
+def drive_moves(start: Pose, moves: list[tuple[float, float, bool]], step: float = 0.01):
+    """前へ・後ろへの混じった区間を走ったときの (走った長さ, 後ろの車軸の姿勢, 区間の番号,
+    その区間で走った長さ) の列。"""
+    r = rear_axle(start)
+    x, y, yaw = r.x, r.y, r.yaw
+    out = [(0.0, Pose(x, y, yaw), 0, 0.0)]
+    done = 0.0
+    for k, (steer, length, back) in enumerate(moves):
+        n = max(1, int(math.ceil(length / step)))
+        for j in range(n):
+            x, y, yaw = arc(x, y, yaw, steer, (-1 if back else 1) * length / n)
+            done += length / n
+            out.append((done, Pose(x, y, yaw), k, (j + 1) * length / n))
+    return out
+
+
+def moves_are_clear(
+    grid: Grid, state: np.ndarray, pose: Pose, moves, unseen_ok_m: float = 0.15
+) -> bool:
+    """区間を走って、車の真ん中が blocked に入らないか。後ろへの区間の頭 unseen_ok_m だけは、
+    見ていない所も通ってよい（turning_reverse と同じ。Pi は遅く下がり、動かなければ止まる）。"""
+    blocked = blocked_cells(grid, state, pose)
+    hard = blocked_cells(grid, state, pose, unseen_ok=True)
+    for _, rear, k, part in drive_moves(pose, moves)[1:]:
+        c = grid.cell(
+            rear.x + CAR_CENTER_M * math.cos(rear.yaw), rear.y + CAR_CENTER_M * math.sin(rear.yaw)
+        )
+        back = moves[k][2]
+        if not grid.inside(*c) or (hard if back and part <= unseen_ok_m else blocked)[c]:
+            return False
+    return True
+
+
+def plan_turn(
+    grid: Grid,
+    pose: Pose,
+    toward: Pose | None = None,
+    unseen_ok_m: float = 0.0,
+) -> Turn | None:
+    """向きを変える 1 歩：切り返し（いっぱいに切って 30 cm か 15 cm 下がる）。
+
+    前輪で曲がる車は、真後ろの見たい所へ前進だけで行くと、回転半径 26 cm の輪を描き、
+    数歩かけて回り込む（輪の途中で家具に当たる道は使えず、3 回目の実走は unreachable と
+    戻るを繰り返した）。toward（見たい所）があれば、着いた向きがそこにいちばん近いもの、
+    無ければ着いた所から新しく見えそうなセルがいちばん多いもの。見えるセルが無ければ None。
+    後ろへの区間は、頭の unseen_ok_m だけ見ていない所に入ってよい（既定は床と分かった所だけ。
+    走ってきた所は mark_driven で床になっている。行き場が無いときの turning_reverse は 15 cm）。
+    3 点ターン（前へ曲がる → 逆に切って後ろへ、を 1 回の返事にする）も試したが、
+    シミュレーターの実走の部屋で 5 分の広さが 17 % 減ったので入れていない。
+    """
+    state = grid.state()
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    options: list[list[tuple[float, float, bool]]] = []
+    for s in (max_steer, -max_steer):
+        options += [[(s, 0.30, True)], [(s, 0.15, True)]]
+    best, best_key = None, None
+    for moves in options:
+        if not moves_are_clear(grid, state, pose, moves, unseen_ok_m):
+            continue
+        end = camera_of(drive_moves(pose, moves)[-1][1])
+        gain = view_gain(grid, state, end, rays=21)
+        if gain <= 0:
+            continue
+        if toward is not None:
+            off = abs(
+                math.remainder(
+                    math.atan2(toward.y - end.y, toward.x - end.x) - end.yaw, 2 * math.pi
+                )
+            )
+            key = (-off, gain)
+        else:
+            key = (gain, 0.0)
+        if best_key is None or key > best_key:
+            best, best_key = Turn(moves, end, gain), key
+    return best
+
+
+def bearing(pose: Pose, target: Pose) -> float:
+    """pose の向きから見た target の向き（rad、-π..π）。"""
+    return math.remainder(math.atan2(target.y - pose.y, target.x - pose.x) - pose.yaw, 2 * math.pi)
+
+
+def retrace(
+    trail: list[tuple[float, float]], budget: float = REVERSE_MAX_M, max_pieces: int = MAX_SEGMENTS
+) -> list[tuple[float, float]]:
+    """来た道の終わりから budget m を、戻る順の区間にする。
+
+    同じハンドルのまま後ろへ走ると、自転車モデルでは同じ弧をそのまま戻る。なので、走った区間を
+    逆の順に、同じハンドルで後ろへ走れば、さっき走った（ぶつからなかった）床の上だけを通る。
+    """
+    out: list[tuple[float, float]] = []
+    left = budget
+    for steer, length in reversed(trail):
+        if left <= 1e-9:
+            break
+        use = min(length, left)
+        if out and abs(out[-1][0] - steer) < 0.05:
+            out[-1] = (steer, out[-1][1] + use)
+        elif len(out) == max_pieces:
+            break
+        else:
+            out.append((steer, use))
+        left -= use
+    return [(st, m) for st, m in out if m >= 0.005]

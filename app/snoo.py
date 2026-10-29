@@ -19,6 +19,10 @@ LAN 宛ては 3.7 ms）。そのときは 0.0.0.0 で受け、認証の無い UD
 （Pi の LAN と tailscale の IP）以外は捨てる。
 
 --record-dir を渡すと、猫が写っている間のフレームを学習用に保存する（app/snoo_record.py）。
+--live-dir を渡すと、送り元ごとに最新のフレームと返事を 1 秒に 1 回ほど書く（app/snoo_live.py。
+地図のサーバーの /twin で見る）。
+--slam-tap-dir を渡すと、走っている間のフレームを 4 枚/秒ほど SLAM に渡す（app/snoo_slam_tap.py。
+ホストの app/snoo_slam.py が読む）。
 
 走っている間（SNO2 で flags に MOVING）は、前があと何 cm 空いているか（clear_cm、
 app/clearance.py）も返事の一番上の段に載せる。超音波のセンサーが壊れていて、走っている間は
@@ -47,7 +51,9 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from app.snoo_live import LIVE_DIR, LiveWriter
 from app.snoo_record import RECORD_DIR, Recorder
+from app.snoo_slam_tap import SLAM_TAP_DIR, SlamTap
 
 HEADER = struct.Struct("<4sIQHH")
 MAGIC = b"SNO1"
@@ -89,6 +95,10 @@ CLEAR_MIN_CONF = float(os.getenv("SNOO_CLEAR_MIN_CONF", "0.5"))
 # 0.7 cm しか進まないので、それで足りる。毎フレーム回しても検出の p50 は 0.3 ms ほどしか
 # 遅れなかったが、GPU は検出のために空けておく
 CLEAR_INTERVAL_MS = float(os.getenv("SNOO_CLEAR_INTERVAL_MS", "45"))
+# 首（パン・チルト）を動かしてから・走り出してから、この間は clear_cm を見積もらない。
+# サーボが止まるまで（0.4 s ほど）は、撮った時刻の指令と実際の向きが違い、床の位置を見誤る。
+# 1 回目の実走の 2 回目の探索では、撮り終えて走り出した直後に 18 cm（超音波は 67 cm）と出て止まった
+CLEAR_SETTLE_MS = float(os.getenv("SNOO_CLEAR_SETTLE_MS", "400"))
 
 log = logging.getLogger("snoo")
 
@@ -416,6 +426,7 @@ class ClearanceWorker:
         max_age_ms: float = CLEAR_MAX_AGE_MS,
         min_conf: float = CLEAR_MIN_CONF,
         interval_ms: float = CLEAR_INTERVAL_MS,
+        settle_ms: float = CLEAR_SETTLE_MS,
     ):
         self.max_age_ns = int(max_age_ms * 1e6)
         self.min_conf = min_conf
@@ -429,6 +440,9 @@ class ClearanceWorker:
         self._busy = False
         self._job = None
         self._results: dict[tuple, _ClearResult] = {}
+        self.settle_ns = int(settle_ms * 1e6)
+        # 送り元ごとの、前のフレームの (走っているか, パン, チルト) と、それが変わった時刻
+        self._pose: dict[tuple, tuple[tuple, int]] = {}
         threading.Thread(target=self._run, args=(build,), daemon=True, name="snoo-clear").start()
 
     def wait_ready(self, timeout: float | None = None) -> bool:
@@ -436,14 +450,30 @@ class ClearanceWorker:
         self._ready.wait(timeout)
         return self.estimator is not None
 
+    def settling(self, addr: tuple, frame: Frame) -> bool:
+        """首を動かした・走り出した直後で、サーボがまだ止まっていないか。フレームごとに呼ぶ。"""
+        key = (frame.moving, round(frame.pan_deg or 0.0, 1), round(frame.tilt_deg or 0.0, 1))
+        last = self._pose.get(addr)
+        if last is None or last[0] != key or frame.t_capture_ns < last[1]:
+            self._pose[addr] = (key, frame.t_capture_ns)
+            return self.settle_ns > 0
+        return frame.t_capture_ns - last[1] < self.settle_ns
+
     def fields(self, addr: tuple, frame: Frame) -> dict | None:
         """このフレームの返事に載せる clear の欄。None なら載せない。"""
+        settling = self.settling(addr, frame)
         if not frame.moving or self.estimator is None:
             return None
         if frame.flags & REVERSING:
             return {"clear_skip": "reversing"}
+        if settling:
+            return {"clear_skip": "settling"}
         with self._lock:
             r = self._results.get(addr)
+        # サーボが動いていた間のフレームから見積もった値は使わない
+        changed = self._pose[addr][1]
+        if r is not None and r.t_capture_ns - changed < self.settle_ns:
+            r = None
         # 古さは Pi の撮った時刻どうしで比べる（届くまでの揺れが入らない）。
         # 負なら Pi が起動し直して時刻が戻った
         if r is None or not 0 <= frame.t_capture_ns - r.t_capture_ns <= self.max_age_ns:
@@ -463,6 +493,8 @@ class ClearanceWorker:
         """返事を送った後に呼ぶ。前のがまだ回っている・間が短ければ捨てて False。"""
         if not frame.moving or frame.flags & REVERSING or self.estimator is None:
             return False
+        if self.settling(addr, frame):
+            return False  # サーボが止まるまでは見積もらない
         now = time.monotonic_ns()
         with self._lock:
             if now - self._last_start_ns < self.interval_ns:
@@ -577,6 +609,8 @@ def serve(
     active_file: str = "",
     recorder: Recorder | None = None,
     clearance: ClearanceWorker | None = None,
+    live: LiveWriter | None = None,
+    slam_tap: SlamTap | None = None,
 ) -> None:
     sock = _bind(host, port)
     allow = allow or []
@@ -631,6 +665,10 @@ def serve(
                 clearance.submit(addr, frame, image, stages)
             if recorder is not None:  # 返事の後に渡す（書き込みは別のスレッド）
                 recorder.offer(addr, frame, dets)
+            if live is not None:  # これも返事の後。書くのは 1 秒に 1 回ほど、別のスレッドで
+                live.offer(addr, frame, dets, infer_ms, clear)
+            if slam_tap is not None:  # これも返事の後。走っている間だけ、別のスレッドで書く
+                slam_tap.offer(addr, frame, dets)
         now = time.monotonic()
         if active_file and times and now - last_touch >= 1.0:
             _touch(active_file)
@@ -681,6 +719,16 @@ def main() -> None:
         help="猫が写っている間のフレームを保存する所（環境変数 SNOO_RECORD_DIR）。空なら保存しない",
     )
     parser.add_argument(
+        "--live-dir",
+        default=LIVE_DIR,
+        help="最新のフレームと返事を 1 秒に 1 回ほど書く所（環境変数 SNOO_LIVE_DIR）。空は書かない",
+    )
+    parser.add_argument(
+        "--slam-tap-dir",
+        default=SLAM_TAP_DIR,
+        help="走っている間のフレームを SLAM に渡す所（環境変数 SNOO_SLAM_TAP_DIR）。空は書かない",
+    )
+    parser.add_argument(
         "--clearance",
         action=argparse.BooleanOptionalAction,
         default=CLEARANCE,
@@ -713,6 +761,8 @@ def main() -> None:
         active_file=args.active_file,
         recorder=Recorder(args.record_dir) if args.record_dir else None,
         clearance=clearance,
+        live=LiveWriter(args.live_dir) if args.live_dir else None,
+        slam_tap=SlamTap(args.slam_tap_dir) if args.slam_tap_dir else None,
     )
 
 

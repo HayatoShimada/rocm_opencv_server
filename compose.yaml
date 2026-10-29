@@ -57,7 +57,9 @@ services:
       SNOO_COMPILE: "${SNOO_COMPILE:-1}"
       # フレームを処理している間 1 秒ごとに触る。ホストの deploy/snoo-gpu-perf.sh がこれを見て、
       # 検出が動いている間だけ GPU の時計を上げる（止まれば 3 秒で auto に戻す）
-      SNOO_ACTIVE_FILE: /run/snoo/active
+      # 消費電力を抑えるため、既定では合図を出さず GPU の時計は auto のまま（2026-10-29、遅れより電力）。
+      # 時計を上げたいときは SNOO_ACTIVE_FILE=/run/snoo/active にする
+      SNOO_ACTIVE_FILE: "${SNOO_ACTIVE_FILE-}"
       # 猫が写っている間のフレームを学習用に保存する（app/snoo_record.py。10 枚/秒まで）
       SNOO_RECORD_DIR: /app/data/snoo_rec
       SNOO_RECORD_FPS: "${SNOO_RECORD_FPS:-10}"
@@ -69,6 +71,14 @@ services:
       SNOO_CAMERA_HEIGHT_CM: "${SNOO_CAMERA_HEIGHT_CM:-8}"
       SNOO_TILT_GAIN: "${SNOO_TILT_GAIN:-1.0}"
       SNOO_TILT_OFFSET_DEG: "${SNOO_TILT_OFFSET_DEG:-0.0}"
+      # 送り元ごとに最新のフレームと返事を 1 秒に 1 回ほど書く（app/snoo_live.py）。地図のサーバー
+      # （ホストのプロセス）が /twin で見せる。/run/snoo は下のボリュームでホストと分け合う。
+      # 空にすれば書かない
+      SNOO_LIVE_DIR: "${SNOO_LIVE_DIR-/run/snoo/live}"
+      # 走っている間のフレームを 4 枚/秒ほど SLAM（ホストの app/snoo_slam.py、deploy/snoo-slam.service）に
+      # 渡す（app/snoo_slam_tap.py）。送り元ごとに新しい 300 枚だけ残す。空にすれば書かない
+      SNOO_SLAM_TAP_DIR: "${SNOO_SLAM_TAP_DIR-/run/snoo/slam}"
+      SNOO_SLAM_TAP_HZ: "${SNOO_SLAM_TAP_HZ:-4}"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
       TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
     # snoo の見本（scripts/snoo_gallery.py で作る）と、

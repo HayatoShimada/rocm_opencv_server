@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<!-- PiCar-X（snoo_trucar）と部屋のデジタルツイン。地図のサーバー（app/snoo_twin.py）が返す。
+     家の外へ出られなくても見られるよう、外の CDN もビルドも使わない（素の JS と Canvas）。 -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snoo ツイン</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/twin/static/twin.css">
+</head>
+<body>
+<header>
+  <h1>snoo <span>ツイン</span></h1>
+  <label class="field">セッション
+    <select id="session"></select>
+  </label>
+  <label class="check"><input type="checkbox" id="follow" checked> 新しいセッションを追う</label>
+  <div class="spacer"></div>
+  <div id="status" class="status"><i></i><span>読み込み中</span></div>
+</header>
+
+<main>
+  <section class="card map" id="map-card">
+    <div class="card-head">
+      <h2>上から見た地図</h2>
+      <div class="toggles" id="layers">
+        <label><input type="checkbox" data-layer="frontier" checked>境目</label>
+        <label><input type="checkbox" data-layer="high" checked>上の層</label>
+        <label><input type="checkbox" data-layer="fov" checked>カメラ</label>
+        <label><input type="checkbox" data-layer="sonar" checked>超音波</label>
+        <label><input type="checkbox" data-layer="plan" checked>目標と道</label>
+        <label><input type="checkbox" data-layer="step" checked>次の 1 歩</label>
+      </div>
+      <button id="fit" title="全体が入るように戻す（ダブルクリックでも）">全体</button>
+    </div>
+    <div class="canvas-wrap"><canvas id="map"></canvas></div>
+    <div class="legend">
+      <span><i class="sw free"></i>床</span>
+      <span><i class="sw occ"></i>障害物</span>
+      <span><i class="sw high"></i>上の層</span>
+      <span><i class="sw unk"></i>見ていない</span>
+      <span><i class="sw front"></i>境目</span>
+      <span><i class="ln st"></i>ステーション</span>
+      <span><i class="ln fwd"></i>前へ</span>
+      <span><i class="ln rev"></i>後ろへ</span>
+      <span><i class="ln nbv"></i>目標までの道</span>
+    </div>
+  </section>
+
+  <section class="card view3d">
+    <div class="card-head"><h2>3D</h2><span class="hint">ドラッグで回す・ホイールで寄る</span></div>
+    <div class="canvas-wrap"><canvas id="view3d"></canvas></div>
+  </section>
+
+  <section class="card live">
+    <div class="card-head">
+      <h2>今のカメラ</h2>
+      <select id="sender" hidden></select>
+      <span class="hint" id="live-age"></span>
+    </div>
+    <div class="live-body">
+      <div class="live-frame">
+        <img id="live-img" alt="">
+        <canvas id="live-boxes"></canvas>
+        <div class="empty" id="live-empty">検出サーバーの今のフレームはまだ無い</div>
+      </div>
+      <dl class="kv" id="live-kv"></dl>
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="card">
+      <div class="card-head"><h2>返事</h2><span id="reply-badge" class="badge"></span></div>
+      <div id="reply"></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>車</h2></div>
+      <dl class="kv" id="car"></dl>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>時間</h2><span class="hint">Pi が待つのは 20 秒</span></div>
+      <div id="timing"></div>
+    </section>
+  </aside>
+
+  <section class="card thumbs">
+    <div class="card-head">
+      <h2>止まって撮った画像</h2>
+      <div id="station-chips" class="chips"></div>
+    </div>
+    <div id="thumbs" class="thumb-grid"></div>
+  </section>
+</main>
+
+<div id="lightbox" hidden><img alt=""><p></p></div>
+
+<script src="/twin/static/view3d.js"></script>
+<script src="/twin/static/twin.js"></script>
+</body>
+</html>
