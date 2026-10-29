@@ -432,3 +432,17 @@ def test_random_and_first_steps_keep_the_real_car_off_obstacles():
     path = sample_path(pose, "L", (math.pi / 2,), r=0.26)  # 左へいっぱいに曲がる道
     steer, run = first_step(g, blocked, pose, path, 0.4)
     assert run == 0 or not hits(steer, run)
+
+
+def test_big_frontiers_drop_tiny_holes_in_the_floor():
+    from app.roommap import big_frontiers
+
+    g = _room()  # x < 0.8 が床の大きな境目
+    for _ in range(3):  # 床の中に 1 セルの見ていない穴（VGGT の点の抜け）を作る
+        g.logodds[g.cell(-1.0, -1.0)] = 0.0
+    s = g.state()
+    assert frontiers(s)[g.cell(-1.05, -1.0)] or frontiers(s)[g.cell(-0.95, -1.0)]
+    big = big_frontiers(s)
+    ix, iy = np.nonzero(big)
+    x, _ = g.center(ix, iy)
+    assert len(ix) and np.all(np.abs(x - 0.775) < 0.06)  # 大きな境目だけが残る

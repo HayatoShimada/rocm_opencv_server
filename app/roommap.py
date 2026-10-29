@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -176,6 +177,48 @@ def frontiers(state: np.ndarray) -> np.ndarray:
     near[:, 1:] |= unknown[:, :-1]
     near[:, :-1] |= unknown[:, 1:]
     return (state == FREE) & near
+
+
+# 境目の塊（8 近傍でつながったセル）がこれより小さければ、次に撮る位置の手がかりにしない
+MIN_FRONTIER_CELLS = int(os.getenv("SNOO_MIN_FRONTIER_CELLS", "3"))
+# 床に囲まれた見ていない穴がこれより小さければ（VGGT の点の抜け）、穴の縁を境目にしない
+MIN_UNKNOWN_HOLE_CELLS = int(os.getenv("SNOO_MIN_UNKNOWN_HOLE_CELLS", "6"))
+
+
+def big_frontiers(
+    state: np.ndarray,
+    min_cells: int = MIN_FRONTIER_CELLS,
+    min_hole: int = MIN_UNKNOWN_HOLE_CELLS,
+) -> np.ndarray:
+    """次に撮る位置の手がかりにする境目。frontiers から、小さな穴の縁と小さな塊を除く。
+
+    VGGT の点の抜けでできた床の中の小さな穴（1〜数セル）も境目になり、そこを見に行こうとして
+    小刻みに動くことがある（explore_lite の min_frontier_size と同じ考え）。実走の地図では、
+    境目の塊の半分ほどが 3 セル未満だった。走れるかの判定（blocked）は変えない（穴は見ていない
+    ままなので、そこへは入らない）。
+    """
+    import cv2
+
+    work = state
+    if min_hole > 1:
+        unknown = (state == UNKNOWN).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(unknown, connectivity=4)
+        h, w = state.shape
+        tiny = np.zeros(n, bool)
+        for k in range(1, n):
+            x, y, bw, bh, area = stats[k]
+            edge = x == 0 or y == 0 or x + bw == w or y + bh == h
+            tiny[k] = area < min_hole and not edge
+        if tiny.any():
+            work = state.copy()
+            work[tiny[labels]] = FREE  # 境目を探すときだけ、穴を床とみなす
+    front = frontiers(work) & (state == FREE)
+    if min_cells <= 1 or not front.any():
+        return front
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(front.astype(np.uint8), connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_cells
+    return keep[labels]
 
 
 def view_cells(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> np.ndarray:
@@ -423,7 +466,7 @@ def next_best_view(
     rng = rng or np.random.default_rng(0)
     state = grid.state()
     blocked = blocked_cells(grid, state, pose)
-    front = np.argwhere(frontiers(state))
+    front = np.argwhere(big_frontiers(state))
     if not len(front):
         return None
     # 候補：境目の近く（1.2 m 以内）の、車が入れるセル
