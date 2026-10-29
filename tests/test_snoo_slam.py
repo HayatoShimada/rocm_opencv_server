@@ -291,6 +291,15 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
             {"t_capture_ns": starts[0] - 10**9, "image": f"{file_stem(starts[0] - 10**9)}.jpg"}
         )
     )
+    # Pi を起動し直す前の起動のフレーム：撮った時刻はずっと大きいが、セッションの前に届いた。
+    # 使わず、これのせいで後のフレームを読み飛ばしてもいけない
+    old_t = starts[-1] + 10**15
+    _jpeg(q / f"{file_stem(old_t)}.jpg")
+    (q / f"{file_stem(old_t)}.json").write_text(
+        json.dumps(
+            {"t_capture_ns": old_t, "image": f"{file_stem(old_t)}.jpg", "t_recv": T0 - 100.0}
+        )
+    )
     # ステーションを受けた時刻を、作り物の時計にそろえる（それより前に届いたタップは使わない）
     for meta in (tmp_path / "data").glob("*/*/meta.json"):
         os.utime(meta, (T0 - 10.0, T0 - 10.0))
@@ -344,6 +353,15 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
     lines = (out / "frames.jsonl").read_text().splitlines()
     assert len(lines) == 26 and json.loads(lines[1])["boxes"] == []
 
+    # 古い起動のフレームを読んだ後に届いた、新しい起動のフレーム
+    # （撮った時刻は古いものより小さい）も読む
+    late_t = starts[1] - 5 * 10**8
+    _jpeg(q / f"{file_stem(late_t)}.jpg")
+    late = {"t_capture_ns": late_t, "image": f"{file_stem(late_t)}.jpg", "t_recv": clock.t}
+    (q / f"{file_stem(late_t)}.json").write_text(json.dumps(late))
+    svc.poll()
+    assert f"{late_t:020d}.jpg" in svc.kfs
+
     # 使わないので終えて起動し直しても、同じセッションのそれまでのコマを読み直す
     # （タップの置き場からは消えていても、frames/ に写したものがある）
     for p in (tmp_path / "queue").rglob("*"):
@@ -354,7 +372,7 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
         slam_factory=lambda: FakeSlam(sc, truth), clock=clock,
     )  # fmt: skip
     again.start(session)
-    assert len(again.kfs) == 26 and len(again.pending) == 26
+    assert len(again.kfs) == 27 and len(again.pending) == 27
 
 
 def test_service_starts_a_new_segment_when_tracking_is_lost(tmp_path):
