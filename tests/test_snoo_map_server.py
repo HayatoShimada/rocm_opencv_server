@@ -473,3 +473,34 @@ def test_no_floor_returns_done_instead_of_500(tmp_path, monkeypatch):
     c = _client(tmp_path)
     r = _post(c, _meta(0))
     assert r.status_code == 200 and r.json()["action"] == "done"
+
+
+def test_idle_exit_waits_for_requests_in_flight():
+    from app.snoo_map_server import VggtReconstruct
+
+    v = VggtReconstruct(idle_s=0)  # 監視のスレッドは立てない
+    v.idle_s = 0.01
+    v.model = object()  # 読んだことにする
+    assert v.enter()  # 受けている途中
+    v.last_used -= 1.0
+    assert not v._should_exit()  # 途中のリクエストがあるので終えない
+    v.leave()
+    v.last_used -= 1.0
+    assert v._should_exit()
+    assert not v.enter()  # 終えると決めた後は受けない（503）
+
+
+def test_resending_the_same_station_does_not_break_the_first(tmp_path):
+    import threading as _threading
+
+    c = _client(tmp_path)
+    out = []
+    ts = [
+        _threading.Thread(target=lambda: out.append(_post(c, _meta(0)).status_code))
+        for _ in range(3)
+    ]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert out == [200, 200, 200]
