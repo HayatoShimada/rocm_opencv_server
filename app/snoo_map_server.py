@@ -613,6 +613,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
             action["target"] = pose_dict(r.step_path[-1])
             remember_reverse(session, station_id, action)
             r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
+    if action.get("reverse") and station_id not in read_reverses(session):
+        # 向きを変える 1 歩（turn）も後ろへ走る。prev_step に reverse を書かない Pi のために残す
+        # （残さないと、後ろへの turn を前へ走ったものとして来た道と床を逆側にしていた）
+        remember_reverse(session, station_id, action)
     if action["action"] == "move":
         here = poses.get(station_id)
         if here is None:  # 位置合わせが崩れていれば decide が done にするので、ふつうは来ない
@@ -667,6 +671,17 @@ def pi_distance_m(prev: dict) -> float | None:
     return None
 
 
+def moved_fit(
+    prev: dict, pieces, a: Pose | None, b: Pose | None, reverse: bool
+) -> tuple[float | None, bool]:
+    """(moved_m の長さ, VGGT の位置で確かめられたか)。"""
+    if a is not None and b is not None:
+        s, err = fit_driven(a, b, pieces, reverse)
+        if err <= FIT_TOL_M:
+            return s, True
+    return pi_distance_m(prev), False
+
+
 def moved_m(prev: dict, pieces, a: Pose | None, b: Pose | None, reverse: bool) -> float | None:
     """ステーション a から b まで、区間に沿って実際に走った長さ（m）。
 
@@ -704,10 +719,12 @@ def driven_trail(
 
 
 def steps_driven(
-    session: Path, station_id: int, poses: dict[int, Pose]
+    session: Path, station_id: int, poses: dict[int, Pose], fitted_only: bool = False
 ) -> list[tuple[int, list[tuple[float, float]] | None, bool]]:
     """station_id までの、ステーションの間に走った 1 歩ごとの (前のステーション, 区間, 後ろへか)。
     区間は実際に走った長さまで（moved_m）。どう動いたか分からない所は区間が None。
+    fitted_only なら、VGGT の位置で確かめられなかった歩も None にする（床にするとき。位置が
+    8 cm を超えてずれていると、車の外形分が別の所で床になる。コードレビュー）。
     prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
     """
     sent = read_reverses(session)
@@ -723,15 +740,18 @@ def steps_driven(
         else:
             reverse = prev.get("reverse")
             reverse = before in sent if reverse is None else bool(reverse)
-            s = moved_m(prev, pieces, poses.get(before), poses.get(i), reverse)
-            out.append((before, None if s is None else take(pieces, s), reverse))
+            s, fitted = moved_fit(prev, pieces, poses.get(before), poses.get(i), reverse)
+            if s is None or (fitted_only and not fitted):
+                out.append((before, None, reverse))
+            else:
+                out.append((before, take(pieces, s), reverse))
         before = i
     return out
 
 
 def mark_steps_driven(grid, session: Path, station_id: int, poses: dict[int, Pose]) -> None:
     """走ってきた道（車の外形の下）を、セッションの間取りの床にする（roommap.mark_driven）。"""
-    for before, pieces, reverse in steps_driven(session, station_id, poses):
+    for before, pieces, reverse in steps_driven(session, station_id, poses, fitted_only=True):
         if pieces and before in poses:
             mark_driven(grid, poses[before], pieces, reverse)
 
