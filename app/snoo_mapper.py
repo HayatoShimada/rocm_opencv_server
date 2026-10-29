@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,6 +121,9 @@ class MapParams:
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
     force_random: bool = False
     seed: int = 0
+    # 学んだ選び方（app/snoo_explore_policy.py）の重みのファイル。None なら今までの決め方。
+    # 既定は環境変数 SNOO_EXPLORE_POLICY（無ければ使わない）
+    policy: str | None = field(default_factory=lambda: os.getenv("SNOO_EXPLORE_POLICY") or None)
 
 
 @dataclass
@@ -843,21 +847,39 @@ def registration_is_bad(st: StationResult, height_m: float | None) -> bool:
     return height_m is not None and abs(st.height_m - height_m) > 0.5 * height_m
 
 
+def stop_reason(
+    grid: Grid, stations: list[StationResult], params: MapParams, heights: list[float | None]
+) -> dict | None:
+    """探るのをやめる返事（done）か、続けるなら None。決め方（今まで・学んだもの）によらない。"""
+    if len(stations) >= params.max_stations:
+        return {"action": "done", "reason": "step_limit"}
+    for st, H in zip(stations, heights, strict=True):
+        if registration_is_bad(st, H):
+            return {"action": "done", "reason": f"bad_registration:{st.name}"}
+    if int((grid.state() == FREE).sum()) < MIN_FREE_CELLS:
+        return {"action": "done", "reason": "too_little_floor"}
+    # 次に撮る位置と同じ境目で見る（床の中の小さな穴だけが残ったら、調べ終えたとする）
+    if not big_frontiers(grid.state()).any():
+        return {"action": "done", "reason": "no_frontier"}
+    return None
+
+
 def decide(
     grid: Grid, stations: list[StationResult], params: MapParams, heights: list[float | None]
 ) -> tuple[dict, Plan | None]:
-    """最後のステーションから次の 1 歩を決める。危なそうなら止める（done）。"""
-    if len(stations) >= params.max_stations:
-        return {"action": "done", "reason": "step_limit"}, None
-    for st, H in zip(stations, heights, strict=True):
-        if registration_is_bad(st, H):
-            return {"action": "done", "reason": f"bad_registration:{st.name}"}, None
-    if int((grid.state() == FREE).sum()) < MIN_FREE_CELLS:
-        return {"action": "done", "reason": "too_little_floor"}, None
+    """最後のステーションから次の 1 歩を決める。危なそうなら止める（done）。
+
+    params.policy（重みのファイル）があれば、候補の 1 歩を学んだ点数で選ぶ
+    （app/snoo_explore_policy.py。安全の確かめと 1 歩の作り方は同じ）。
+    """
+    stop = stop_reason(grid, stations, params, heights)
+    if stop is not None:
+        return stop, None
     pose = stations[-1].pose
-    # 次に撮る位置と同じ境目で見る（床の中の小さな穴だけが残ったら、調べ終えたとする）
-    if not big_frontiers(grid.state()).any():
-        return {"action": "done", "reason": "no_frontier"}, None
+    if params.policy:
+        from app.snoo_explore_policy import policy_decide
+
+        return policy_decide(grid, stations, params)
     rng = np.random.default_rng(params.seed)
     plan = None
     if not params.force_random and rng.random() >= params.random_p:
@@ -871,18 +893,26 @@ def decide(
         step = random_step(grid, pose, rng)
         if step is None:  # 境目はあるが、見えている床を通って行ける所が無い
             return {"action": "done", "reason": "unreachable"}, None
-        steer, run = step
-        action = {
-            "action": "move",
-            "steer_deg": round(steer, 1),
-            "speed": SPEED,
-            "distance_cm": round(run * 100, 1),
-            "pose": pose_dict(pose),
-            "random": True,
-        }
-        if params.segments:
-            action["segments"] = segments_json([(steer, run)])
-        return action, None
+        return random_action(step, pose, params), None
+    return plan_action(plan, pose, params), plan
+
+
+def random_action(step: tuple[float, float], pose: Pose, params: MapParams) -> dict:
+    steer, run = step
+    action = {
+        "action": "move",
+        "steer_deg": round(steer, 1),
+        "speed": SPEED,
+        "distance_cm": round(run * 100, 1),
+        "pose": pose_dict(pose),
+        "random": True,
+    }
+    if params.segments:
+        action["segments"] = segments_json([(steer, run)])
+    return action
+
+
+def plan_action(plan: Plan, pose: Pose, params: MapParams) -> dict:
     action = {
         "action": "move",
         "steer_deg": round(plan.steer_deg, 1),
@@ -894,7 +924,7 @@ def decide(
     if params.segments:
         # 上の steer_deg・distance_cm は最初の区間（segments を知らない Pi でも同じに動く）
         action["segments"] = segments_json(plan.segments)
-    return action, plan
+    return action
 
 
 def turn_instead(grid: Grid, pose: Pose, plan: Plan | None, params: MapParams) -> Turn | None:
