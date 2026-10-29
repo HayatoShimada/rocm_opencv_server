@@ -20,6 +20,12 @@ LAN 宛ては 3.7 ms）。そのときは 0.0.0.0 で受け、認証の無い UD
 
 --record-dir を渡すと、猫が写っている間のフレームを学習用に保存する（app/snoo_record.py）。
 
+走っている間（SNO2 で flags に MOVING）は、前があと何 cm 空いているか（clear_cm、
+app/clearance.py）も返事の一番上の段に載せる。超音波のセンサーが壊れていて、走っている間は
+前が見えないため。
+検出を遅くしないよう、返事を送った後に別のスレッドで最新のフレームだけを見積もり、次の返事に載せる
+（ClearanceWorker）。走っていないフレームと SNO1 には clear の欄を載せない。
+
     uv run python -m app.snoo --host 0.0.0.0 --allow 192.168.0.188,100.73.14.8
 """
 
@@ -28,10 +34,12 @@ import errno
 import ipaddress
 import json
 import logging
+import math
 import os
 import socket
 import statistics
 import struct
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -71,6 +79,16 @@ ALLOW = os.getenv("SNOO_ALLOW", "")
 # フレームを処理している間、1 秒ごとに触る（更新時刻を新しくする）ファイル。ホストの
 # deploy/snoo-gpu-perf.sh がこれを見て、検出が動いている間だけ GPU の時計を上げる
 ACTIVE_FILE = os.getenv("SNOO_ACTIVE_FILE", "")
+# 走っている間の前の空き（clear_cm）を見積もるか
+CLEARANCE = os.getenv("SNOO_CLEARANCE", "1") == "1"
+# clear_cm の元にしたフレームが、返事のフレームよりこれだけ前に撮ったものなら古いとして null にする
+CLEAR_MAX_AGE_MS = 150.0
+# 確からしさがこれより低い clear_cm は null にする（地図の画像では、床が見えていれば 0.95 以上）
+CLEAR_MIN_CONF = float(os.getenv("SNOO_CLEAR_MIN_CONF", "0.5"))
+# 見積もりを始める間の最短（ms）。15 cm/s なら 45 ms（60 fps の 3 フレームに 1 回、20 回/秒）で
+# 0.7 cm しか進まないので、それで足りる。毎フレーム回しても検出の p50 は 0.3 ms ほどしか
+# 遅れなかったが、GPU は検出のために空けておく
+CLEAR_INTERVAL_MS = float(os.getenv("SNOO_CLEAR_INTERVAL_MS", "45"))
 
 log = logging.getLogger("snoo")
 
@@ -122,7 +140,10 @@ def parse_frame(data: bytes) -> Frame:
     return Frame(seq, t_capture_ns, width, height, data[HEADER.size :])
 
 
-def encode_reply(frame: Frame, dets: list[Detection], infer_ms: float) -> bytes:
+def encode_reply(
+    frame: Frame, dets: list[Detection], infer_ms: float, clear: dict | None = None
+) -> bytes:
+    """clear は ClearanceWorker.fields の値（None なら clear の欄は載せない）。"""
     reply = {
         "v": 1,
         "seq": frame.seq,
@@ -137,6 +158,8 @@ def encode_reply(frame: Frame, dets: list[Detection], infer_ms: float) -> bytes:
             for d in dets
         ],
     }
+    if clear is not None:
+        reply.update(clear)
     return json.dumps(reply, separators=(",", ":")).encode()
 
 
@@ -218,7 +241,7 @@ class Stages:
     検出と CLIP は結果を CPU に移す所で GPU を待つので、その直後に区切れば GPU の時間も入る。
     """
 
-    ORDER = ("受信", "デコード", "検出", "CLIP", "送信")
+    ORDER = ("受信", "デコード", "検出", "CLIP", "送信", "clear")
 
     def __init__(self):
         self.samples: dict[str, list[float]] = defaultdict(list)
@@ -233,6 +256,10 @@ class Stages:
         now = time.perf_counter()
         self.samples[name].append((now - self._t) * 1000)
         self._t = now
+
+    def add(self, name: str, ms: float) -> None:
+        """別のスレッドで測った時間を足す（clear は返事の後に別のスレッドで回す）。"""
+        self.samples[name].append(ms)
 
     def summary(self) -> str:
         """「区間 p50/p95 ms」を ORDER の順に並べた 1 行。集めた値は消す。"""
@@ -348,6 +375,146 @@ class CatDetector:
         return [Detection(tuple(b), s) for b, s in zip(boxes, scores, strict=True)]
 
 
+# 走っているが、使える clear_cm が無いときの欄（Pi は null が 0.3 秒続くと止まる）
+NO_CLEAR = {"clear_cm": None, "clear_conf": None, "clear_seq": None, "clear_blind_cm": None}
+
+
+@dataclass
+class _ClearResult:
+    seq: int
+    t_capture_ns: int
+    clearance: object  # app.clearance.Clearance
+
+
+class ClearanceWorker:
+    """走っている間の前の空き（clear_cm）を、検出とは別のスレッドで見積もる。
+
+    検出は 60 fps・1 フレーム 5 ms 足らずで回っているので、その間に入れると遅くなる。
+    そこで返事を送った後に submit でフレームを渡し、別のスレッドで見積もって、次の返事に載せる。
+    GPU は 1 つを分け合うので、同時には 1 つしか回さない。まだ回っている間に来たフレームは
+    溜めずに捨てる（終わった後に来た最新のフレームを使う）。前に始めてから interval_ms 経って
+    いないフレームも見積もらない。
+
+    返事の欄（fields）の決まり（Pi と決めたもの）
+    - 欄が無い = サーバーは clear を見ていない（Pi は止まらない）。走っていないフレーム・SNO1・
+      モデルがまだ無い（読み込み中か失敗）とき。
+    - null = 見ているが、このフレームには使える値が無い（Pi は走っている間に null が 0.3 秒
+      続くと止まる）。元のフレームが CLEAR_MAX_AGE_MS より古い・まだ無い・見えない
+      （手前が見えなさすぎる・床に合わない）・確からしさが CLEAR_MIN_CONF より低い・
+      下がっている（カメラは前を向いているので、進む先が見えない）とき。
+
+    build は見積もりの道具（app.clearance.Estimator か、テストでは同じ形の物）を作る関数。
+    compile した HIP グラフは作ったスレッドでしか使い回せないので、見積もるスレッドの中で作る。
+    """
+
+    def __init__(
+        self,
+        build,
+        max_age_ms: float = CLEAR_MAX_AGE_MS,
+        min_conf: float = CLEAR_MIN_CONF,
+        interval_ms: float = CLEAR_INTERVAL_MS,
+    ):
+        self.max_age_ns = int(max_age_ms * 1e6)
+        self.min_conf = min_conf
+        self.interval_ns = int(interval_ms * 1e6)
+        self._last_start_ns = -(1 << 62)
+        self.estimator = None
+        self.computed = self.skipped = 0
+        self._ready = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._busy = False
+        self._job = None
+        self._results: dict[tuple, _ClearResult] = {}
+        threading.Thread(target=self._run, args=(build,), daemon=True, name="snoo-clear").start()
+
+    def wait_ready(self, timeout: float | None = None) -> bool:
+        """モデルの読み込み（と compile の準備）が終わるまで待つ。失敗したら False。"""
+        self._ready.wait(timeout)
+        return self.estimator is not None
+
+    def fields(self, addr: tuple, frame: Frame) -> dict | None:
+        """このフレームの返事に載せる clear の欄。None なら載せない。"""
+        if not frame.moving or self.estimator is None:
+            return None
+        if frame.flags & REVERSING:
+            return dict(NO_CLEAR)
+        with self._lock:
+            r = self._results.get(addr)
+        # 古さは Pi の撮った時刻どうしで比べる（届くまでの揺れが入らない）。
+        # 負なら Pi が起動し直して時刻が戻った
+        if r is None or not 0 <= frame.t_capture_ns - r.t_capture_ns <= self.max_age_ns:
+            return dict(NO_CLEAR)
+        c = r.clearance
+        ok = c.clear_cm is not None and c.confidence >= self.min_conf
+        return {
+            "clear_cm": round(c.clear_cm, 1) if ok else None,
+            "clear_conf": round(c.confidence, 2),
+            "clear_seq": r.seq,
+            "clear_blind_cm": round(c.blind_cm, 1) if math.isfinite(c.blind_cm) else None,
+        }
+
+    def submit(self, addr: tuple, frame: Frame, image: np.ndarray, stages=None) -> bool:
+        """返事を送った後に呼ぶ。前のがまだ回っている・間が短ければ捨てて False。"""
+        if not frame.moving or frame.flags & REVERSING or self.estimator is None:
+            return False
+        now = time.monotonic_ns()
+        with self._lock:
+            if now - self._last_start_ns < self.interval_ns:
+                return False
+            if self._busy:
+                self.skipped += 1
+                return False
+            self._busy = True
+            self._last_start_ns = now
+            self._job = (addr, frame, image, stages)
+        self._wake.set()
+        return True
+
+    def report(self) -> str:
+        """前に呼んでからの回数（ログ用）。数えた値は消す。"""
+        with self._lock:
+            text = f"clear {self.computed} 回（回っていて飛ばした {self.skipped}）"
+            self.computed = self.skipped = 0
+        return text
+
+    def _run(self, build) -> None:
+        try:
+            self.estimator = build()
+            log.info("clear_cm を見積もる準備ができた")
+        except Exception:
+            log.exception("clear_cm を見積もる道具を作れないので、clear の欄は載せない")
+        finally:
+            self._ready.set()
+        if self.estimator is None:
+            return
+        failed = False
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                addr, frame, image, stages = self._job
+                self._job = None
+            t0 = time.perf_counter()
+            try:
+                c = self.estimator.estimate(image, frame.tilt_deg, frame.pan_deg, frame.steer_deg)
+                failed = False
+            except Exception:
+                if not failed:  # 続けて失敗しても 1 回だけ書く
+                    log.exception("clear_cm を見積もれない（null で返す）")
+                failed = True
+                c = None
+            if stages is not None:
+                stages.add("clear", (time.perf_counter() - t0) * 1000)
+            with self._lock:
+                if c is None:  # 前の値も使わない（null になる）
+                    self._results.pop(addr, None)
+                else:
+                    self._results[addr] = _ClearResult(frame.seq, frame.t_capture_ns, c)
+                self.computed += 1
+                self._busy = False
+
+
 def _latest_per_sender(sock: socket.socket, first: tuple[bytes, tuple]) -> dict[tuple, bytes]:
     """溜まっているデータグラムを読み切り、送り元ごとに最新の 1 つだけ残す（古いものは捨てる）。"""
     latest = {first[1]: first[0]}
@@ -404,6 +571,7 @@ def serve(
     allow: list | None = None,
     active_file: str = "",
     recorder: Recorder | None = None,
+    clearance: ClearanceWorker | None = None,
 ) -> None:
     sock = _bind(host, port)
     allow = allow or []
@@ -438,6 +606,7 @@ def serve(
             except FrameError as e:
                 log.warning("%s から: %s", addr, e)
                 continue
+            image = None
             try:
                 memory = memories.setdefault(addr, SnooMemory())
                 image = decode_jpeg(frame.jpeg)
@@ -448,9 +617,13 @@ def serve(
                 dets = []
                 stages.start()  # 読めなかった分は「送信」に入れない
             infer_ms = (time.perf_counter() - t0) * 1000
-            sock.sendto(encode_reply(frame, dets, infer_ms), addr)
+            # clear の欄は前に見積もった値を読むだけ（見積もりは返事の後）
+            clear = clearance.fields(addr, frame) if clearance is not None else None
+            sock.sendto(encode_reply(frame, dets, infer_ms, clear), addr)
             stages.mark("送信")
             times.append(infer_ms)
+            if clearance is not None and image is not None:
+                clearance.submit(addr, frame, image, stages)
             if recorder is not None:  # 返事の後に渡す（書き込みは別のスレッド）
                 recorder.offer(addr, frame, dets)
         now = time.monotonic()
@@ -460,13 +633,15 @@ def serve(
         if now - last_report >= 10:
             # 返事が無かった間も区間は消す（次の報告に古い値を混ぜない）
             summary = stages.summary()
+            clear = f"｜{clearance.report()}" if clearance is not None else ""
             if times:
                 log.info(
-                    "%.1f fps、受けてから返すまで 中央値 %.1f ms・最大 %.1f ms｜p50/p95 ms: %s",
+                    "%.1f fps、受けてから返すまで 中央値 %.1f ms・最大 %.1f ms｜p50/p95 ms: %s%s",
                     len(times) / (now - last_report),
                     statistics.median(times),
                     max(times),
                     summary,
+                    clear,
                 )
             times.clear()
             last_report = now
@@ -500,12 +675,31 @@ def main() -> None:
         default=RECORD_DIR,
         help="猫が写っている間のフレームを保存する所（環境変数 SNOO_RECORD_DIR）。空なら保存しない",
     )
+    parser.add_argument(
+        "--clearance",
+        action=argparse.BooleanOptionalAction,
+        default=CLEARANCE,
+        help="走っている間の前の空き（clear_cm）を見積もる（環境変数 SNOO_CLEARANCE、既定は 1）",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     gallery = args.gallery if os.path.exists(args.gallery) else None
     if gallery is None:
         log.warning("snoo の見本（%s）が無いので、snoo は null で返す", args.gallery)
     detector = CatDetector(args.model, args.cat_min, gallery, args.compile)
+    clearance = None
+    if args.clearance:
+        from app.clearance import CAM_HEIGHT_CM, TILT_GAIN, TILT_OFFSET_DEG, Estimator
+
+        log.info(
+            "clear_cm を見積もる（カメラの高さ %.1f cm、tilt = 指令 × %.2f %+.1f°）",
+            CAM_HEIGHT_CM,
+            TILT_GAIN,
+            TILT_OFFSET_DEG,
+        )
+        clearance = ClearanceWorker(lambda: Estimator(compile=args.compile))
+        # 検出の compile と同時に準備しないよう、終わるまで待ってから受け始める
+        clearance.wait_ready()
     serve(
         args.host,
         args.port,
@@ -513,6 +707,7 @@ def main() -> None:
         allow=parse_allow(args.allow),
         active_file=args.active_file,
         recorder=Recorder(args.record_dir) if args.record_dir else None,
+        clearance=clearance,
     )
 
 

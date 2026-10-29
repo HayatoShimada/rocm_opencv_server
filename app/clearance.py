@@ -1,4 +1,4 @@
-"""PiCar-X のカメラ画像から「進む先があと何 cm 空いているか」（clear_cm）を見積もる。試作。
+"""PiCar-X のカメラ画像から「進む先があと何 cm 空いているか」（clear_cm）を見積もる。
 
 超音波のセンサーが壊れていて、走っている間は前が見えない。スキャンで見えなかった細いケーブルや
 出てきた snoo に当たらないよう、走る間はカメラで前を見る。
@@ -16,7 +16,9 @@
   約 13 cm）。手前はスキャンや前のフレームで見えていたはず、という前提。曲がると帯はすぐ
   画面の横へ出るので、見えている端（clear_cm の上限）が近くなる。曲がるときは pan を曲がる
   向きに振るとよい。
-- tilt は TILT_GAIN・TILT_OFFSET_DEG で直す（指令 0° で実際は約 4.5° 下を向いていた）。
+- tilt は TILT_GAIN・TILT_OFFSET_DEG で直せる。Pi が 10/29 20:20 ごろに tilt の校正を直したので、
+  それより後のフレームは直さなくてよい（既定は直さない）。前のフレームは、指令 0° で
+  約 4.5° 下を向いていた。
 
 見積もりの方法（二つ試して比べた）
 (a) DepthClearance: 単眼の深度（Depth Anything V2 Small の相対版、Apache-2.0）。床の画素で視差を
@@ -31,21 +33,13 @@
 (b) 見落とし: 箱 5/8・脚 1/8、止まりすぎ: 実物 3（ソファの影）。
 二つの近い方（combine）は、見落とし 0、止まりすぎ 実物 3・脚 1・箱 1。走るときは combine を使う。
 
-検出の返事に clear を足す案（app/snoo.py はまだ触らない）
-- Pi は走っている間だけ、フレームのヘッダーに tilt・pan・舵（0.01° 単位）と「走っている」を載せる
-  （新しい magic "SNO2"。サーバーを先に両方読めるようにする）。走っていなければ clear は求めない。
-- 検出を遅くしない。返事を送った後（次のフレームが届くまでの 10 ms ほどの間）に、別のスレッドで
-  最新のフレームだけを処理する（前のがまだ終わっていなければ回さない。10〜20 Hz で足りる）。
-  返事には最後に出た値を、元にしたフレームの seq と一緒に載せる:
-  "clear": {"cm": 42.0, "conf": 0.8, "blind_cm": 13.0, "seq": 1234}。
-  150 ms より古い・まだ無い・見えない（blind_cm > MAX_BLIND_CM）ときは null。
-  知らない欄は Pi が読み飛ばすので、今の Pi はそのまま動く。
-- Pi は、残りの弧 + 止まるまでの余裕 > cm のとき止まる。走っている間に null か conf < 0.5 が
-  300 ms 続いたときも止まる（見えないまま走らない）。
+検出の返事への載せ方は app/snoo.py（ClearanceWorker）。走っている間だけ、検出の返事を送った後に
+別のスレッドで最新のフレームを Estimator にかけ、次の返事に載せる。
 """
 
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import cv2
@@ -54,14 +48,15 @@ import numpy as np
 # 横の画角（測った値）。縦は 640x480 の比から決まる（約 42°）
 HFOV_DEG = 54.0
 # カメラの床からの高さ（まだ測っていない。距離はこれに比例して変わる）
-CAM_HEIGHT_CM = float(os.getenv("SNOO_CAM_HEIGHT_CM", "10"))
+CAM_HEIGHT_CM = float(os.getenv("SNOO_CAMERA_HEIGHT_CM", "10"))
 # Pi の tilt の指令から、床に対する実際の向きを出す（実際 = 指令 × GAIN + OFFSET）。
-# tilt 0° で水平のはずだったが、地図のフレーム（VGGT の深度）から水平線を求めると、どの tilt でも
-# 40〜50 画素上にあった（= カメラが約 4.5° 下を向いている。車体が前に傾いているのかもしれない）。
-# 同じソファの脚が tilt 0° と -15° で同じ位置に来るのは、-15° が実際は -20.7° のとき（GAIN 1.08）。
-# 距離が大きく変わる（tilt 0° で 73 cm の脚が、直さないと 175 cm になる）ので、測り直すまでの仮の値
-TILT_GAIN = float(os.getenv("SNOO_TILT_GAIN", "1.08"))
-TILT_OFFSET_DEG = float(os.getenv("SNOO_TILT_OFFSET_DEG", "-4.5"))
+# 試作のときの地図のフレーム（VGGT の深度）では、水平線がどの tilt でも 40〜50 画素上にあった
+# （= カメラが約 4.5° 下を向いていた）。同じソファの脚が tilt 0° と -15° で同じ位置に来るのは、
+# -15° が実際は -20.7° のとき（GAIN 1.08、OFFSET -4.5）。Pi はこれを受けて 10/29 20:20 ごろに
+# tilt の校正を 26.5° から 22.0° に直したので、今のフレームは直さない（1.0 と 0.0）。
+# 直す前に撮った画像（data/snoo_map/map_20261029_192220 など）を試すときだけ、環境変数で戻す
+TILT_GAIN = float(os.getenv("SNOO_TILT_GAIN", "1.0"))
+TILT_OFFSET_DEG = float(os.getenv("SNOO_TILT_OFFSET_DEG", "0.0"))
 # これより先は見ない（40 cm の弧を走って止まるまでの分に余裕を足した長さ）
 MAX_CM = 100.0
 # 見えない手前がこれより長いときは、clear_cm を出さない（カメラが上を向きすぎている）
@@ -477,6 +472,10 @@ class DepthClearance:
     床から 10 cm の視点では奥行きを 2〜7 倍に見積もり、遠くの床を持ち上げてしまった。
     相対の版の視差を床の幾何に当てはめる方が、床がまっすぐ平らに出た。
     torch.compile（HIP グラフ）で 434x322 が 3.5 ms（compile なしは 8 ms）。
+
+    検出と GPU を分け合うので、GPU の仕事は自分の stream に流す。同じ（既定の）stream に流すと、
+    検出の仕事がこちらの仕事の後ろに並んで待たされる。compile したときの HIP グラフは、記録した
+    スレッドでしか使い回せないので、作るのも呼ぶのも同じスレッドで行う。
     """
 
     MODEL = os.getenv("SNOO_DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")
@@ -495,6 +494,7 @@ class DepthClearance:
         mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         self.mean = torch.tensor(mean, device=self.device, dtype=self.dtype).view(1, 3, 1, 1)
         self.std = torch.tensor(std, device=self.device, dtype=self.dtype).view(1, 3, 1, 1)
+        self.stream = torch.cuda.Stream() if self.device == "cuda" else None
         self.forward = self.model
         if compile and self.device == "cuda":
             self.forward = torch.compile(self.model, mode="reduce-overhead", dynamic=False)
@@ -504,15 +504,16 @@ class DepthClearance:
     def disparity(self, image: np.ndarray) -> np.ndarray:
         """BGR の画像の相対の視差（半分の大きさ。大きいほど近い）。"""
         torch = self.torch
-        x = torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).to(self.device)
-        x = x.permute(2, 0, 1).unsqueeze(0).to(self.dtype).div_(255)
-        w, h = self.size
-        x = torch.nn.functional.interpolate(x, size=(h, w), mode="bilinear", antialias=True)
-        with torch.inference_mode():
+        stream = torch.cuda.stream(self.stream) if self.stream is not None else nullcontext()
+        with stream, torch.inference_mode():
+            x = torch.from_numpy(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).to(self.device)
+            x = x.permute(2, 0, 1).unsqueeze(0).to(self.dtype).div_(255)
+            w, h = self.size
+            x = torch.nn.functional.interpolate(x, size=(h, w), mode="bilinear", antialias=True)
             d = self.forward(pixel_values=(x - self.mean) / self.std).predicted_depth
             # 点の計算は CPU でするので、半分にして渡す量と計算を減らす
             d = torch.nn.functional.avg_pool2d(d.unsqueeze(1).float(), 2)
-            return d[0, 0].cpu().numpy()
+            return d[0, 0].cpu().numpy()  # この stream が終わるまで待つ
 
     def estimate(
         self, image: np.ndarray, cam: Camera, steer_deg: float = 0.0, car: Car | None = None
@@ -534,3 +535,25 @@ def combine(depth: Clearance, floor: Clearance) -> Clearance:
         max(depth.blind_cm, floor.blind_cm),
         "both",
     )
+
+
+class Estimator:
+    """走っている間に使う見積もり。(a) と (b) の近い方（combine）。
+
+    Pi が送る tilt・pan（指令）と舵から、カメラの向きと通り道を決める。探索中の Pi は
+    曲がる向きに pan を振る（pan = 舵、±30° まで）ので、pan は必ずヘッダーの値を使う。
+    """
+
+    def __init__(self, compile: bool = False, height_cm: float = CAM_HEIGHT_CM):
+        self.height_cm = height_cm
+        self.depth = DepthClearance(compile=compile)
+        self.floor = FloorClearance()
+
+    def estimate(
+        self, image: np.ndarray, tilt_deg: float, pan_deg: float, steer_deg: float
+    ) -> Clearance:
+        h, w = image.shape[:2]
+        cam = Camera.from_pi(tilt_deg, pan_deg, height_cm=self.height_cm, width=w, height=h)
+        return combine(
+            self.depth.estimate(image, cam, steer_deg), self.floor.estimate(image, cam, steer_deg)
+        )

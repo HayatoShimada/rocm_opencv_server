@@ -69,10 +69,28 @@ def test_rays_have_unit_forward_component():
     assert (d @ cam.rotation())[2] == pytest.approx(1.0)
 
 
-def test_from_pi_applies_tilt_calibration():
+def test_from_pi_applies_tilt_calibration(monkeypatch):
     cam = Camera.from_pi(-15, 5)
     assert cam.tilt_deg == pytest.approx(-15 * TILT_GAIN + TILT_OFFSET_DEG)
     assert cam.pan_deg == 5
+    # Pi が校正を直す前に撮った画像は、環境変数で前の直し方に戻して見る
+    monkeypatch.setattr("app.clearance.TILT_GAIN", 1.08)
+    monkeypatch.setattr("app.clearance.TILT_OFFSET_DEG", -4.5)
+    assert Camera.from_pi(-15, 5).tilt_deg == pytest.approx(-15 * 1.08 - 4.5)
+
+
+def test_tilt_is_not_corrected_by_default(monkeypatch):
+    import importlib
+
+    import app.clearance
+
+    monkeypatch.delenv("SNOO_TILT_GAIN", raising=False)
+    monkeypatch.delenv("SNOO_TILT_OFFSET_DEG", raising=False)
+    module = importlib.reload(app.clearance)
+    try:  # Pi が 10/29 20:20 ごろに校正を直したので、今のフレームは直さない
+        assert (module.TILT_GAIN, module.TILT_OFFSET_DEG) == (1.0, 0.0)
+    finally:
+        importlib.reload(app.clearance)
 
 
 def test_straight_path_is_x_minus_front():
@@ -242,3 +260,22 @@ def test_combine_takes_the_nearer_and_keeps_null():
     assert (c.clear_cm, c.confidence, c.method) == (30.0, 0.8, "both")
     assert combine(Clearance(None, 0.0, 50.0, "depth"), b).clear_cm is None
     assert c.to_json() == {"cm": 30.0, "conf": 0.8, "blind_cm": 7.0}
+
+
+def test_estimator_uses_tilt_pan_and_steer_from_the_header():
+    from app.clearance import Estimator
+
+    seen = []
+
+    class _Depth:
+        def estimate(self, image, cam, steer_deg):
+            seen.append((cam.tilt_deg, cam.pan_deg, steer_deg, cam.height_cm, cam.width))
+            return Clearance(50.0, 0.9, 13.0, "depth")
+
+    est = Estimator.__new__(Estimator)  # 深度のモデルは読まない
+    est.height_cm, est.depth, est.floor = 8.0, _Depth(), FloorClearance()
+    cam = Camera(tilt_deg=-15, pan_deg=20)
+    r = est.estimate(_floor_image(cam, np.random.default_rng(3)), -15.0, 20.0, 20.0)
+    # 探索中の Pi は曲がる向きに pan を振る。通り道はヘッダーの pan で見る
+    assert seen == [(-15.0 * TILT_GAIN + TILT_OFFSET_DEG, 20.0, 20.0, 8.0, 640)]
+    assert r.method == "both"  # (a) と (b) の近い方
