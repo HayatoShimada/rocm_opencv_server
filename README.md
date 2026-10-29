@@ -255,6 +255,8 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 | 地図（app/snoo_map_server.py など）を直して試す | `make deploy-map` | 約 7 秒 |
 | 両方の様子を見る | `make status` | 0.1 秒 |
 | 保存したセッションの最後の 1 歩を GPU なしで決め直す | `make replay SESSION=explore_20261029_223944` | 1 秒 |
+| 作った 30 坪の家で、次の 1 歩の選び方を学ぶ（続きから） | `make train-explore`（`ARGS="--hours 4"`） | 上限まで（SIGTERM で書いて止まる） |
+| 学んだ選び方を、学んでいない家で今の決め方と比べる | `make eval-explore` | 48 軒 × 3 通りで約 1 分 |
 
 - **検出**: `compose.dev.yaml` が `./app` をコンテナに読み取り専用で重ねるので、app/ を直したら作り直さずに起動し直すだけで新しいコードで動く。`make deploy-detector` は、上書きの無いコンテナなら一度だけ作り直し（`docker compose -f compose.yaml -f compose.dev.yaml up -d snoo`）、あとは `restart` して「待ち受け」まで待ち、最初の p50/p95 の行を出す。起動に失敗したら Traceback を出してやめる。torch.compile の準備は torch-compile ボリュームのキャッシュが効く（検出 約 11 秒・clear_cm の深度 約 2.5 秒）。もっと速く試すときは `SNOO_CLEARANCE=0`（約 16 秒）・`SNOO_COMPILE=0`（clear も切って約 9 秒）を付けて `make deploy-detector`（作り直しになる）。pyproject.toml・uv.lock・Dockerfile を変えたときは `docker compose build snoo` が要る（`make deploy-detector` が知らせる）。本番の形（上書きなし）に戻すのは `docker compose up -d snoo`、その後に待つだけなら `.venv/bin/python -m scripts.snoo_dev wait-detector`
 - **地図**: systemd のユーザーのサービス（`deploy/snoo-map.service`）で動かす。落ちたら 3 秒後に起動し直し、ホストを起動し直しても動く。入れ方（sudo は要らない。手で起動したものを先に止める）:
