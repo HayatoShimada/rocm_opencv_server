@@ -959,11 +959,12 @@ class SlamService:
             for sd in sorted(p for p in self.queue.iterdir() if p.is_dir()):
                 seen = self.seen_queue.get(sd.name, self.t_min)
                 for k in read_queue(sd, seen):
-                    seen = max(seen, k.t_capture_ns)
                     # セッションが始まる前に届いたもの（Pi を起動し直す前の起動のフレームは、撮った
-                    # 時刻が新しいセッションより大きく見える）は使わない
+                    # 時刻が新しいセッションより大きく見える）は使わない。seen も進めない
+                    # （進めると、起動し直した後の小さな時刻のフレームを、ずっと読まなくなる）
                     if k.t_recv is not None and started is not None and k.t_recv < started - 5:
                         continue
+                    seen = max(seen, k.t_capture_ns)
                     n += self.ingest(k)
                 self.seen_queue[sd.name] = seen
         return n
