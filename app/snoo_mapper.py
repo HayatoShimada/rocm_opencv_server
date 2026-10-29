@@ -35,7 +35,10 @@ import numpy as np
 
 from app.roommap import (
     FREE,
+    MAX_SEGMENTS,
+    MIN_STEP_M,
     OCCUPIED,
+    REVERSE_MAX_M,
     UNKNOWN,
     Grid,
     Plan,
@@ -46,6 +49,8 @@ from app.roommap import (
     mark_sonar,
     next_best_view,
     random_step,
+    retrace,
+    turning_reverse,
 )
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
@@ -90,6 +95,9 @@ class MapParams:
     # 1 歩を「曲がる → まっすぐ」の区間（segments）で返す。Pi が meta の supports に
     # "segments" を書いたときだけ（古い Pi は 1 本の弧しか走れない）
     segments: bool = False
+    # 行き場が無いときに後ろへ下がってよい（Pi が supports に "reverse" を書いたとき。
+    # 下がり方は reverse_step で決める）
+    reverse: bool = False
     # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
     random_p: float = 0.15
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
@@ -668,6 +676,103 @@ def decide(
 
 def segments_json(pieces: list[tuple[float, float]]) -> list[dict]:
     return [{"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1)} for st, m in pieces]
+
+
+# --- 行き場が無いときに後ろへ下がる（地図のサーバーとシミュレーターで同じ決め方にする） ---
+
+# 行き場が無いときに来た道を戻るのは、続けてこの回数まで
+MAX_REVERSES = 2
+# 間に前へ走っても、直近 RECENT_STATIONS か所で戻るのはこの回数まで。戻る → 前へ → 戻るを
+# 繰り返して同じ所を回り続けないため（シミュレーターで周の多くを使った）
+MAX_RECENT_REVERSES = 3
+RECENT_STATIONS = 6
+# 後ろにはセンサーが無く、シミュレーターでは後ろに来た snoo に当たることがあった。
+# 当たっても弱くなるよう、前（12）より遅く戻る（約 14 cm/s）
+REVERSE_SPEED = 8
+# 直近 CLUSTER_STATIONS か所が、この半径に固まっていたら、でたらめな 1 歩で抜け出す
+CLUSTER_STATIONS = 4
+CLUSTER_RADIUS_M = 0.30
+
+
+# 1 回に VGGT に入れるステーションの数。48 コマを 6 か所で分けると 1 か所 8 コマ（下向きと
+# 正面の 2 段 × パン 4 つ）。これより多いと 1 か所のコマが少なすぎて向きと位置がぶれる
+WINDOW = 6
+
+
+def choose_window(
+    ids: list[int], latest: int, poses: dict[int, Pose], k: int = WINDOW
+) -> list[int]:
+    """VGGT に入れるステーション。最後のステーションと、位置が分かっている前のステーションのうち、
+    1 つ前の位置（今の車の近く）に近い k - 1 個。原点にする窓のいちばん古いステーションの位置が
+    分かっていないと座標を直せないので、位置の分からないステーションは入れない。
+    """
+    known = [i for i in ids if i < latest and i in poses]
+    if not known:
+        return [latest]
+    here = poses[max(known)]
+    near = sorted(known, key=lambda i: (math.hypot(poses[i].x - here.x, poses[i].y - here.y), -i))
+    return sorted(near[: k - 1]) + [latest]
+
+
+@dataclass
+class History:
+    """前のステーションまでの走り方。地図のサーバーは置き場（meta の prev_step・reverse.json）
+    から、シミュレーターは覚えたものから作る。
+    """
+
+    # 前へ走った道（走った順の区間 (ハンドル°, m)）。来た道を戻るのに使う
+    trail: list[tuple[float, float]] = field(default_factory=list)
+    backs: int = 0  # 続けて後ろへ戻った回数
+    recent_reverses: int = 0  # 直近 RECENT_STATIONS か所のうち、後ろへ戻って着いた数
+
+
+def clustered(recent: list[Pose]) -> bool:
+    """直近のステーション（CLUSTER_STATIONS か所）が狭い所に固まっているか。"""
+    if len(recent) < CLUSTER_STATIONS:
+        return False
+    cx = sum(p.x for p in recent) / len(recent)
+    cy = sum(p.y for p in recent) / len(recent)
+    return all(math.hypot(p.x - cx, p.y - cy) <= CLUSTER_RADIUS_M for p in recent)
+
+
+def retrace_step(history: History, segments: bool) -> list[tuple[float, float]]:
+    """来た道を戻る区間（戻る順）。続けて戻りすぎていれば・戻れる長さが無ければ空。
+
+    前にしか走らないと、壁に向いて止まったときに回れずに終わる（1 回目の実走の 4 か所目。
+    シミュレーターでも角で 74 % で止まり、30 cm 下がると 95 % まで調べられた）。
+    segments を受けない Pi には、最後に走った区間の 1 本だけを返す。
+    """
+    if history.backs >= MAX_REVERSES or history.recent_reverses >= MAX_RECENT_REVERSES:
+        return []
+    pieces = retrace(history.trail, REVERSE_MAX_M, MAX_SEGMENTS if segments else 1)
+    return pieces if sum(m for _, m in pieces) >= MIN_STEP_M else []
+
+
+def reverse_step(
+    grid: Grid, pose: Pose, history: History, segments: bool
+) -> list[tuple[float, float]]:
+    """前へ行ける所が無い（unreachable）ときに後ろへ下がる区間。下がれなければ空。
+
+    まず切り返し（曲がりながら下がって向きを変える）、だめなら来た道を戻る。
+    後ろは見ていないので 30 cm 下がれなければ、見ていない所に入る 15 cm だけ下がる。
+    """
+    pieces: list[tuple[float, float]] = []
+    if history.recent_reverses < MAX_RECENT_REVERSES:
+        pieces = turning_reverse(grid, pose) or turning_reverse(grid, pose, length=0.15)
+    return pieces or retrace_step(history, segments)
+
+
+def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
+    action = {
+        "action": "move",
+        "reverse": True,
+        "steer_deg": round(pieces[0][0], 1) + 0.0,
+        "speed": REVERSE_SPEED,
+        "distance_cm": round(pieces[0][1] * 100, 1),
+    }
+    if segments:
+        action["segments"] = segments_json(pieces)
+    return action
 
 
 # --- 書き出し ---

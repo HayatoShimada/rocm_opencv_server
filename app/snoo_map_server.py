@@ -62,36 +62,42 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+from app import snoo_mapper
 from app.roommap import (
     FIT_TOL_M,
-    MAX_SEGMENTS,
-    MIN_STEP_M,
-    REVERSE_MAX_M,
     Pose,
     camera_of,
     consume,
     drive_poses,
     fit_driven,
-    retrace,
     take,
-    turning_reverse,
 )
 from app.snoo import _allowed, parse_allow
-from app.snoo_mapper import (
+from app.snoo_mapper import (  # noqa: F401  WINDOW・REVERSE_SPEED などはここからも使う
+    CLUSTER_STATIONS,
     MAX_FRAMES,
+    MAX_RECENT_REVERSES,
+    MAX_REVERSES,
     MAX_STATIONS,
+    RECENT_STATIONS,
+    REVERSE_SPEED,
+    WINDOW,
     FrameRef,
+    History,
     MapParams,
     Station,
     build_map,
+    choose_window,
     frame_colors,
     load_station,
     load_vggt_model,
     pose_dict,
     registration_is_bad,
+    retrace_step,
+    reverse_action,
+    reverse_step,
     run_vggt,
     save_vggt,
-    segments_json,
     select_frames,
     unproject,
     write_outputs,
@@ -119,22 +125,10 @@ MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGES = 64
 # これより電池の電圧が低ければ探るのをやめる（2 セルのリチウムイオンで、走ると電圧が落ちる）
 LOW_BATTERY_V = 6.8
-# 1 回に VGGT に入れるステーションの数。48 コマを 6 か所で分けると 1 か所 8 コマ（下向きと
-# 正面の 2 段 × パン 4 つ）。これより多いと 1 か所のコマが少なすぎて向きと位置がぶれる
-WINDOW = 6
 # 床からレンズの中心まで。2026-10-29 に SD カードの長い辺（32 mm）2.5 枚分と測った
 DEFAULT_CAMERA_HEIGHT_CM = 8.0
 # 超音波がこれより短く読んだら測れなかったとする（PiCar-X の超音波は 2 cm から）
 MIN_ULTRASONIC_CM = 2.0
-# 行き場が無いときに来た道を戻るのは、続けてこの回数まで
-MAX_REVERSES = 2
-# 間に前へ走っても、直近 RECENT_STATIONS か所で戻るのはこの回数まで。戻る → 前へ → 戻るを
-# 繰り返して同じ所を回り続けないため（シミュレーターで周の多くを使った）
-MAX_RECENT_REVERSES = 3
-RECENT_STATIONS = 6
-# 後ろにはセンサーが無く、シミュレーターでは後ろに来た snoo に当たることがあった。
-# 当たっても弱くなるよう、前（12）より遅く戻る（約 14 cm/s）
-REVERSE_SPEED = 8
 # Pi の speed 1 あたりの速さ（cm/s）。1 回目の実走の VGGT の位置から測った（speed 12 で約 20 cm/s）
 PI_CM_PER_S_PER_SPEED = 1.7
 
@@ -345,21 +339,6 @@ def to_session(anchor: Pose, p: Pose) -> Pose:
     )
 
 
-def choose_window(
-    ids: list[int], latest: int, poses: dict[int, Pose], k: int = WINDOW
-) -> list[int]:
-    """VGGT に入れるステーション。最後のステーションと、位置が分かっている前のステーションのうち、
-    1 つ前の位置（今の車の近く）に近い k - 1 個。原点にする窓のいちばん古いステーションの位置が
-    分かっていないと座標を直せないので、位置の分からないステーションは入れない。
-    """
-    known = [i for i in ids if i < latest and i in poses]
-    if not known:
-        return [latest]
-    here = poses[max(known)]
-    near = sorted(known, key=lambda i: (math.hypot(poses[i].x - here.x, poses[i].y - here.y), -i))
-    return sorted(near[: k - 1]) + [latest]
-
-
 # --- VGGT ---
 
 
@@ -414,19 +393,10 @@ class VggtReconstruct:
 # --- 1 ステーションを処理する ---
 
 
-# 直近 CLUSTER_STATIONS か所が、この半径に固まっていたら、でたらめな 1 歩で抜け出す
-CLUSTER_STATIONS = 4
-CLUSTER_RADIUS_M = 0.30
-
-
 def clustered(poses: dict[int, Pose], station_id: int) -> bool:
-    """直近のステーションが狭い所に固まっているか（同じ所を回り続けている）。"""
+    """station_id の直前 CLUSTER_STATIONS か所が狭い所に固まっているか（snoo_mapper.clustered）。"""
     recent = [poses[i] for i in range(station_id - CLUSTER_STATIONS, station_id) if i in poses]
-    if len(recent) < CLUSTER_STATIONS:
-        return False
-    cx = sum(p.x for p in recent) / len(recent)
-    cy = sum(p.y for p in recent) / len(recent)
-    return all(math.hypot(p.x - cx, p.y - cy) <= CLUSTER_RADIUS_M for p in recent)
+    return snoo_mapper.clustered(recent)
 
 
 def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
@@ -442,6 +412,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         ultrasonic_cm=[ultrasonic_cm(d) for d in dirs],
         segments="segments" in can,
         force_random=clustered(poses, station_id),
+        reverse="reverse" in can,
         seed=station_id,
     )
     refs = select_frames(stations, MAX_FRAMES)
@@ -462,16 +433,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
 
     raw = r.action
     action = dict(raw)
-    if action == {"action": "done", "reason": "unreachable"} and "reverse" in can:
-        pieces = []
-        if recent_reverses(session, station_id) < MAX_RECENT_REVERSES:
-            # まず切り返し（曲がりながら下がって向きを変える）、だめなら来た道を戻る
-            # 後ろは見ていないので 30 cm 下がれなければ、見ていない所に入る 15 cm だけ下がる
-            pieces = turning_reverse(r.grid, r.stations[-1].pose) or turning_reverse(
-                r.grid, r.stations[-1].pose, length=0.15
-            )
-        if not pieces:
-            pieces = backtrack(session, station_id, poses, "segments" in can)
+    if action == {"action": "done", "reason": "unreachable"} and params.reverse:
+        pieces = reverse_step(
+            r.grid, r.stations[-1].pose, history(session, station_id, poses), params.segments
+        )
         if pieces:
             action = reverse_action(pieces, "segments" in can)
             # 戻る弧を上から見た絵に描き、戻った先を target にする
@@ -583,21 +548,19 @@ def driven_trail(
     return trail, backs
 
 
+def history(session: Path, station_id: int, poses: dict[int, Pose]) -> History:
+    """station_id までの走り方（来た道・続けて戻った回数・直近で戻った回数）。"""
+    trail, backs = driven_trail(session, station_id, poses)
+    return History(trail, backs, recent_reverses(session, station_id))
+
+
 def backtrack(
     session: Path, station_id: int, poses: dict[int, Pose], segments: bool
 ) -> list[tuple[float, float]]:
-    """前へ行ける所が無いときに、来た道を戻る区間（戻る順）。戻れなければ空。
-
-    前にしか走らないと、壁に向いて止まったときに回れずに終わる（1 回目の実走の 4 か所目。
-    シミュレーターでも角で 74 % で止まり、30 cm 下がると 95 % まで調べられた）。
-    続けて戻るのは MAX_REVERSES 回まで（それでも行き場が無ければやめる）。
-    segments を受けない Pi には、最後に走った区間の 1 本だけを返す。
+    """前へ行ける所が無いときに、来た道を戻る区間（戻る順）。戻れなければ空
+    （app.snoo_mapper.retrace_step）。
     """
-    trail, backs = driven_trail(session, station_id, poses)
-    if backs >= MAX_REVERSES or recent_reverses(session, station_id) >= MAX_RECENT_REVERSES:
-        return []
-    pieces = retrace(trail, REVERSE_MAX_M, MAX_SEGMENTS if segments else 1)
-    return pieces if sum(m for _, m in pieces) >= MIN_STEP_M else []
+    return retrace_step(history(session, station_id, poses), segments)
 
 
 def recent_reverses(session: Path, station_id: int) -> int:
@@ -611,19 +574,6 @@ def recent_reverses(session: Path, station_id: int) -> int:
                 reverse = prev.get("reverse")
                 count += bool(reverse) if reverse is not None else (i - 1) in sent
     return count
-
-
-def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
-    action = {
-        "action": "move",
-        "reverse": True,
-        "steer_deg": round(pieces[0][0], 1) + 0.0,
-        "speed": REVERSE_SPEED,
-        "distance_cm": round(pieces[0][1] * 100, 1),
-    }
-    if segments:
-        action["segments"] = segments_json(pieces)
-    return action
 
 
 def read_reverses(session: Path) -> dict[int, dict]:
