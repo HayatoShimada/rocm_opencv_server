@@ -36,13 +36,17 @@ VGGT は 48 コマで 9 秒ほどかかる（RX 7900 XTX）。実データ（23 
 その近くのステーション（合わせて WINDOW 個）だけにする。そのときの間取りの原点は窓のいちばん
 古いステーションになるので、前に求めたそのステーションの位置を足して、返す位置をセッションの
 座標（最初のステーションが原点）に直す。
-窓の外のステーションは間取りに入らない（room.json・topdown.png は窓の中だけ）。
+最後のステーションで見たもの（床・障害物・上の層のセルと超音波）は、セッションの座標にして
+<station>/obs.npz に 1 回だけ残し、次の 1 歩は全部のステーションの分を足した間取りで決める
+（窓の外で見た所も忘れない）。room.json・topdown.png もセッションの座標で書く
+（window.origin_pose は (0, 0, 0)、VGGT の窓の原点は window.vggt_origin_pose）。
 
 認証が無いので、SNOO_MAP_ALLOW に書いた送り元（Pi の LAN と tailscale の IP）以外には 403 を返す
 （app/snoo.py の検出サーバーと同じやり方）。GPU は猫の検出（Docker の snoo）と分け合うので、
 VGGT は 1 つずつ回す（同時に来たものは順に待たせる）。
 """
 
+import dataclasses
 import json
 import logging
 import math
@@ -85,9 +89,11 @@ from app.snoo_mapper import (  # noqa: F401  WINDOW・REVERSE_SPEED などはこ
     FrameRef,
     History,
     MapParams,
+    Observation,
     Station,
     build_map,
     choose_window,
+    decide,
     frame_colors,
     load_station,
     load_vggt_model,
@@ -99,8 +105,11 @@ from app.snoo_mapper import (  # noqa: F401  WINDOW・REVERSE_SPEED などはこ
     run_vggt,
     save_vggt,
     select_frames,
+    session_grid,
+    to_frame,
     unproject,
     write_outputs,
+    xy_to_frame,
 )
 
 HOST = os.getenv("SNOO_MAP_HOST", "0.0.0.0")
@@ -330,13 +339,20 @@ def write_poses(session: Path, poses: dict[int, Pose]) -> None:
 
 def to_session(anchor: Pose, p: Pose) -> Pose:
     """窓の座標（原点は窓のいちばん古いステーション）の位置を、セッションの座標に直す。"""
-    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
-    yaw = anchor.yaw + p.yaw
-    return Pose(
-        anchor.x + c * p.x - s * p.y,
-        anchor.y + s * p.x + c * p.y,
-        math.atan2(math.sin(yaw), math.cos(yaw)),
-    )
+    return to_frame(anchor, p)
+
+
+def obs_path(session: Path, station_id: int) -> Path:
+    return station_dir(session, station_id) / "obs.npz"
+
+
+def read_observations(session: Path, upto: int) -> list[Observation]:
+    """upto までのステーションで見たもの（置き場の obs.npz）。無いステーションは飛ばす。"""
+    out = []
+    for i in station_ids(session):
+        if i <= upto and obs_path(session, i).is_file():
+            out.append(Observation.load(obs_path(session, i)))
+    return out
 
 
 # --- VGGT ---
@@ -400,7 +416,13 @@ def clustered(poses: dict[int, Pose], station_id: int) -> bool:
 
 
 def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
-    """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。"""
+    """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。
+
+    VGGT は窓（WINDOW か所）だけに通し、最後のステーションの位置と見たものをセッションの座標に
+    直して置き場に残す（obs.npz）。次の 1 歩は、全部のステーションの見たものを足した
+    セッションの間取り（session_grid）で決める。窓の外で見た所も覚えているので、見た所へ
+    戻らない。room.json などもセッションの座標で書く。
+    """
     ids = station_ids(session)
     poses = read_poses(session)
     window = choose_window(ids, station_id, poses)
@@ -419,40 +441,53 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     rec = reconstruct(refs, session / "vggt.npz", marks)
 
     t = time.perf_counter()
-    r = build_map(stations, refs, rec.extrinsic, rec.points, rec.conf, params, rec.colors)
-    marks["map"] = time.perf_counter() - t
-
-    t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)
     anchor = poses.get(window[0], Pose(0.0, 0.0, 0.0))
-    for i, s, h in zip(window, r.stations, params.camera_height_m, strict=True):
+    r = build_map(
+        stations, refs, rec.extrinsic, rec.points, rec.conf, params, rec.colors,
+        anchor=anchor, plan=False,
+    )  # fmt: skip
+    for i, s, h, o in zip(window, r.stations, params.camera_height_m, r.observations, strict=True):
         # 一度求めた位置は変えない（変えると、それを原点にした後の窓と座標がずれる）
         if i not in poses and s.frames and not registration_is_bad(s, h):
             poses[i] = to_session(anchor, s.pose)
+        # 見たものも 1 回だけ残す（ふつうは最後のステーション。前の版で受けたステーションも）
+        if i in poses and o is not None and not obs_path(session, i).is_file():
+            o.save(obs_path(session, i))
     write_poses(session, poses)
 
+    # 窓の結果をセッションの座標に直し、セッションの間取りで次の 1 歩を決める
+    r.stations = [dataclasses.replace(s, pose=to_session(anchor, s.pose)) for s in r.stations]
+    r.points = xy_to_frame(anchor, r.points) if len(r.points) else r.points
+    if r.floor.inliers:
+        r.grid, r.high = session_grid(read_observations(session, station_id))
+        r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
+        r.step_path = []
+        if r.plan is not None:
+            pieces = r.plan.segments or [(r.plan.steer_deg, r.plan.step_m)]
+            r.step_path = [camera_of(p) for _, p in drive_poses(r.stations[-1].pose, pieces)]
+    marks["map"] = time.perf_counter() - t
+
+    t = time.perf_counter()
     raw = r.action
     action = dict(raw)
     if action == {"action": "done", "reason": "unreachable"} and params.reverse:
-        pieces = reverse_step(
-            r.grid, r.stations[-1].pose, history(session, station_id, poses), params.segments
-        )
+        pose = r.stations[-1].pose
+        pieces = reverse_step(r.grid, pose, history(session, station_id, poses), params.segments)
         if pieces:
-            action = reverse_action(pieces, "segments" in can)
+            action = reverse_action(pieces, params.segments)
             # 戻る弧を上から見た絵に描き、戻った先を target にする
-            r.step_path = [
-                camera_of(p) for _, p in drive_poses(r.stations[-1].pose, pieces, reverse=True)
-            ]
-            action["target"] = pose_dict(to_session(anchor, r.step_path[-1]))
+            r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
+            action["target"] = pose_dict(r.step_path[-1])
             remember_reverse(session, station_id, action)
             r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
     if action["action"] == "move":
         here = poses.get(station_id)
         if here is None:  # 位置合わせが崩れていれば decide が done にするので、ふつうは来ない
-            here = to_session(anchor, r.stations[-1].pose)
+            here = r.stations[-1].pose
         action["pose"] = pose_dict(here)
         if not action.get("reverse") and r.plan is not None:  # でたらめな 1 歩には目標が無い
-            action["target"] = pose_dict(to_session(anchor, r.plan.target))
+            action["target"] = pose_dict(r.plan.target)
         action["station_index"] = ids.index(station_id)
         action["map_url"] = f"/v1/snoo/map/{session.name}/topdown.png"
     else:
@@ -601,7 +636,14 @@ def write_results(
     tmp = session / ".out"
     shutil.rmtree(tmp, ignore_errors=True)
     write_outputs(r, tmp)
-    info = {"stations": window, "origin_pose": pose_dict(anchor)}
+    # 間取り・ステーション・目標はセッションの座標（原点 (0, 0, 0)）で書く。
+    # vggt_origin_pose は VGGT の窓の原点（vggt.npz の座標）
+    info = {
+        "stations": window,
+        "origin_pose": pose_dict(Pose(0.0, 0.0, 0.0)),
+        "vggt_origin_pose": pose_dict(anchor),
+        "map": "session",
+    }
     room = json.loads((tmp / "room.json").read_text())
     room["window"] = info
     (tmp / "room.json").write_text(json.dumps(room, ensure_ascii=False, indent=1))

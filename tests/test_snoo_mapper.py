@@ -238,3 +238,29 @@ def test_decide_stops_on_step_limit_and_bad_registration(result):
     bad = [StationResult("x", Pose(0, 0, 0), CAM_H, 0.3, 8)]
     a, _ = decide(g, bad, MapParams(), [CAM_H])
     assert a["action"] == "done" and a["reason"].startswith("bad_registration")
+
+
+def test_observations_add_up_to_the_same_grid_and_move_with_the_anchor(tmp_path):
+    """ステーションごとに見たもの（セッションの座標）を足すと、窓で作った格子と同じになる。
+    窓の原点が (1, 2, 90°) なら、見たものも同じだけずれて回る。
+    """
+    from app.snoo_mapper import Observation, session_grid
+
+    stations, refs, ext, points, conf = _scene()
+    params = MapParams(camera_height_m=CAM_H, ultrasonic_cm=[80.0, None])
+    r = build_map(stations, refs, ext, points, conf, params, anchor=Pose(0, 0, 0), plan=False)
+    assert r.action == {} and r.plan is None
+    grid, _ = session_grid(r.observations)
+    assert (grid.state() == r.grid.state()).all()
+    assert r.observations[0].sonar_m == pytest.approx(0.8)
+    r.observations[1].save(tmp_path / "obs.npz")
+    back = Observation.load(tmp_path / "obs.npz")
+    assert back.pose == pytest.approx(r.observations[1].pose) and back.sonar_m is None
+    assert np.allclose(back.free, r.observations[1].free)
+
+    moved = build_map(
+        stations, refs, ext, points, conf, params, anchor=Pose(1.0, 2.0, math.pi / 2), plan=False
+    )
+    o, p = moved.observations[1], r.observations[1]
+    assert (o.pose.x, o.pose.y) == pytest.approx((1.0 - p.pose.y, 2.0 + p.pose.x), abs=1e-6)
+    assert len(o.free) == pytest.approx(len(p.free), rel=0.05)  # 回してもセルが抜けない

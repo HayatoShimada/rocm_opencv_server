@@ -462,6 +462,76 @@ class StationResult:
 
 
 @dataclass
+class Observation:
+    """1 ステーションで見たもの。セッションの座標（最初のステーションが原点）の格子のセルの中心
+    (K, 2)。地図のサーバーはステーションごとに 1 回だけ（そのステーションが最後のとき）作って
+    置き場に残し、全部のステーションの分を足してセッションの間取りにする（session_grid）。
+    窓（WINDOW か所）だけで間取りを作ると、窓の外で見た所を忘れて、そこへまた行こうとする。
+    """
+
+    free: np.ndarray
+    occupied: np.ndarray
+    high: np.ndarray
+    pose: Pose  # ステーションの位置（セッションの座標）
+    sonar_m: float | None = None
+
+    def save(self, path: Path) -> None:
+        p = self.pose
+        np.savez(
+            path,
+            free=self.free.astype(np.float32),
+            occupied=self.occupied.astype(np.float32),
+            high=self.high.astype(np.float32),
+            pose=np.array([p.x, p.y, p.yaw]),
+            sonar_m=np.array(np.nan if self.sonar_m is None else self.sonar_m),
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> Observation:
+        d = np.load(path)
+        sonar = float(d["sonar_m"])
+        return cls(
+            d["free"], d["occupied"], d["high"], Pose(*map(float, d["pose"])),
+            None if math.isnan(sonar) else sonar,
+        )  # fmt: skip
+
+
+def session_grid(observations: list[Observation]) -> tuple[Grid, np.ndarray]:
+    """ステーションごとに見たものを順に足した格子と「上」の層（build_map と同じ足し方）。"""
+    grid = Grid()
+    high = np.zeros_like(grid.logodds, np.int32)
+    for o in observations:
+        grid.mark_free(o.free[:, 0], o.free[:, 1])
+        grid.mark_occupied(o.occupied[:, 0], o.occupied[:, 1])
+        hix, hiy = grid.cell(o.high[:, 0], o.high[:, 1])
+        ok = grid.inside(hix, hiy)
+        high[hix[ok], hiy[ok]] += 1
+        if o.sonar_m is not None:
+            mark_sonar(grid, o.pose, o.sonar_m)
+    return grid, high
+
+
+def to_frame(anchor: Pose, p: Pose) -> Pose:
+    """anchor を原点にした座標の位置を、anchor のある座標に直す（窓 → セッション）。"""
+    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
+    yaw = anchor.yaw + p.yaw
+    return Pose(
+        anchor.x + c * p.x - s * p.y,
+        anchor.y + s * p.x + c * p.y,
+        math.atan2(math.sin(yaw), math.cos(yaw)),
+    )
+
+
+def xy_to_frame(anchor: Pose, xy: np.ndarray) -> np.ndarray:
+    """点 (N, 2 以上) の x・y を to_frame と同じに直す（3 列目からはそのまま）。"""
+    c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
+    out = np.array(xy, dtype=np.float64, copy=True)
+    out[:, 0] = anchor.x + c * xy[:, 0] - s * xy[:, 1]
+    out[:, 1] = anchor.y + s * xy[:, 0] + c * xy[:, 1]
+    return out.astype(np.asarray(xy).dtype)
+
+
+@dataclass
 class MapResult:
     grid: Grid
     high: np.ndarray  # (n, n) の int。「上」の層の点が見つかった回数
@@ -476,6 +546,9 @@ class MapResult:
     colors: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.uint8))
     # 次の 1 歩で車（カメラの真下）が通る所。上から見た絵に描く（後ろへ戻るときはサーバーが入れる）
     step_path: list[Pose] = field(default_factory=list)
+    # build_map に anchor を渡したときの、ステーションごとに見たもの（セッションの座標）。
+    # 位置合わせが崩れたステーションは None
+    observations: list[Observation | None] = field(default_factory=list)
 
 
 def _cells_with(grid: Grid, x: np.ndarray, y: np.ndarray, min_count: int):
@@ -497,9 +570,14 @@ def build_map(
     conf: np.ndarray,
     params: MapParams | None = None,
     colors: np.ndarray | None = None,
+    anchor: Pose | None = None,
+    plan: bool = True,
 ) -> MapResult:
     """VGGT の点（コマごと、(F, ..., 3)）から床・座標・ステーションの位置・格子を作り、
-    次の 1 歩を決める。
+    次の 1 歩を決める（plan が False なら決めない。地図のサーバーはセッションの間取りで決める）。
+    anchor（最初のステーションのセッションの座標での位置）を渡すと、ステーションごとに見たものを
+    セッションの座標の格子のセルにして observations に入れる（点を直してからセルにする。
+    セルの中心を回すと、セルの抜けや重なりができる）。
     GPU は使わない（VGGT の出力を差し替えて試せるよう、ここは numpy だけ）。
     """
     params = params or MapParams()
@@ -531,6 +609,7 @@ def build_map(
     high = np.zeros_like(grid.logodds, np.int32)
     top = params.car_height_m + params.obstacle_margin_m
     results: list[StationResult] = []
+    observations: list[Observation | None] = []
     keep_pts, keep_cols = [], []
     rng = np.random.default_rng(0)
     for s, st in enumerate(stations):
@@ -548,6 +627,7 @@ def build_map(
             len(idx),
         )
         results.append(res)
+        observations.append(None)
         if registration_is_bad(res, heights[s]):
             continue  # 位置の合っていない点は地図に入れない（decide で止める）
         p = world.apply(pts[idx][good[idx]])
@@ -564,8 +644,17 @@ def build_map(
         hx, hy = _cells_with(grid, p[is_high, 0], p[is_high, 1], MIN_POINTS_PER_CELL)
         hix, hiy = grid.cell(hx, hy)
         high[hix, hiy] += 1
+        sonar = None
         if params.ultrasonic_cm is not None and params.ultrasonic_cm[s] is not None:
-            mark_sonar(grid, pose, params.ultrasonic_cm[s] / 100)
+            sonar = params.ultrasonic_cm[s] / 100
+            mark_sonar(grid, pose, sonar)
+        if anchor is not None:
+            q = xy_to_frame(anchor, p)
+            cells = []
+            for sel in (is_floor, is_obst, is_high):
+                cx, cy = _cells_with(grid, q[sel, 0], q[sel, 1], MIN_POINTS_PER_CELL)
+                cells.append(np.stack([cx, cy], 1).reshape(-1, 2))
+            observations[-1] = Observation(*cells, to_frame(anchor, pose), sonar)
         res.floor_points, res.obstacle_points = int(is_floor.sum()), int(is_obst.sum())
         res.high_points = int(is_high.sum())
         if cols is not None:
@@ -573,10 +662,10 @@ def build_map(
             keep_pts.append(p[sel])
             keep_cols.append(cols[idx][good[idx]][near][sel])
 
-    action, plan = decide(grid, results, params, heights)
+    action, nbv = decide(grid, results, params, heights) if plan else ({}, None)
     step_path = []
-    if plan is not None:
-        pieces = plan.segments or [(plan.steer_deg, plan.step_m)]
+    if nbv is not None:
+        pieces = nbv.segments or [(nbv.steer_deg, nbv.step_m)]
         step_path = [camera_of(p) for _, p in drive_poses(results[-1].pose, pieces)]
     return MapResult(
         grid,
@@ -585,11 +674,12 @@ def build_map(
         floor,
         world,
         action,
-        plan,
+        nbv,
         params,
         np.concatenate(keep_pts) if keep_pts else np.zeros((0, 3), np.float32),
         np.concatenate(keep_cols) if keep_cols else np.zeros((0, 3), np.uint8),
         step_path,
+        observations,
     )
 
 

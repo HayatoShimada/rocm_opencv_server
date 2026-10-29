@@ -132,6 +132,11 @@ def test_two_stations_return_the_next_step(tmp_path):
     room = c.get("/v1/snoo/map/explore_20261029_201500/room.json").json()
     assert [s["name"] for s in room["stations"]] == ["000", "001"]
     assert room["window"]["stations"] == [0, 1]
+    # 間取りはセッションの座標で、全部のステーションの見たもの（obs.npz）を足したもの
+    assert room["window"]["map"] == "session"
+    assert room["window"]["origin_pose"] == {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}
+    session = tmp_path / "explore_20261029_201500"
+    assert (session / "000" / "obs.npz").is_file() and (session / "001" / "obs.npz").is_file()
     plan = c.get("/v1/snoo/map/explore_20261029_201500/plan.json").json()
     assert plan["action"] == "move" and "total" not in plan["timing_s"]
     assert "vggt" in plan["timing_s"]
@@ -323,14 +328,10 @@ def stuck(monkeypatch):
     """間取りは作るが、前へ行ける所が無い（unreachable）ことにする。"""
     import app.snoo_map_server as server
 
-    real = server.build_map
+    def decide(*a, **kw):
+        return {"action": "done", "reason": "unreachable"}, None
 
-    def build(*a, **kw):
-        r = real(*a, **kw)
-        r.action, r.plan, r.step_path = {"action": "done", "reason": "unreachable"}, None, []
-        return r
-
-    monkeypatch.setattr(server, "build_map", build)
+    monkeypatch.setattr(server, "decide", decide)
 
 
 # 作り物の部屋の 1 か所目 (0, 0, 0°) から 2 か所目 (0.3, 0.1, 20°) へは、ハンドル -8.9° の
