@@ -75,6 +75,10 @@ services:
       # （ホストのプロセス）が /twin で見せる。/run/snoo は下のボリュームでホストと分け合う。
       # 空にすれば書かない
       SNOO_LIVE_DIR: "${SNOO_LIVE_DIR-/run/snoo/live}"
+      # 走っている間のフレームを 4 枚/秒ほど SLAM（ホストの app/snoo_slam.py、deploy/snoo-slam.service）に
+      # 渡す（app/snoo_slam_tap.py）。送り元ごとに新しい 300 枚だけ残す。空にすれば書かない
+      SNOO_SLAM_TAP_DIR: "${SNOO_SLAM_TAP_DIR-/run/snoo/slam}"
+      SNOO_SLAM_TAP_HZ: "${SNOO_SLAM_TAP_HZ:-4}"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
       TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
     # snoo の見本（scripts/snoo_gallery.py で作る）と、

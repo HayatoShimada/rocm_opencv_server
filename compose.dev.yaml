@@ -24,3 +24,5 @@ services:
       # 速く試したいときは、環境変数を付けて up -d（restart では環境変数は変わらない）:
       #   SNOO_CLEARANCE=0 … clear_cm を見積もらない（約 16 秒）
       #   SNOO_COMPILE=0   … torch.compile しない（clear も切って約 9 秒。検出は 1 枚 6 ms ほどに遅くなる）
+      #   SNOO_SLAM_TAP_DIR= … 走っている間のフレームを SLAM に渡さない（空にする）
+      #   SNOO_SLAM_TAP_HZ=5 … SLAM に渡す枚数/秒を変える（既定 4）

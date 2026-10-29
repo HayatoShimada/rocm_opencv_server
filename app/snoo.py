@@ -21,6 +21,8 @@ LAN 宛ては 3.7 ms）。そのときは 0.0.0.0 で受け、認証の無い UD
 --record-dir を渡すと、猫が写っている間のフレームを学習用に保存する（app/snoo_record.py）。
 --live-dir を渡すと、送り元ごとに最新のフレームと返事を 1 秒に 1 回ほど書く（app/snoo_live.py。
 地図のサーバーの /twin で見る）。
+--slam-tap-dir を渡すと、走っている間のフレームを 4 枚/秒ほど SLAM に渡す（app/snoo_slam_tap.py。
+ホストの app/snoo_slam.py が読む）。
 
 走っている間（SNO2 で flags に MOVING）は、前があと何 cm 空いているか（clear_cm、
 app/clearance.py）も返事の一番上の段に載せる。超音波のセンサーが壊れていて、走っている間は
@@ -51,6 +53,7 @@ import numpy as np
 
 from app.snoo_live import LIVE_DIR, LiveWriter
 from app.snoo_record import RECORD_DIR, Recorder
+from app.snoo_slam_tap import SLAM_TAP_DIR, SlamTap
 
 HEADER = struct.Struct("<4sIQHH")
 MAGIC = b"SNO1"
@@ -607,6 +610,7 @@ def serve(
     recorder: Recorder | None = None,
     clearance: ClearanceWorker | None = None,
     live: LiveWriter | None = None,
+    slam_tap: SlamTap | None = None,
 ) -> None:
     sock = _bind(host, port)
     allow = allow or []
@@ -663,6 +667,8 @@ def serve(
                 recorder.offer(addr, frame, dets)
             if live is not None:  # これも返事の後。書くのは 1 秒に 1 回ほど、別のスレッドで
                 live.offer(addr, frame, dets, infer_ms, clear)
+            if slam_tap is not None:  # これも返事の後。走っている間だけ、別のスレッドで書く
+                slam_tap.offer(addr, frame, dets)
         now = time.monotonic()
         if active_file and times and now - last_touch >= 1.0:
             _touch(active_file)
@@ -718,6 +724,11 @@ def main() -> None:
         help="最新のフレームと返事を 1 秒に 1 回ほど書く所（環境変数 SNOO_LIVE_DIR）。空は書かない",
     )
     parser.add_argument(
+        "--slam-tap-dir",
+        default=SLAM_TAP_DIR,
+        help="走っている間のフレームを SLAM に渡す所（環境変数 SNOO_SLAM_TAP_DIR）。空は書かない",
+    )
+    parser.add_argument(
         "--clearance",
         action=argparse.BooleanOptionalAction,
         default=CLEARANCE,
@@ -751,6 +762,7 @@ def main() -> None:
         recorder=Recorder(args.record_dir) if args.record_dir else None,
         clearance=clearance,
         live=LiveWriter(args.live_dir) if args.live_dir else None,
+        slam_tap=SlamTap(args.slam_tap_dir) if args.slam_tap_dir else None,
     )
 
 
