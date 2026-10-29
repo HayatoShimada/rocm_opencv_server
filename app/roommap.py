@@ -35,6 +35,9 @@ WHEELBASE_M = 0.14
 CAR_REAR_M = -0.05
 CAR_FRONT_M = 0.21
 CAM_X_M = 0.16
+# 車の幅と高さ（見積もり。測っていない）。app/clearance.py・app/snoo_twin.py もここの値を使う
+CAR_WIDTH_M = 0.19
+CAR_HEIGHT_M = 0.12
 # 前の超音波（バンパーの真ん中）。±15° の円すいで、3 m まで測れる
 SONAR_HALF_DEG = 15.0
 SONAR_RANGE_M = 3.0

@@ -45,6 +45,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from app import roommap
+
 # 横の画角（測った値）。縦は 640x480 の比から決まる（約 42°）
 HFOV_DEG = 54.0
 # カメラの床からの高さ（まだ測っていない。距離はこれに比例して変わる）
@@ -136,14 +138,20 @@ def floor_row(cam: Camera, x_cm: float, y_cm: float = 0.0) -> float:
 
 @dataclass(frozen=True)
 class Car:
-    """PiCar-X の寸法（cm）。前後の位置はまだ測っていない。"""
+    """PiCar-X の寸法（cm）。値は app/roommap.py にまとめてある（前後の位置はまだ測っていない）。
 
-    width_cm: float = 19.0
-    height_cm: float = 12.0
+    前はここだけ後ろの車軸まで 12 cm・ホイールベース 12 cm で、計画の弧（16 cm・14 cm）より
+    通り道の帯の曲がりが 15 % ほどきつかった（コードレビュー）。
+    """
+
+    width_cm: float = roommap.CAR_WIDTH_M * 100
+    height_cm: float = roommap.CAR_HEIGHT_M * 100
     margin_cm: float = 2.0  # 両脇に足す余裕
-    cam_to_front_cm: float = 5.0  # カメラの真下から前の端まで
-    cam_to_rear_axle_cm: float = 12.0  # カメラの真下から後ろの車軸まで（曲がるときの中心の位置）
-    wheelbase_cm: float = 12.0  # 前と後ろの車軸の間
+    # カメラの真下から前の端まで
+    cam_to_front_cm: float = (roommap.CAR_FRONT_M - roommap.CAM_X_M) * 100
+    # カメラの真下から後ろの車軸まで（曲がるときの中心の位置）
+    cam_to_rear_axle_cm: float = roommap.CAM_X_M * 100
+    wheelbase_cm: float = roommap.WHEELBASE_M * 100  # 前と後ろの車軸の間
 
 
 @dataclass(frozen=True)
