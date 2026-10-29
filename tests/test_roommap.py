@@ -81,3 +81,26 @@ def test_next_best_view_heads_toward_the_unseen_side_without_leaving_the_floor()
 def test_next_best_view_is_none_when_everything_is_seen():
     g = _room(seen_until_x=3.0)
     assert next_best_view(g, Pose(0, 0, 0)) is None
+
+
+def test_first_step_runs_a_useful_distance_toward_the_path():
+    g = _room()
+    plan = next_best_view(g, Pose(0, 0, 0))
+    # 数 cm で止まらず、経路の先へまとめて進む
+    assert plan.step_m >= min(0.2, plan.length_m)
+    # 左（+y）に曲がる経路ならハンドルは左（−）、右なら右（+）
+    if plan.target.y > 0.1:
+        assert plan.steer_deg < 0
+    elif plan.target.y < -0.1:
+        assert plan.steer_deg > 0
+
+
+def test_first_step_goes_straight_for_a_straight_path():
+    g = _room()
+    path = sample_path(Pose(0, 0, 0), "S", (1.0,), r=1.0)
+    from app.roommap import first_step
+
+    blocked = g.state() != FREE
+    steer, step = first_step(g, blocked, Pose(0, 0, 0), path, 1.0)
+    assert steer == pytest.approx(0, abs=0.5)
+    assert step == pytest.approx(0.4)

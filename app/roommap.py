@@ -33,6 +33,8 @@ VIEW_RANGE_M = 2.0
 DISTANCE_SCALE_M = 1.5
 # 1 回に走る長さの上限
 MAX_STEP_M = 0.40
+# 1 歩の向きは、経路のこの距離だけ先の点を目指して決める（pure pursuit）
+LOOKAHEAD_M = 0.30
 # 1 回の観測で足す log-odds。障害物は強く、床は弱く数える（同じセルに両方あれば障害物になる。
 # 見落とした障害物にぶつかるほうが、床を走れないことにするより悪い）
 OCCUPIED_HIT = 2.0
@@ -285,21 +287,49 @@ def next_best_view(grid: Grid, pose: Pose, candidates_max: int = 400, rng=None) 
         path = sample_path(pose, kind, segs)
         if not path_is_clear(grid, blocked, path):
             continue
+        steer, step = first_step(grid, blocked, pose, path, length)
+        if step <= 0:
+            continue
         best_utility = utility
-        steer, step = first_step(kind, segs, length)
         best = Plan(target, gain, length, path, steer, step)
     return best
 
 
-def first_step(kind: str, segs: tuple, length: float) -> tuple[float, float]:
-    """経路の最初の区間を、ハンドル角（右が +、度）と走る長さ（m、MAX_STEP_M まで）にする。"""
-    c, seg = kind[0], segs[0]
-    if c == "S" or seg * TURN_RADIUS_M < 0.02:  # 最初の曲がりがごく短ければ次の区間から
-        c, seg = kind[1], segs[1]
-    if c == "S":
-        steer = 0.0
-        run = seg * TURN_RADIUS_M
+def first_step(
+    grid: Grid, blocked: np.ndarray, pose: Pose, path: list[Pose], length: float
+) -> tuple[float, float]:
+    """経路の LOOKAHEAD_M 先の点を目指す 1 本の弧を、ハンドル角（右が +、度）と走る長さ（m）にする。
+
+    Pi は 1 歩をハンドル角 1 つで走るので、Dubins 経路の区間をそのまま渡すと、
+    最初の曲がりが数 cm しかないときに数 cm 走っては撮り直すことになる。そこで経路の少し先の点へ
+    向かう弧（pure pursuit）で MAX_STEP_M までまとめて進む。弧は経路から少し外れるので、
+    ぶつからない所までに縮める（5 cm も進めなければ 0 を返し、この候補は使わない）。
+    """
+    goal_at = min(LOOKAHEAD_M, length)
+    travelled, aim = 0.0, path[-1]
+    for a, b in zip(path, path[1:], strict=False):
+        travelled += math.hypot(b.x - a.x, b.y - a.y)
+        if travelled >= goal_at:
+            aim = b
+            break
+    dx, dy = aim.x - pose.x, aim.y - pose.y
+    ahead = math.cos(pose.yaw) * dx + math.sin(pose.yaw) * dy
+    left = -math.sin(pose.yaw) * dx + math.cos(pose.yaw) * dy
+    curvature = 2 * left / max(ahead * ahead + left * left, 1e-9)  # 左が +
+    curvature = max(-1 / TURN_RADIUS_M, min(1 / TURN_RADIUS_M, curvature))
+    run = min(MAX_STEP_M, length)
+    if abs(curvature) < 1e-3:
+        arc = sample_path(pose, "S", (run,), r=1.0)
     else:
-        steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M)) * (-1 if c == "L" else 1)
-        run = seg * TURN_RADIUS_M
-    return steer, min(MAX_STEP_M, run, length)
+        radius = 1 / abs(curvature)
+        arc = sample_path(pose, "L" if curvature > 0 else "R", (run / radius,), r=radius)
+    clear = 0.0
+    for a, b in zip(arc, arc[1:], strict=False):
+        ix, iy = grid.cell(b.x, b.y)
+        if not grid.inside(ix, iy) or blocked[ix, iy]:
+            break
+        clear += math.hypot(b.x - a.x, b.y - a.y)
+    if clear < 0.05:
+        return 0.0, 0.0
+    steer = -math.degrees(math.atan(WHEELBASE_M * curvature))
+    return steer, min(run, clear)
