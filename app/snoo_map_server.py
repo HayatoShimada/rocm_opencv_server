@@ -17,6 +17,9 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
   - supports に "reverse" があれば、前へ行ける所が無い（unreachable）とき、来た道を戻る
     {"action": "move", "reverse": true, steer_deg, speed, distance_cm（30 cm まで）, [segments]}
     を返す（続けて 2 回まで）
+  - supports に "long_step"（と "segments"）があれば、まっすぐの区間が地図で床と分かっている
+    ときは、1 歩を 60 cm まで延ばす（40 cm を超えるのは、最後のまっすぐの区間だけ）。
+    Pi は今までどおり超音波・clear_cm・動かないときに止まる
   - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
 - GET /twin：車と部屋をブラウザで見る画面（app/snoo_twin.py）。地図・ステーション・次の 1 歩・
@@ -69,6 +72,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import snoo_mapper
 from app.roommap import (
     FIT_TOL_M,
+    LONG_STEP_M,
+    MAX_STEP_M,
     Pose,
     camera_of,
     consume,
@@ -446,6 +451,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         segments="segments" in can,
         force_random=clustered(poses, station_id),
         reverse="reverse" in can,
+        max_step_m=LONG_STEP_M if {"long_step", "segments"} <= can else MAX_STEP_M,
         seed=station_id,
     )
     refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)

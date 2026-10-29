@@ -371,3 +371,20 @@ def test_mark_driven_makes_the_floor_under_the_car_free_but_keeps_obstacles():
     g = Grid(size_m=4.0)
     mark_driven(g, Pose(0, 0, 0), [(0.0, 0.20)], reverse=True)
     assert g.state()[g.cell(-0.16 + CAR_REAR_M - 0.15, 0.0)] == FREE
+
+
+def test_long_step_only_on_a_straight_segment_over_seen_floor():
+    from app.roommap import LONG_STEP_M
+
+    g, blocked = _open_floor()
+    pieces = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(1.5, 0, 0), LONG_STEP_M)
+    assert pieces == [(0.0, pytest.approx(LONG_STEP_M))]
+    # 曲がるだけで終わる 1 歩は 40 cm まで
+    turn = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(0.1, -0.5, math.pi), LONG_STEP_M)
+    assert sum(m for _, m in turn) <= MAX_STEP_M + 1e-9
+    # 床が見えている所までしか延ばさない（45 cm 先から見ていない。車の真ん中はカメラの 8 cm 後ろ）
+    g, blocked = _open_floor()
+    g.logodds[g.cell(0.45, 0.0)[0] :, :] = 0
+    blocked = g.state() != FREE
+    short = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(1.5, 0, 0), LONG_STEP_M)
+    assert MAX_STEP_M <= sum(m for _, m in short) < LONG_STEP_M

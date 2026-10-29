@@ -49,6 +49,9 @@ VIEW_RANGE_M = 2.0
 DISTANCE_SCALE_M = 1.5
 # 1 回に走る長さの上限
 MAX_STEP_M = 0.40
+# Pi が long_step を受けるときの上限。40 cm を超える分は、まっすぐの区間で、地図で床と
+# 分かっている所だけ（turn_then_straight）。3 回目の実走は 15 か所が 47 x 65 cm に収まった
+LONG_STEP_M = 0.60
 # でたらめな 1 歩の長さの下限
 MIN_RANDOM_STEP_M = 0.20
 # 1 歩の向きは、経路のこの距離だけ先の点を目指して決める（pure pursuit）
@@ -396,12 +399,18 @@ def random_step(grid: Grid, pose: Pose, rng, tries: int = 40) -> tuple[float, fl
 
 
 def next_best_view(
-    grid: Grid, pose: Pose, candidates_max: int = 400, rng=None, segments: bool = False
+    grid: Grid,
+    pose: Pose,
+    candidates_max: int = 400,
+    rng=None,
+    segments: bool = False,
+    max_step_m: float = MAX_STEP_M,
 ) -> Plan | None:
     """次に撮りに行く位置と、そこへの最初の 1 歩。行ける所に見るものが無ければ None。
 
-    segments なら、1 歩を「曲がる → まっすぐ」の区間に分ける（turn_then_straight）。
-    分けられない候補（Dubins 経路が曲がる・曲がる・曲がるの形など）は、今までの 1 本の弧にする。
+    segments なら、1 歩を「曲がる → まっすぐ」の区間に分ける（turn_then_straight。
+    合わせて max_step_m まで）。分けられない候補（Dubins 経路が曲がる・曲がる・曲がるの形など）は、
+    今までの 1 本の弧にする（MAX_STEP_M まで）。
     """
     rng = rng or np.random.default_rng(0)
     state = grid.state()
@@ -450,7 +459,7 @@ def next_best_view(
         path = sample_path(pose, kind, segs)
         if not path_is_clear(grid, blocked, path):
             continue
-        pieces = turn_then_straight(grid, blocked, pose, target) if segments else []
+        pieces = turn_then_straight(grid, blocked, pose, target, max_step_m) if segments else []
         if pieces:
             steer, step = pieces[0]
         else:
@@ -623,6 +632,8 @@ def turn_then_straight(
     そのまま使う。曲がりの長さは、直線が次の位置のほうを向くまでの分だけになる。
     最後の曲がりは使わない（次のステーションで撮って決め直す）。直線の無い形（RLR・LRL）は
     分けられないので空を返す。区間は自転車モデルで走らせて blocked に当て、ぶつかる手前までにする。
+    MAX_STEP_M を超えて走るのは、超えた分がまっすぐの区間のときだけ（Pi の clear_cm は、
+    ハンドルが小さいときだけ通り道を測れる）。
     """
     route = dubins(rear_axle(pose), rear_axle(target))
     if route is None or route[1][1] != "S":
@@ -636,6 +647,10 @@ def turn_then_straight(
     total = sum(m for _, m in pieces)
     if total <= 0:
         return []
+    if max_m > MAX_STEP_M and pieces[-1][0] != 0.0:
+        max_m = MAX_STEP_M
+    if max_m > MAX_STEP_M and len(pieces) > 1 and pieces[0][1] > MAX_STEP_M:
+        max_m = MAX_STEP_M
     pieces = take(pieces, min(max_m, total))
     return clip_pieces(grid, blocked, pose, pieces)
 

@@ -36,6 +36,7 @@ import numpy as np
 from app.roommap import (
     FREE,
     MAX_SEGMENTS,
+    MAX_STEP_M,
     MIN_STEP_M,
     OCCUPIED,
     REVERSE_MAX_M,
@@ -101,6 +102,9 @@ class MapParams:
     # 走ってきた道（車の外形の下）を床にする（roommap.mark_driven。地図のサーバーと
     # シミュレーターが間取りに足す）
     driven_free: bool = True
+    # 1 歩の長さの上限。Pi が supports に "long_step"（と "segments"）を書いたときは
+    # roommap.LONG_STEP_M（60 cm）まで。超えた分はまっすぐの区間だけ
+    max_step_m: float = MAX_STEP_M
     # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
     random_p: float = 0.15
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
@@ -747,7 +751,7 @@ def decide(
     rng = np.random.default_rng(params.seed)
     plan = None
     if not params.force_random and rng.random() >= params.random_p:
-        plan = next_best_view(grid, pose, segments=params.segments)
+        plan = next_best_view(grid, pose, segments=params.segments, max_step_m=params.max_step_m)
     if plan is None:
         # 行き詰まった・同じ所に固まった・ときどき：でたらめな 1 歩
         step = random_step(grid, pose, rng)
