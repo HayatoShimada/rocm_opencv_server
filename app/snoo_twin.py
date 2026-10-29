@@ -181,6 +181,38 @@ def step_path(reply: dict) -> dict | None:
     return {"start": pose_dict(start), "end": pose_dict(here), "reverse": reverse, "segments": out}
 
 
+# SLAM の道筋を画面に送るとき、これより多ければ間引く
+SLAM_TRAIL_MAX = 600
+
+
+def slam_state(session: Path) -> dict | None:
+    """走りながらの SLAM（app/snoo_slam.py が slam/ に書く）の状態・今の位置・道筋。"""
+    d = session / "slam"
+    status = _read_json(d / "status.json")
+    if not isinstance(status, dict):
+        return None
+    trail = []
+    try:
+        for line in (d / "trajectory.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            trail.append([round(row["x"], 3), round(row["y"], 3)])
+    except (OSError, ValueError, KeyError, TypeError):
+        trail = []
+    if len(trail) > SLAM_TRAIL_MAX:
+        step = len(trail) / SLAM_TRAIL_MAX
+        trail = [trail[int(k * step)] for k in range(SLAM_TRAIL_MAX)] + [trail[-1]]
+    pose = status.get("pose") if isinstance(status.get("pose"), dict) else None
+    return {
+        "state": status.get("state"),
+        "pose": pose,
+        "age_s": status.get("last_keyframe_age_s"),
+        "rmse_m": (status.get("alignment") or {}).get("rmse_m"),
+        "keyframes": status.get("keyframes"),
+        "loops": status.get("loop_closures"),
+        "trail": trail,
+    }
+
+
 def session_state(session: Path) -> dict:
     ids = station_ids(session)
     poses = read_poses(session)
@@ -241,6 +273,7 @@ def session_state(session: Path) -> dict:
         "timing_s": plan.get("timing_s"),
         "reverses": {str(k): v for k, v in read_reverses(session).items()},
         "car": CAR,
+        "slam": slam_state(session),
     }
 
 
@@ -313,6 +346,23 @@ def add_twin(app: FastAPI, root: Path, live_dir: Path | None) -> None:
             raise HTTPException(404, "無い")
         p = _inside(live_dir / f"{name}.jpg", live_dir)
         return FileResponse(p, media_type="image/jpeg", headers=NO_STORE)
+
+    @app.get("/v1/snoo/map/{session_id}/slam/pose")
+    def slam_pose(session_id: str):
+        """走りながらの SLAM の今の位置（Pi が次の 1 歩の出発点に使えるように。#20）。"""
+        sl = slam_state(_session(session_id))
+        if sl is None or not sl.get("pose"):
+            raise HTTPException(404, "SLAM の位置がまだ無い")
+        p = sl["pose"]
+        return JSONResponse(
+            {
+                "state": sl["state"], "age_s": sl["age_s"], "rmse_m": sl["rmse_m"],
+                "t_capture_ns": p.get("t_capture_ns"), "x": p.get("x"), "y": p.get("y"),
+                "yaw_deg": None if p.get("yaw") is None else round(math.degrees(p["yaw"]), 2),
+                "segment": p.get("segment"),
+            },
+            headers=NO_STORE,
+        )  # fmt: skip
 
     @app.get("/twin/api/{session_id}/state")
     def twin_state(session_id: str):

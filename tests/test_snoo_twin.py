@@ -293,3 +293,47 @@ def test_live_frames_when_turned_off(root):
     c = _client(root, None)
     assert c.get("/twin/api/live").json() == {"enabled": False, "senders": []}
     assert c.get("/twin/api/live/192.168.0.188.jpg").status_code == 404
+
+
+def test_slam_state_reads_status_pose_and_a_thinned_trail(tmp_path):
+    from app import snoo_twin
+
+    session = tmp_path / "explore_20261030_010000"
+    (session / "slam").mkdir(parents=True)
+    assert snoo_twin.slam_state(session) is None  # SLAM がまだ書いていない
+    (session / "slam" / "status.json").write_text(
+        json.dumps(
+            {
+                "state": "ok",
+                "pose": {"t_capture_ns": 5, "x": 0.4, "y": -0.1, "yaw": 0.3, "segment": 0},
+                "last_keyframe_age_s": 0.8,
+                "alignment": {"rmse_m": 0.03},
+                "keyframes": 900,
+                "loop_closures": 3,
+            }
+        )
+    )
+    rows = [{"x": k * 0.001, "y": 0.0} for k in range(900)]
+    (session / "slam" / "trajectory.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    s = snoo_twin.slam_state(session)
+    assert s["state"] == "ok" and s["pose"]["x"] == 0.4 and s["rmse_m"] == 0.03
+    assert len(s["trail"]) <= snoo_twin.SLAM_TRAIL_MAX + 1 and s["trail"][-1] == [0.899, 0.0]
+
+
+def test_slam_pose_endpoint(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app.snoo import parse_allow
+    from app.snoo_map_server import create_app
+
+    session = tmp_path / "explore_20261030_010000"
+    (session / "slam").mkdir(parents=True)
+    app = create_app(tmp_path, parse_allow("127.0.0.1"), lambda *a: None)
+    c = TestClient(app, client=("127.0.0.1", 5000))
+    assert c.get("/v1/snoo/map/explore_20261030_010000/slam/pose").status_code == 404
+    (session / "slam" / "status.json").write_text(
+        json.dumps({"state": "ok", "pose": {"x": 0.4, "y": -0.1, "yaw": math.pi / 2}})
+    )
+    r = c.get("/v1/snoo/map/explore_20261030_010000/slam/pose").json()
+    assert r["state"] == "ok" and r["x"] == 0.4 and r["yaw_deg"] == 90.0
+    assert c.get("/v1/snoo/map/..%2Fetc/slam/pose").status_code in (400, 404)

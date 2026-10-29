@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 const COLORS = {
   free: [201, 209, 217], occ: [229, 83, 75], high: [83, 155, 245], front: [242, 184, 75],
   unk: [29, 34, 40], st: "#b392f0", fwd: "#3fb950", rev: "#f0883e", nbv: "#e3e7eb",
-  cam: "57,197,207", sonar: "247,120,186", car: "#3fb950",
+  cam: "57,197,207", sonar: "247,120,186", car: "#3fb950", slam: "#58a6ff",
 };
 // 今のフレームがこれより古ければ、車は止まっている（検出サーバーに届いていない）とする
 const LIVE_STALE_S = 5;
@@ -18,7 +18,7 @@ const S = {
   state: null, stateKey: "", gridVer: null, grid: null,
   live: null, sender: null, liveSeq: null,
   view: { cx: 0, cy: 0, scale: 100, auto: true },
-  layers: { frontier: true, high: true, fov: true, sonar: true, plan: true, step: true },
+  layers: { frontier: true, high: true, fov: true, sonar: true, plan: true, step: true, slam: true },
   thumbStation: null, thumbAuto: true, lastOk: 0,
 };
 
@@ -346,6 +346,23 @@ function drawMap() {
     ctx.fillText(String(s.id), u - 14, v - 7);
   }
 
+  // 走りながらの SLAM の道筋と今の位置（見失っている間は点線）
+  const sl = st.slam;
+  if (S.layers.slam && sl && sl.trail && sl.trail.length > 1) {
+    ctx.strokeStyle = COLORS.slam; ctx.lineWidth = 1.5;
+    if (sl.state !== "ok") ctx.setLineDash([4, 4]);
+    ctx.beginPath(); sl.trail.forEach((q, k) => (k ? ctx.lineTo(...P(q)) : ctx.moveTo(...P(q)))); ctx.stroke();
+    ctx.setLineDash([]);
+    if (sl.pose && sl.pose.x != null) {
+      const yaw = sl.pose.yaw != null ? sl.pose.yaw : 0;
+      const u = X(sl.pose.x), v = Y(sl.pose.y);
+      arrow(ctx, u, v, X(sl.pose.x + 0.14 * Math.cos(yaw)), Y(sl.pose.y + 0.14 * Math.sin(yaw)), COLORS.slam, 2);
+      ctx.fillStyle = COLORS.slam; ctx.beginPath(); ctx.arc(u, v, 4, 0, 7); ctx.fill();
+      ctx.font = "11px ui-monospace, monospace";
+      ctx.fillText(`SLAM ${sl.state || ""}`, u + 7, v - 7);
+    }
+  }
+
   // 次の 1 歩（区間ごと。前へは緑、後ろへは橙）と、走り終えたときの車
   if (S.layers.step && st.step) {
     const col = st.step.reverse ? COLORS.rev : COLORS.fwd;
@@ -557,6 +574,11 @@ function renderPanel() {
     ["窓", st.window ? (st.window.stations || []).join(", ") : "—"],
     ["境目のセル", S.grid ? `${S.grid.frontierCount}` : "—"],
     ["Pi ができること", (last.supports || []).join(", ") || "—"],
+    // 走りながらの SLAM：状態・座標合わせのずれ・最後のキーフレームの古さ
+    st.slam
+      ? ["SLAM", `${st.slam.state || "—"}・ずれ ${fmt(st.slam.rmse_m != null ? st.slam.rmse_m * 100 : null, 1, " cm")}・${fmt(st.slam.age_s, 1, " 秒前")}`,
+         st.slam.state === "ok" ? "good" : "warn"]
+      : ["SLAM", "—"],
   ]);
 
   const t = st.timing_s || {};
