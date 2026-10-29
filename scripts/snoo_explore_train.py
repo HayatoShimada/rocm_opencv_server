@@ -8,8 +8,12 @@
   （HIP_VISIBLE_DEVICES=""。GPU を使うプロセスが 2 つ以上あると、何もしなくても 120 W ほど食う）
 - 学ぶ（learner）：この親のプロセスだけが GPU（--device cuda、ROCm）で重みを直す。
   始める前に、ほかに GPU を使っているプロセスが無いか見る（あれば待って、ログに書く）
-- はじめの --bc-iters 回は、今の決め方（でたらめ抜き）を軽くまねる（行動の複製）。まねすぎると
-  選び方がほぼ決まってしまい（エントロピー 0.12）、PPO で試す幅が無くなった。そのあと PPO
+- PPO だけで学ぶ（既定）。はじめの選び方はほぼ一様で、それでも確かめの家で decide と同じくらい
+  分かる（でたらめな 1 歩が行き詰まりから抜けるのに効く）。--bc-iters で、今の決め方の
+  でたらめ抜き（heuristic）をまねてから始められるが、heuristic は decide より 2 m² 少なく、
+  まねると選び方がほぼ決まって（エントロピー 0.2）PPO で試す幅が無くなった
+- 1 歩の良し悪しは数周先までにしか効かないので、割引は短め（γ 0.95・λ 0.8）。長くすると
+  家ごとの広さの違いに埋もれて、選び方がほとんど動かなかった
 - 報酬：新しく分かった床（m²）− 時間 − ぶつかった数（人と snoo は重く。app/snoo_explore_rollout.py）
 - 止め方：SIGTERM・SIGINT を受けたら、チェックポイントを書いてから終わる（scripts/snoo_phase.sh が
   ロボットの時間に入るとき送る。120 秒以内に終わる）。次に動かすと、最後のチェックポイント
@@ -300,15 +304,15 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument("--episodes", type=int, default=72, help="1 回に回す家の数")
     parser.add_argument("--budget-s", type=float, default=1200.0, help="1 回の探索（実機の秒）")
-    parser.add_argument("--bc-iters", type=int, default=1)
-    parser.add_argument("--bc-epochs", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--bc-iters", type=int, default=0)
+    parser.add_argument("--bc-epochs", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--minibatch", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--clip", type=float, default=0.2)
-    parser.add_argument("--ent", type=float, default=0.02)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lam", type=float, default=0.95)
+    parser.add_argument("--ent", type=float, default=0.005)
+    parser.add_argument("--gamma", type=float, default=0.95)
+    parser.add_argument("--lam", type=float, default=0.8)
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--eval-homes", type=int, default=36)
     parser.add_argument("--device", default="cuda")

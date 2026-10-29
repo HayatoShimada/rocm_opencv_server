@@ -78,6 +78,7 @@ FEATURES = (
     "clustered",
     "recent_spread",
     "n_candidates",
+    "last_move",  # 前のステーションからの距離（同じ所で止まり続けているか）
 )
 N_FEATURES = len(FEATURES)
 HIDDEN = 64
@@ -196,6 +197,7 @@ def featurize(
         float(clustered_now),
         min(spread, 2.0),
         len(cands) / K_MAX,
+        min(float(np.hypot(*(recent[-1] - recent[-2]))), 1.0) / 0.4 if len(recent) > 1 else 1.0,
     ]
     rows = []
     half = int(round(0.5 / grid.res))
