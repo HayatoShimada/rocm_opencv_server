@@ -164,6 +164,16 @@ class KeyFrame:
 # --- 入るもの ---
 
 
+def _read_rows(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
 def read_queue(sender_dir: Path, after_ns: int = -1) -> list[KeyFrame]:
     """app/snoo_slam_tap.py が書いたもののうち、撮った時刻が after_ns より後のもの（撮った順）。"""
     out = []
@@ -849,8 +859,11 @@ class SlamService:
         self.frames_dir = self.out / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         old = self.out / "frames.jsonl"
-        if old.exists():  # 起動し直したとき。前の欄は退ける（frames/ の画像はそのまま使う）
-            old.replace(self.out / f"frames.{int(time.time())}.old.jsonl")
+        before = []
+        if old.exists():  # 起動し直したとき。前の欄は退け、そのコマを読み直す（下の _reload）
+            moved = self.out / f"frames.{int(time.time())}.old.jsonl"
+            old.replace(moved)
+            before = _read_rows(moved)
         self.slam = None
         self.kfs: dict[str, KeyFrame] = {}
         self.pending: list[KeyFrame] = []
@@ -868,6 +881,34 @@ class SlamService:
         self.alignment: Alignment | None = None
         self.last_info: dict = {}
         self.state = "init"
+        self._reload(before)
+
+    def _reload(self, rows: list[dict]) -> None:
+        """使わないので終えて起動し直したとき、同じセッションでそれまでに使ったコマ（frames/ に
+        写してある）を、もう一度入れる。タップは新しい 300 枚しか残さないので、入れ直さないと
+        それまでの点を失う（コードレビュー）。回し直すので GPU は使う。
+        """
+        n = 0
+        for row in rows:
+            try:
+                k = KeyFrame(
+                    int(row["t_capture_ns"]), self.frames_dir / row["file"],
+                    float(row.get("pan_deg") or 0), float(row.get("tilt_deg") or 0),
+                    float(row.get("steer_deg") or 0), float(row.get("speed") or 0),
+                    bool(row.get("moving")), row.get("station"), row.get("source") or "tap",
+                    [], row.get("t_recv"), row["file"],
+                )  # fmt: skip
+            except (KeyError, TypeError, ValueError):
+                continue
+            if k.file in self.kfs or not k.image.exists():
+                continue
+            self.kfs[k.file] = k
+            self.pending.append(k)
+            with (self.out / "frames.jsonl").open("a") as f:
+                f.write(json.dumps({**k.row(), "t_recv": k.t_recv}) + "\n")
+            n += 1
+        if n:
+            log.info("前に使った %d コマを読み直した", n)
 
     def ingest(self, k: KeyFrame) -> bool:
         name = f"{k.t_capture_ns:020d}.jpg"
