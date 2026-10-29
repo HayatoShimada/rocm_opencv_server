@@ -55,6 +55,7 @@ from app.roommap import (
     Pose,
     arc,
     consume,
+    mark_driven,
     mark_sonar,
 )
 from app.snoo_mapper import (
@@ -842,6 +843,8 @@ class Sim:
         # 撮り終えるごとの (Sim.t, 本当の床のうち床と分かった m²)
         self.timeline: list[tuple[float, float]] = []
         self._truth: np.ndarray | None = None
+        # 走った 1 歩ごとの (走り出したカメラの真下, 走った区間, 後ろへか)。地図に足す
+        self.drives: list[tuple[Pose, list[tuple[float, float]], bool]] = []
         self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
@@ -1114,6 +1117,9 @@ class Sim:
                 high[o.high[:, 0], o.high[:, 1]] += 1
             if self.sonar_map:
                 mark_sonar(g, o.pose, o.sonar_m)
+        if self.params.driven_free:
+            for start, pieces, reverse in self.drives:
+                mark_driven(g, start, pieces, reverse)
         self.grid, self.high = g, high
 
     def truth_floor(self) -> np.ndarray:
@@ -1327,9 +1333,11 @@ class Sim:
                 break
             reverse = bool(action.get("reverse"))
             for steer, cm in self.pieces(action):
-                before = self.distance_m
+                start, before = self.car.camera_pose(), self.distance_m
                 result = self.drive(steer, action["speed"], cm, on_frame, reverse=reverse)
                 moved = self.distance_m - before
+                if moved > 1e-6:
+                    self.drives.append((start, [(steer, moved)], reverse))
                 if reverse:
                     self.driven = consume(self.driven, moved)
                 elif moved > 1e-6:

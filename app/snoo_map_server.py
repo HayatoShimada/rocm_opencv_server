@@ -74,6 +74,7 @@ from app.roommap import (
     consume,
     drive_poses,
     fit_driven,
+    mark_driven,
     take,
 )
 from app.snoo import _allowed, parse_allow
@@ -471,6 +472,8 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     r.points = xy_to_frame(anchor, r.points) if len(r.points) else r.points
     if r.floor.inliers:
         r.grid, r.high = session_grid(read_observations(session, station_id))
+        if params.driven_free:
+            mark_steps_driven(r.grid, session, station_id, poses)
         r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
         r.step_path = []
         if r.plan is not None:
@@ -568,9 +571,27 @@ def driven_trail(
     飛んでいる・長さが測れない）があれば、そこより前へは戻らない。
     prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
     """
-    sent = read_reverses(session)
     trail: list[tuple[float, float]] = []
     backs = 0
+    for _, pieces, reverse in steps_driven(session, station_id, poses):
+        if pieces is None:
+            trail, backs = [], 0
+        elif reverse:
+            trail, backs = consume(trail, sum(m for _, m in pieces)), backs + 1
+        else:
+            trail, backs = trail + pieces, 0
+    return trail, backs
+
+
+def steps_driven(
+    session: Path, station_id: int, poses: dict[int, Pose]
+) -> list[tuple[int, list[tuple[float, float]] | None, bool]]:
+    """station_id までの、ステーションの間に走った 1 歩ごとの (前のステーション, 区間, 後ろへか)。
+    区間は実際に走った長さまで（moved_m）。どう動いたか分からない所は区間が None。
+    prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
+    """
+    sent = read_reverses(session)
+    out: list[tuple[int, list[tuple[float, float]] | None, bool]] = []
     before = None
     for i in station_ids(session):
         if i > station_id:
@@ -578,19 +599,21 @@ def driven_trail(
         prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
         pieces = step_pieces(prev) if isinstance(prev, dict) else None
         if before is None or i != before + 1 or pieces is None:
-            trail, backs = [], 0
+            out.append((i, None, False))
         else:
             reverse = prev.get("reverse")
             reverse = before in sent if reverse is None else bool(reverse)
             s = moved_m(prev, pieces, poses.get(before), poses.get(i), reverse)
-            if s is None:
-                trail, backs = [], 0
-            elif reverse:
-                trail, backs = consume(trail, s), backs + 1
-            else:
-                trail, backs = trail + take(pieces, s), 0
+            out.append((before, None if s is None else take(pieces, s), reverse))
         before = i
-    return trail, backs
+    return out
+
+
+def mark_steps_driven(grid, session: Path, station_id: int, poses: dict[int, Pose]) -> None:
+    """走ってきた道（車の外形の下）を、セッションの間取りの床にする（roommap.mark_driven）。"""
+    for before, pieces, reverse in steps_driven(session, station_id, poses):
+        if pieces and before in poses:
+            mark_driven(grid, poses[before], pieces, reverse)
 
 
 def history(session: Path, station_id: int, poses: dict[int, Pose]) -> History:

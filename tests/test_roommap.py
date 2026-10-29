@@ -339,3 +339,35 @@ def test_turning_reverse_may_enter_unseen_floor_only_at_the_start():
     g = Grid(size_m=6.0)  # 何も見ていない
     assert turning_reverse(g, Pose(0, 0, 0), unseen_ok_m=0.15) == []  # 30 cm は無理
     assert turning_reverse(g, Pose(0, 0, 0), length=0.12, unseen_ok_m=0.15)  # 12 cm ならよい
+
+
+def test_car_next_to_furniture_can_still_leave_away_from_it():
+    """左前 14 cm に障害物があっても、居る所はふさがらず、離れる向きへは行ける
+    （3 回目の実走の最後は、ここで周りが全部ふさがって unreachable だった）。
+    """
+    from app.roommap import blocked_cells
+
+    g = _room(seen_until_x=1.5)
+    g.mark_occupied(np.array([0.10, 0.10]), np.array([0.10, 0.15]))
+    pose = Pose(0, 0, 0)
+    blocked = blocked_cells(g, g.state(), pose)
+    assert not blocked[g.cell(0.0, 0.0)]
+    assert blocked[g.cell(0.10, 0.05)]  # 障害物のすぐ横には入らない
+    plan = next_best_view(g, pose, segments=True)
+    assert plan is not None and plan.segments
+
+
+def test_mark_driven_makes_the_floor_under_the_car_free_but_keeps_obstacles():
+    from app.roommap import CAR_REAR_M, mark_driven
+
+    g = Grid(size_m=4.0)
+    g.mark_occupied(np.array([0.30]), np.array([0.0]))
+    mark_driven(g, Pose(0, 0, 0), [(0.0, 0.40)])
+    s = g.state()
+    assert s[g.cell(0.0, 0.0)] == FREE and s[g.cell(0.41, 0.0)] == FREE  # 前の端 +5 cm まで
+    assert s[g.cell(0.30, 0.0)] == OCCUPIED  # 見た障害物は消さない
+    assert s[g.cell(0.0, 0.12)] == UNKNOWN  # 車の幅の外
+    # 後ろへ下がったら、車の後ろが床になる（カメラの真下から CAM_X_M + 後ろの端まで）
+    g = Grid(size_m=4.0)
+    mark_driven(g, Pose(0, 0, 0), [(0.0, 0.20)], reverse=True)
+    assert g.state()[g.cell(-0.16 + CAR_REAR_M - 0.15, 0.0)] == FREE

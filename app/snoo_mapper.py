@@ -98,6 +98,9 @@ class MapParams:
     # 行き場が無いときに後ろへ下がってよい（Pi が supports に "reverse" を書いたとき。
     # 下がり方は reverse_step で決める）
     reverse: bool = False
+    # 走ってきた道（車の外形の下）を床にする（roommap.mark_driven。地図のサーバーと
+    # シミュレーターが間取りに足す）
+    driven_free: bool = True
     # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
     random_p: float = 0.15
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）

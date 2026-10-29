@@ -545,6 +545,42 @@ def drive_poses(
     return out
 
 
+# 車の幅の半分（外形 約 26 x 19 cm）
+CAR_HALF_WIDTH_M = 0.095
+# 走った所を床にするとき、外形からこれだけ内側だけにする（位置のずれの分）
+DRIVEN_SHRINK_M = 0.03
+# 走った所の床の強さ（log-odds）。見た床（1 回 -0.85）より確か（車がそこに居た）
+DRIVEN_FREE = -1.5
+
+
+def mark_driven(
+    grid: Grid, start: Pose, pieces: list[tuple[float, float]], reverse: bool = False
+) -> None:
+    """カメラの真下が start の車が区間を走った所（外形の下）を、床にする。
+
+    カメラは前しか見ず、足元も写らないので、走ってきた道（とくに車の後ろ）は見ていないことが多い。
+    けれど車が通れたのだから、車の高さより低い物は無い。そこを床にすると、後ろへ下がる・
+    切り返す道を地図で確かめられる。障害物と見ているセルは消さない（動く猫かもしれない）。
+    """
+    if not pieces:
+        return
+    xs = np.arange(CAR_REAR_M + DRIVEN_SHRINK_M, CAR_FRONT_M - DRIVEN_SHRINK_M + 1e-9, grid.res / 2)
+    half = CAR_HALF_WIDTH_M - DRIVEN_SHRINK_M
+    ys = np.arange(-half, half + 1e-9, grid.res / 2)
+    fx, fy = (a.ravel() for a in np.meshgrid(xs, ys))
+    px, py = [], []
+    for _, r in drive_poses(start, pieces, reverse, step=grid.res / 2):
+        c, s = math.cos(r.yaw), math.sin(r.yaw)
+        px.append(r.x + c * fx - s * fy)
+        py.append(r.y + s * fx + c * fy)
+    ix, iy = grid.cell(np.concatenate(px), np.concatenate(py))
+    ok = grid.inside(ix, iy)
+    cells = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0)
+    lo = grid.logodds[cells[:, 0], cells[:, 1]]
+    keep = lo <= 0.4  # 障害物と見ているセルはそのまま
+    grid.logodds[cells[keep, 0], cells[keep, 1]] = np.minimum(lo[keep], DRIVEN_FREE)
+
+
 def take(pieces: list[tuple[float, float]], total: float) -> list[tuple[float, float]]:
     """区間の頭から total m だけ（足りなければ最後の区間を伸ばす）。"""
     out: list[tuple[float, float]] = []
