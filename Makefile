@@ -39,4 +39,4 @@ status:
 
 replay:
 	@test -n "$(SESSION)" || { echo "make replay SESSION=<セッションの名前か置き場>"; exit 2; }
-	$(PYTHON) -m scripts.snoo_replay $(SESSION) $(ARGS)
+	$(PYTHON) -m scripts.snoo_replay $(SESSION) $(if $(STATION),--station $(STATION)) $(ARGS)

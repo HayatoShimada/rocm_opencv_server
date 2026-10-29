@@ -447,3 +447,20 @@ def test_clustered_stations_force_a_random_step():
     spread = {i: Pose(0.4 * i, 0.0, 0.0) for i in range(5)}
     assert not clustered(spread, 4)
     assert not clustered({0: Pose(0, 0, 0)}, 1)  # まだ少ない
+
+
+def test_each_station_keeps_its_points_and_reply_and_can_be_replayed(tmp_path):
+    from app.snoo_map_server import RECON_FILE, load_recon
+    from scripts.snoo_replay import replay, same_reply
+
+    c = _client(tmp_path)
+    replies = [_post(c, _meta(i)).json() for i in range(2)]
+    session = tmp_path / "explore_20261029_201500"
+    for i, reply in enumerate(replies):
+        d = session / f"{i:03d}"
+        keys, recon = load_recon(d / RECON_FILE)
+        assert len(keys) == len(recon.extrinsic) and recon.points.dtype == np.float32
+        assert json.loads((d / "reply.json").read_text()) == reply
+    # 最後でないステーションも、残した点で決め直せる
+    station, again, before, _ = replay(session, tmp_path / "out", station=0)
+    assert station == 0 and before == replies[0] and same_reply(again, before)
