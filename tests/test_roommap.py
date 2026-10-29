@@ -388,3 +388,21 @@ def test_long_step_only_on_a_straight_segment_over_seen_floor():
     blocked = g.state() != FREE
     short = turn_then_straight(g, blocked, Pose(0, 0, 0), Pose(1.5, 0, 0), LONG_STEP_M)
     assert MAX_STEP_M <= sum(m for _, m in short) < LONG_STEP_M
+
+
+def test_plan_turn_faces_a_target_behind_with_a_turning_reverse():
+    from app.roommap import bearing, drive_moves, plan_turn
+
+    g, _ = _open_floor()
+    behind = Pose(-1.0, 0.3, 0.0)
+    turn = plan_turn(g, Pose(0, 0, 0), behind)
+    assert turn is not None and all(back for *_, back in turn.moves)
+    assert abs(bearing(turn.end, behind)) < abs(bearing(Pose(0, 0, 0), behind)) - 0.5
+    end = camera_of(drive_moves(Pose(0, 0, 0), turn.moves)[-1][1])
+    assert (end.x, end.y) == pytest.approx((turn.end.x, turn.end.y))
+    # 壁に囲まれていれば向きを変えない
+    wall = Grid(size_m=6.0)
+    xs = np.arange(-1.0, 1.0, 0.02)
+    gx, gy = np.meshgrid(xs, xs)
+    wall.mark_occupied(gx.ravel(), gy.ravel())
+    assert plan_turn(wall, Pose(0.6, 0.6, 0), behind) is None

@@ -275,3 +275,22 @@ def test_observations_add_up_to_the_same_grid_and_move_with_the_anchor(tmp_path)
     o, p = moved.observations[1], r.observations[1]
     assert (o.pose.x, o.pose.y) == pytest.approx((1.0 - p.pose.y, 2.0 + p.pose.x), abs=1e-6)
     assert len(o.free) == pytest.approx(len(p.free), rel=0.05)  # 回してもセルが抜けない
+
+
+def test_decide_turns_instead_of_looping_when_the_target_is_behind():
+    """見ていない所が真後ろだけなら、前へ輪を描かず、切り返す（Pi が reverse を受けるとき）。"""
+    from app.roommap import Grid
+
+    g = Grid(size_m=6.0)
+    xs = np.arange(-0.2, 1.6, 0.025)
+    gx, gy = np.meshgrid(xs, np.arange(-0.8, 0.8, 0.025))
+    g.mark_free(gx.ravel(), gy.ravel())  # 前と足元だけ床。後ろ（x < -0.2）は見ていない
+    wall = np.arange(-0.8, 0.8, 0.02)
+    g.mark_occupied(np.full_like(wall, 1.6), wall)
+    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, 0.8))
+    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, -0.8))
+    st = [StationResult("000", Pose(0.3, 0.0, 0.0), CAM_H, 0.0, 8)]
+    a, plan = decide(g, st, MapParams(segments=True, reverse=True, random_p=0.0), [CAM_H])
+    assert a["action"] == "move" and a.get("turn") and a["reverse"] is True and plan is None
+    a, _ = decide(g, st, MapParams(segments=True, random_p=0.0), [CAM_H])
+    assert not a.get("turn")  # reverse を受けない Pi には今までどおり

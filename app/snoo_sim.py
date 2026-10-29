@@ -845,7 +845,7 @@ class Sim:
         self._truth: np.ndarray | None = None
         # 走った 1 歩ごとの (走り出したカメラの真下, 走った区間, 後ろへか)。地図に足す
         self.drives: list[tuple[Pose, list[tuple[float, float]], bool]] = []
-        self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・done）の数
+        self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・turn・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
         if snoo is None:
@@ -1206,6 +1206,7 @@ class Sim:
                 self.action = reverse_action(pieces, params.segments)
         a = self.action
         kind = "reverse" if a.get("reverse") else "random" if a.get("random") else "nbv"
+        kind = "turn" if a.get("turn") else kind
         kind = kind if a.get("action") == "move" else "done"
         self.kinds[kind] = self.kinds.get(kind, 0) + 1
         self.step_arc = []

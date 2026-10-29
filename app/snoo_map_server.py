@@ -16,7 +16,9 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
     上の steer_deg・distance_cm は最初の区間
   - supports に "reverse" があれば、前へ行ける所が無い（unreachable）とき、来た道を戻る
     {"action": "move", "reverse": true, steer_deg, speed, distance_cm（30 cm まで）, [segments]}
-    を返す（続けて 2 回まで）
+    を返す（続けて 2 回まで）。見たい所が後ろ（100° より後ろ）のときも、前へ輪を描く代わりに
+    切り返し（いっぱいに切って下がる）を返すことがある。そのときは "turn": true が付く
+    （形は reverse の返事と同じ）
   - supports に "long_step"（と "segments"）があれば、まっすぐの区間が地図で床と分かっている
     ときは、1 歩を 60 cm まで延ばす（40 cm を超えるのは、最後のまっすぐの区間だけ）。
     Pi は今までどおり超音波・clear_cm・動かないときに止まる

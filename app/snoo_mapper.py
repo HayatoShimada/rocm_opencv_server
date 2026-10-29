@@ -34,21 +34,26 @@ import cv2
 import numpy as np
 
 from app.roommap import (
+    BEHIND_DEG,
     FREE,
     MAX_SEGMENTS,
     MAX_STEP_M,
     MIN_STEP_M,
     OCCUPIED,
     REVERSE_MAX_M,
+    TURN_GAIN_DEG,
     UNKNOWN,
     Grid,
     Plan,
     Pose,
+    Turn,
+    bearing,
     camera_of,
     drive_poses,
     frontiers,
     mark_sonar,
     next_best_view,
+    plan_turn,
     random_step,
     retrace,
     turning_reverse,
@@ -105,6 +110,8 @@ class MapParams:
     # 1 歩の長さの上限。Pi が supports に "long_step"（と "segments"）を書いたときは
     # roommap.LONG_STEP_M（60 cm）まで。超えた分はまっすぐの区間だけ
     max_step_m: float = MAX_STEP_M
+    # 見たい所が後ろなら、先に向きを変える（roommap.plan_turn。reverse のときだけ）
+    plan_turns: bool = True
     # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
     random_p: float = 0.15
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
@@ -752,6 +759,10 @@ def decide(
     plan = None
     if not params.force_random and rng.random() >= params.random_p:
         plan = next_best_view(grid, pose, segments=params.segments, max_step_m=params.max_step_m)
+        if params.reverse and params.plan_turns:
+            turn = turn_instead(grid, pose, plan, params)
+            if turn is not None:
+                return turn_action(turn, pose, params), None
     if plan is None:
         # 行き詰まった・同じ所に固まった・ときどき：でたらめな 1 歩
         step = random_step(grid, pose, rng)
@@ -781,6 +792,34 @@ def decide(
         # 上の steer_deg・distance_cm は最初の区間（segments を知らない Pi でも同じに動く）
         action["segments"] = segments_json(plan.segments)
     return action, plan
+
+
+def turn_instead(grid: Grid, pose: Pose, plan: Plan | None, params: MapParams) -> Turn | None:
+    """前へ進む 1 歩の代わりに向きを変えるか。行ける所が無い（plan が None）か、見たい所が
+    BEHIND_DEG より後ろで、向きを変えるとそれが TURN_GAIN_DEG 以上前に寄るとき。
+
+    前は行き場が無くなるまで前へ進み（unreachable）、それから下がっていた。3 回目の実走は、
+    その間に 1 周（撮る・地図・走る、27 秒）ずつ使った。
+    """
+    if plan is None:
+        return plan_turn(grid, pose, None)
+    off = abs(bearing(pose, plan.target))
+    if off < math.radians(BEHIND_DEG):
+        return None
+    turn = plan_turn(grid, pose, plan.target)
+    if turn is None or abs(bearing(turn.end, plan.target)) > off - math.radians(TURN_GAIN_DEG):
+        return None
+    return turn
+
+
+def turn_action(turn: Turn, pose: Pose, params: MapParams) -> dict:
+    """向きを変える 1 歩の返事。形は後ろへ戻る返事（reverse）と同じなので、今の Pi が走れる。
+    向きを変えたと分かるよう "turn": true を付ける。"""
+    action = reverse_action([(st, m) for st, m, _ in turn.moves], params.segments)
+    action["turn"] = True
+    action["pose"] = pose_dict(pose)
+    action["target"] = pose_dict(turn.end)
+    return action
 
 
 def segments_json(pieces: list[tuple[float, float]]) -> list[dict]:

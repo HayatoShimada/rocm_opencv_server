@@ -733,6 +733,105 @@ def turning_reverse(
     return best
 
 
+# --- 向きを変える（切り返し・3 点ターン）を、次の 1 歩の候補にする ---
+
+# 見たい所がこれより後ろ（車の向きから）なら、前へ輪を描くより先に向きを変える
+BEHIND_DEG = 100.0
+# 向きを変えたら、見たい所の向きがこれだけは前に寄ること
+TURN_GAIN_DEG = 40.0
+
+
+@dataclass
+class Turn:
+    """向きを変える 1 歩。moves は [(ハンドル°, m, 後ろへか), ...]（走る順）。"""
+
+    moves: list[tuple[float, float, bool]]
+    end: Pose  # 着いた所（カメラの真下）
+    gain: int
+
+
+def drive_moves(start: Pose, moves: list[tuple[float, float, bool]], step: float = 0.01):
+    """前へ・後ろへの混じった区間を走ったときの (走った長さ, 後ろの車軸の姿勢, 区間の番号,
+    その区間で走った長さ) の列。"""
+    r = rear_axle(start)
+    x, y, yaw = r.x, r.y, r.yaw
+    out = [(0.0, Pose(x, y, yaw), 0, 0.0)]
+    done = 0.0
+    for k, (steer, length, back) in enumerate(moves):
+        n = max(1, int(math.ceil(length / step)))
+        for j in range(n):
+            x, y, yaw = arc(x, y, yaw, steer, (-1 if back else 1) * length / n)
+            done += length / n
+            out.append((done, Pose(x, y, yaw), k, (j + 1) * length / n))
+    return out
+
+
+def moves_are_clear(
+    grid: Grid, state: np.ndarray, pose: Pose, moves, unseen_ok_m: float = 0.15
+) -> bool:
+    """区間を走って、車の真ん中が blocked に入らないか。後ろへの区間の頭 unseen_ok_m だけは、
+    見ていない所も通ってよい（turning_reverse と同じ。Pi は遅く下がり、動かなければ止まる）。"""
+    blocked = blocked_cells(grid, state, pose)
+    hard = blocked_cells(grid, state, pose, unseen_ok=True)
+    for _, rear, k, part in drive_moves(pose, moves)[1:]:
+        c = grid.cell(
+            rear.x + CAR_CENTER_M * math.cos(rear.yaw), rear.y + CAR_CENTER_M * math.sin(rear.yaw)
+        )
+        back = moves[k][2]
+        if not grid.inside(*c) or (hard if back and part <= unseen_ok_m else blocked)[c]:
+            return False
+    return True
+
+
+def plan_turn(
+    grid: Grid,
+    pose: Pose,
+    toward: Pose | None = None,
+    unseen_ok_m: float = 0.0,
+) -> Turn | None:
+    """向きを変える 1 歩：切り返し（いっぱいに切って 30 cm か 15 cm 下がる）。
+
+    前輪で曲がる車は、真後ろの見たい所へ前進だけで行くと、回転半径 26 cm の輪を描き、
+    数歩かけて回り込む（輪の途中で家具に当たる道は使えず、3 回目の実走は unreachable と
+    戻るを繰り返した）。toward（見たい所）があれば、着いた向きがそこにいちばん近いもの、
+    無ければ着いた所から新しく見えそうなセルがいちばん多いもの。見えるセルが無ければ None。
+    後ろへの区間は、頭の unseen_ok_m だけ見ていない所に入ってよい（既定は床と分かった所だけ。
+    走ってきた所は mark_driven で床になっている。行き場が無いときの turning_reverse は 15 cm）。
+    3 点ターン（前へ曲がる → 逆に切って後ろへ、を 1 回の返事にする）も試したが、
+    シミュレーターの実走の部屋で 5 分の広さが 17 % 減ったので入れていない。
+    """
+    state = grid.state()
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    options: list[list[tuple[float, float, bool]]] = []
+    for s in (max_steer, -max_steer):
+        options += [[(s, 0.30, True)], [(s, 0.15, True)]]
+    best, best_key = None, None
+    for moves in options:
+        if not moves_are_clear(grid, state, pose, moves, unseen_ok_m):
+            continue
+        end = camera_of(drive_moves(pose, moves)[-1][1])
+        gain = view_gain(grid, state, end, rays=21)
+        if gain <= 0:
+            continue
+        if toward is not None:
+            off = abs(
+                math.remainder(
+                    math.atan2(toward.y - end.y, toward.x - end.x) - end.yaw, 2 * math.pi
+                )
+            )
+            key = (-off, gain)
+        else:
+            key = (gain, 0.0)
+        if best_key is None or key > best_key:
+            best, best_key = Turn(moves, end, gain), key
+    return best
+
+
+def bearing(pose: Pose, target: Pose) -> float:
+    """pose の向きから見た target の向き（rad、-π..π）。"""
+    return math.remainder(math.atan2(target.y - pose.y, target.x - pose.x) - pose.yaw, 2 * math.pi)
+
+
 def retrace(
     trail: list[tuple[float, float]], budget: float = REVERSE_MAX_M, max_pieces: int = MAX_SEGMENTS
 ) -> list[tuple[float, float]]:
