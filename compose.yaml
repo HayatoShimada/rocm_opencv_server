@@ -2,6 +2,7 @@ services:
   server:
     build:
       context: .
+      target: server
       args:
         ROCM_IMAGE_TAG: "10.0.0-full"
     image: rocm-opencv-server
@@ -27,3 +28,40 @@ services:
     environment:
       USE_OPENCL: "true"
     restart: unless-stopped
+
+  # PiCar-X（85pi4）の猫の検出（app/snoo.py）。UDP 8710 を tailscale の IP だけで受ける。
+  # tailscale serve は UDP を通せないので、ホストのネットワークで動かし、tailscale の IP に直接 bind する
+  snoo:
+    build:
+      context: .
+      target: snoo
+      args:
+        ROCM_IMAGE_TAG: "10.0.0-full"
+    image: rocm-opencv-server-snoo
+    network_mode: host
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      SNOO_HOST: "${SNOO_HOST:-100.108.168.101}"
+      SNOO_PORT: "${SNOO_PORT:-8710}"
+      # 検出を torch.compile（HIP グラフ）で動かす。準備の結果は torch-compile ボリュームに残す
+      SNOO_COMPILE: "${SNOO_COMPILE:-1}"
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
+      TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
+    # snoo の見本（scripts/snoo_gallery.py で作る）と、
+    # 検出モデル（Hugging Face）を作り直しのたびに取りに行かないためのキャッシュ
+    volumes:
+      - ./data/snoo:/app/data/snoo:ro
+      - hf-cache:/root/.cache/huggingface
+      - torch-compile:/root/.cache/torch-compile
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  torch-compile:
