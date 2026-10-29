@@ -5,16 +5,14 @@ import pytest
 
 pytest.importorskip("mujoco")  # uv sync --group sim
 
-from app.roommap import FREE, WHEELBASE_M, Pose  # noqa: E402
+from app.roommap import FREE, WHEELBASE_M, Pose, arc, curvature  # noqa: E402
 from app.snoo_sim import (  # noqa: E402
     CAR_FRONT_M,
     CAR_REAR_M,
     CAR_WIDTH_M,
     CarState,
     Sim,
-    arc,
     build_mjcf,
-    curvature,
     footprint,
     merge_cells,
     rect_hits,

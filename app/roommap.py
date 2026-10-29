@@ -27,6 +27,16 @@ CAR_RADIUS_M = 0.17
 # （後輪の軸から前輪の操舵軸まで）。ハンドル ±30° で 14 / tan 30° = 24.2 cm なので、余裕を見て 26 cm
 TURN_RADIUS_M = 0.26
 WHEELBASE_M = 0.14
+# 車の前後の端と、カメラ（パンの軸）の位置。どれも後ろの車軸の中央から前へ測る（m）。
+# 前後の端は写真から見積もった（測っていない）。カメラの位置も測っていない。
+# ステーションの位置（Pose）はカメラの真下なので、車の動き（自転車モデル）を当てるときは
+# 後ろの車軸に直してから動かす（app/snoo_sim.py もここの値を使う）
+CAR_REAR_M = -0.05
+CAR_FRONT_M = 0.21
+CAM_X_M = 0.16
+# 前の超音波（バンパーの真ん中）。±15° の円すいで、3 m まで測れる
+SONAR_HALF_DEG = 15.0
+SONAR_RANGE_M = 3.0
 # 1 回の撮影で見える範囲：画角 54° の半分 + パン ±35°
 HALF_VIEW_DEG = 62.0
 VIEW_RANGE_M = 2.0
@@ -216,6 +226,40 @@ def sample_path(start: Pose, kind: str, segs: tuple, r: float = TURN_RADIUS_M, s
                 yaw += turn
             poses.append(Pose(x, y, yaw))
     return poses
+
+
+# --- 車の動き（自転車モデル）。Pi と同じ指令（steer_deg は右が +、距離は後ろの車輪の進み） ---
+
+
+def curvature(steer_deg: float) -> float:
+    """後ろの車軸の中心が描く円の曲率（1/m、左が +）。steer_deg は右が +（Pi と同じ）。"""
+    return -math.tan(math.radians(steer_deg)) / WHEELBASE_M
+
+
+def arc(x: float, y: float, yaw: float, steer_deg: float, ds: float) -> tuple[float, float, float]:
+    """後ろの車軸の中心を、ハンドル steer_deg のまま ds m 進めた姿勢（ちょうど円弧の上）。
+    ds が負なら同じ弧を後ろへ戻る。
+    """
+    k = curvature(steer_deg)
+    if abs(k) < 1e-9:
+        return x + ds * math.cos(yaw), y + ds * math.sin(yaw), yaw
+    nyaw = yaw + k * ds
+    return (
+        x + (math.sin(nyaw) - math.sin(yaw)) / k,
+        y - (math.cos(nyaw) - math.cos(yaw)) / k,
+        nyaw,
+    )
+
+
+def rear_axle(camera: Pose) -> Pose:
+    """カメラの真下の姿勢（ステーションの位置）から、後ろの車軸の中央の姿勢へ。"""
+    c, s = math.cos(camera.yaw), math.sin(camera.yaw)
+    return Pose(camera.x - CAM_X_M * c, camera.y - CAM_X_M * s, camera.yaw)
+
+
+def camera_of(rear: Pose) -> Pose:
+    c, s = math.cos(rear.yaw), math.sin(rear.yaw)
+    return Pose(rear.x + CAM_X_M * c, rear.y + CAM_X_M * s, rear.yaw)
 
 
 def path_is_clear(grid: Grid, blocked: np.ndarray, poses: list[Pose]) -> bool:

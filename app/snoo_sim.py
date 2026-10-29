@@ -36,14 +36,20 @@ import cv2
 import numpy as np
 
 from app.roommap import (
+    CAM_X_M,
+    CAR_FRONT_M,
+    CAR_REAR_M,
     FREE,
     OCCUPIED,
+    SONAR_HALF_DEG,
+    SONAR_RANGE_M,
     UNKNOWN,
     VIEW_RANGE_M,
     WHEELBASE_M,
     Grid,
     Plan,
     Pose,
+    arc,
 )
 from app.snoo_mapper import MapParams, StationResult, decide
 
@@ -55,22 +61,17 @@ import mujoco  # noqa: E402
 # URDF から：ホイールベース 14.0 cm、トレッド 12 cm、車輪の半径 3.26 cm、ハンドル ±40°
 TRACK_M = 0.12
 WHEEL_R_M = 0.0326
-# 外形 約 26 x 19 cm、高さ 約 12 cm。前後の端の位置は写真から見積もった（測っていない）
-CAR_REAR_M = -0.05
-CAR_FRONT_M = 0.21
+# 外形 約 26 x 19 cm、高さ 約 12 cm。前後の端（CAR_FRONT_M・CAR_REAR_M）と、後ろの車軸から
+# カメラまで（CAM_X_M）は、地図のサーバーも使うので app/roommap.py に置く
 CAR_WIDTH_M = 0.19
 CAR_HEIGHT_M = 0.12
-# 後ろの車軸からカメラ（パンの軸）まで。測っていない
-CAM_X_M = 0.16
 CAM_H_M = 0.08  # 床からレンズの中心まで（SD カード 2.5 枚分と測った）
 HFOV_DEG = 54.0
 IMG_W, IMG_H = 640, 480
 VFOV_DEG = math.degrees(2 * math.atan(math.tan(math.radians(HFOV_DEG / 2)) * IMG_H / IMG_W))
 PAN_LIMIT_DEG = 35.0
 STEER_LIMIT_DEG = 30.0  # URDF は ±40° だが、Pi が ±30° で止める
-# 前の超音波（実機では壊れていて None を返す。シミュレーターでは測れることにする）
-SONAR_HALF_DEG = 15.0
-SONAR_RANGE_M = 3.0
+# 前の超音波の高さ（円すいの広さ・届く距離は app/roommap.py）
 SONAR_H_M = 0.045
 # Pi の speed 1 あたりの速さ（m/s）。snoo_trucar の sim.py と同じ仮の値（測っていない）
 SPEED_M_S = 0.01
@@ -442,25 +443,7 @@ def build_mjcf(room: Room) -> str:
 </mujoco>"""
 
 
-# --- 車の動き（自転車モデル） ---
-
-
-def curvature(steer_deg: float) -> float:
-    """後ろの車軸の中心が描く円の曲率（1/m、左が +）。steer_deg は右が +（Pi と同じ）。"""
-    return -math.tan(math.radians(steer_deg)) / WHEELBASE_M
-
-
-def arc(x: float, y: float, yaw: float, steer_deg: float, ds: float) -> tuple[float, float, float]:
-    """後ろの車軸の中心を、ハンドル steer_deg のまま ds m 進めた姿勢（ちょうど円弧の上）。"""
-    k = curvature(steer_deg)
-    if abs(k) < 1e-9:
-        return x + ds * math.cos(yaw), y + ds * math.sin(yaw), yaw
-    nyaw = yaw + k * ds
-    return (
-        x + (math.sin(nyaw) - math.sin(yaw)) / k,
-        y - (math.cos(nyaw) - math.cos(yaw)) / k,
-        nyaw,
-    )
+# --- 車の動き（自転車モデル。curvature・arc は app/roommap.py） ---
 
 
 @dataclass
