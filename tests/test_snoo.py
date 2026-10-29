@@ -221,6 +221,11 @@ def test_serve_touches_the_active_file_while_frames_arrive(tmp_path):
             break
         except TimeoutError:
             continue
+    # サーバーは返事を送った後にファイルを触るので、返事が届いた時にはまだ無いことがある
+    for _ in range(200):
+        if active.exists():
+            break
+        time.sleep(0.01)
     assert active.exists() and time.time() - active.stat().st_mtime < 5
 
 
