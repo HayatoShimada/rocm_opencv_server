@@ -69,6 +69,33 @@ def test_view_gain_counts_unknown_only_in_the_viewing_direction():
     assert view_gain(g, s, Pose(0.5, 0, math.pi)) == 0  # 見た側を向く
 
 
+def _view_gain_by_steps(grid, state, pose, rays=61):
+    """前の view_gain（1 マスずつ辿る）。numpy の版と数が同じかを見る。"""
+    from app.roommap import HALF_VIEW_DEG, VIEW_RANGE_M
+
+    seen = set()
+    half = math.radians(HALF_VIEW_DEG)
+    for a in np.linspace(pose.yaw - half, pose.yaw + half, rays):
+        for k in range(1, int(VIEW_RANGE_M / (grid.res * 0.5)) + 1):
+            d = k * grid.res * 0.5
+            ix, iy = grid.cell(pose.x + d * math.cos(a), pose.y + d * math.sin(a))
+            if not grid.inside(ix, iy) or state[ix, iy] == OCCUPIED:
+                break
+            if state[ix, iy] == UNKNOWN:
+                seen.add((int(ix), int(iy)))
+    return len(seen)
+
+
+def test_view_gain_matches_walking_the_rays_one_cell_at_a_time():
+    rng = np.random.default_rng(0)
+    g = Grid(size_m=4.0)
+    for _ in range(20):
+        s = rng.choice([UNKNOWN, FREE, OCCUPIED], g.logodds.shape, p=[0.5, 0.45, 0.05])
+        s = s.astype(np.uint8)
+        p = Pose(*rng.uniform(-2.2, 2.2, 2), float(rng.uniform(-4, 4)))  # 格子の外へも向く
+        assert view_gain(g, s, p) == _view_gain_by_steps(g, s, p)
+
+
 @pytest.mark.parametrize(
     ("goal", "length"),
     [(Pose(1.0, 0, 0), 1.0), (Pose(0, 0.44, math.pi), math.pi * 0.22)],  # まっすぐ・半円で U ターン

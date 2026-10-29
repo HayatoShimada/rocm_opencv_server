@@ -172,24 +172,30 @@ def frontiers(state: np.ndarray) -> np.ndarray:
     return (state == FREE) & near
 
 
-def view_gain(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> int:
-    """pose で首を振って撮ったときに見えるはずの未知のセルの数（障害物の陰は数えない）。"""
-    seen: set[tuple[int, int]] = set()
+def view_cells(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> np.ndarray:
+    """pose で首を振って撮ったときに見えるはずの未知のセル（格子の通し番号 ix * n + iy）。
+    光線は障害物か格子の外で止める（障害物の陰は数えない）。
+    """
     half = math.radians(HALF_VIEW_DEG)
     steps = int(VIEW_RANGE_M / (grid.res * 0.5))
-    for a in np.linspace(pose.yaw - half, pose.yaw + half, rays):
-        ca, sa = math.cos(a), math.sin(a)
-        for k in range(1, steps + 1):
-            d = k * grid.res * 0.5
-            ix, iy = grid.cell(pose.x + d * ca, pose.y + d * sa)
-            if not grid.inside(ix, iy):
-                break
-            s = state[ix, iy]
-            if s == OCCUPIED:
-                break
-            if s == UNKNOWN:
-                seen.add((int(ix), int(iy)))
-    return len(seen)
+    a = np.linspace(pose.yaw - half, pose.yaw + half, rays)[:, None]
+    d = np.arange(1, steps + 1)[None, :] * grid.res * 0.5
+    ix, iy = grid.cell(pose.x + d * np.cos(a), pose.y + d * np.sin(a))
+    inside = grid.inside(ix, iy)
+    s = np.where(inside, state[np.clip(ix, 0, grid.n - 1), np.clip(iy, 0, grid.n - 1)], OCCUPIED)
+    # 光線ごとに、最初の障害物（か格子の外）より手前だけ
+    ok = np.cumsum(s == OCCUPIED, axis=1) == 0
+    hit = ok & (s == UNKNOWN)
+    return np.unique(ix[hit] * grid.n + iy[hit])
+
+
+def view_gain(grid: Grid, state: np.ndarray, pose: Pose, rays: int = 61) -> int:
+    """pose で首を振って撮ったときに見えるはずの未知のセルの数（障害物の陰は数えない）。
+
+    1 マスずつ Python で辿ると 1 回 5 ms ほどかかり、次の 1 歩を決めるのに 2 秒かかっていた。
+    numpy でまとめて辿る（view_cells）。
+    """
+    return int(len(view_cells(grid, state, pose, rays)))
 
 
 # --- Dubins 経路（前進だけ・最小回転半径 r）。Shkel & Lumelsky の形 ---
