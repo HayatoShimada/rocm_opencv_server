@@ -278,7 +278,8 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 0. **Pi 側の安全の直しを入れる**（まだなら）：snoo_trucar#21 の `review/safety-fixes`
    （bundle は `~/orca/backups/snoo_trucar_safety_fixes.bundle`）。入れたら、走らせている間に
    `systemctl --user stop snoo-trucar` で車が止まることを一度確かめる
-1. **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
+1. **実機のターンにする**：学習していれば `make phase-robot`（学習を止めてから見張りを起こす）。学習に戻るときは `make phase-train`、今どちらかは `make phase`
+   **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
    すぐ全部起こすなら `make deploy-detector && make deploy-map && systemctl --user start snoo-slam`。
    `make status` で、検出の p50/p95 と「今のフレーム」が新しいことを見る
 1.5 **縮尺を確かめる（一度だけ）**：白い A4 を車の 30〜60 cm 前の床に、縁が全部写るように置き、チルト -15° で 1 枚撮る。
