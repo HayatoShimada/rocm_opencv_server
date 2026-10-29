@@ -272,3 +272,21 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 - **走っている間の SLAM**: 検出が走っている間のフレームを 4 枚/秒ほど `/run/snoo/slam` に書き（`SNOO_SLAM_TAP_DIR`、app/snoo_slam_tap.py）、ホストの app/snoo_slam.py（VGGT-SLAM 2.0）がステーションと合わせて読み、`<セッション>/slam/` に trajectory.jsonl・points.npz・status.json を書く（形は app/snoo_slam.py の先頭）。torch・gtsam は別の venv にあるので、`deploy/snoo-slam-venv.sh` で作ってから `deploy/snoo-slam.service` を地図と同じやり方で入れる（`systemctl --user enable --now snoo-slam`）。保存したセッションを流し直して poses.json と比べるのは `HSA_CU_MASK=0:0-71 ~/orca/vggt-slam-venv/bin/python -m scripts.snoo_slam_replay <セッションの置き場> --out /tmp/slam`
 - **テスト**: 重いテストの印（slow）は `tests/conftest.py` の `SLOW` に名前で書く（テストのファイルは直さない）。`make test-fast` で、印が無いのに 3 秒を超えたテストは最後に名前が出る。`make test ARGS='-x'` のように pytest に引数を渡せる
 - **replay**: 地図のサーバーはステーションごとに VGGT の出力をセッションの `vggt.npz` に上書きするので、決め直せるのはそれを作ったステーション（ふつうは最後）の 1 歩。VGGT の代わりに `vggt.npz` を読み、サーバーと同じ `plan_station` を通す。もとのセッションには書かず、`/tmp/snoo-replay/<セッション>` に room.json・topdown.png・plan.json を作る。前に Pi に返したものと違えば終了コード 1（`ARGS=--allow-diff` で 0）
+
+## 実機で探索する日の手順（snoo）
+
+1. **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
+   すぐ全部起こすなら `make deploy-detector && make deploy-map && systemctl --user start snoo-slam`。
+   `make status` で、検出の p50/p95 と「今のフレーム」が新しいことを見る
+2. **部屋の明かりをつける**（暗いと VGGT の手がかりが取れず、誤検出も増える）。snoo が近くにいないことを確かめる
+   （後ろにはセンサーが無く、下がるときに猫に当たりうる）
+3. **電池**：満充電（8.4 V）にしてスイッチを入れる。6.8 V を切ると地図のサーバーが low_battery で止める
+4. **探索を始める**：USR を 4 回。ブラウザで `http://127.0.0.1:8720/twin` を開いて様子を見る
+5. **終わったら**：`make run-report SESSION=<explore_...> BASE=explore_20261029_223944`。Pi の clear.jsonl を
+   取ってきて `CLEAR=...` も付けると、clear_cm と超音波の差も出る。見るところ：
+   - 止まったコマのくっきりさ（BASE の 0.7 倍を切れば、撮る前の待ちが短すぎる）と、向きのずれ（4° 超え）
+   - 止まった理由と返事の内訳（random・turn・reverse・done の理由）、散らばりの広さ
+   - clear_cm の値が出た割合（settling・out_of_view が多すぎないか）
+6. **決め直す**：直したら `make replay SESSION=<explore_...> STATION=<N>` で、そのステーションの 1 歩を GPU なしで確かめる
+7. **片付け**：`systemctl --user stop snoo-ondemand snoo-slam snoo-map` と `docker compose -f compose.yaml -f compose.dev.yaml stop snoo`
+   （GPU を握ったプロセスが 2 つ以上あると、何もしていなくても 120 W 食う）
