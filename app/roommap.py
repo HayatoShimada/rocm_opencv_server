@@ -392,6 +392,11 @@ def random_step(grid: Grid, pose: Pose, rng, tries: int = 40) -> tuple[float, fl
             not grid.inside(*grid.cell(p.x, p.y)) or blocked[grid.cell(p.x, p.y)] for p in arc[1:]
         ):
             continue
+        # Pi が実際に走る道（後ろの車軸を中心に曲がる自転車モデル・車の真ん中）でもぶつからないこと
+        # （カメラの真下の弧だけでは、ハンドルいっぱいで終点が 22 cm ずれる。コードレビュー）
+        clipped = clip_pieces(grid, blocked, pose, [(steer, run)])
+        if not clipped or clipped[0][1] < run - 1e-6:
+            continue
         gain = view_gain(grid, state, arc[-1], rays=21)
         if gain > best_gain:
             best, best_gain = (steer, run), gain
@@ -489,27 +494,24 @@ def first_step(
         if travelled >= goal_at:
             aim = b
             break
-    dx, dy = aim.x - pose.x, aim.y - pose.y
-    ahead = math.cos(pose.yaw) * dx + math.sin(pose.yaw) * dy
-    left = -math.sin(pose.yaw) * dx + math.cos(pose.yaw) * dy
+    # Pi は後ろの車軸を中心に曲がるので、pure pursuit も後ろの車軸から、目指す点の後ろの車軸へ
+    # 向けて引く（カメラから引くと、Pi が走る道が経路から外れ、ぶつかる所までに縮められて
+    # 1 歩が短くなり、次に撮る位置をあまり選べなくなった：ベンチの実走の部屋で 16.1 → 11.4 m²）
+    rear, goal = rear_axle(pose), rear_axle(aim)
+    dx, dy = goal.x - rear.x, goal.y - rear.y
+    ahead = math.cos(rear.yaw) * dx + math.sin(rear.yaw) * dy
+    left = -math.sin(rear.yaw) * dx + math.cos(rear.yaw) * dy
     curvature = 2 * left / max(ahead * ahead + left * left, 1e-9)  # 左が +
     curvature = max(-1 / TURN_RADIUS_M, min(1 / TURN_RADIUS_M, curvature))
     run = min(MAX_STEP_M, length)
-    if abs(curvature) < 1e-3:
-        arc = sample_path(pose, "S", (run,), r=1.0)
-    else:
-        radius = 1 / abs(curvature)
-        arc = sample_path(pose, "L" if curvature > 0 else "R", (run / radius,), r=radius)
-    clear = 0.0
-    for a, b in zip(arc, arc[1:], strict=False):
-        ix, iy = grid.cell(b.x, b.y)
-        if not grid.inside(ix, iy) or blocked[ix, iy]:
-            break
-        clear += math.hypot(b.x - a.x, b.y - a.y)
-    if clear < 0.05:
-        return 0.0, 0.0
     steer = -math.degrees(math.atan(WHEELBASE_M * curvature))
-    return steer, min(run, clear)
+    # ぶつからないかは、Pi が実際に走る道（後ろの車軸を中心に曲がる自転車モデルで、車の真ん中）で
+    # 見る。カメラの真下から弧を引くと、ハンドルいっぱいで 40 cm 走ったとき終点が 22 cm ずれ、
+    # 通した弧で車体が障害物に入っていた（コードレビュー）
+    clipped = clip_pieces(grid, blocked, pose, [(steer, run)])
+    if not clipped:
+        return 0.0, 0.0
+    return steer, clipped[0][1]
 
 
 # --- 曲がってから、まっすぐ走る（Pi が segments を受けるとき） ---
