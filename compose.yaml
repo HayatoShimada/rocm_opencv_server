@@ -58,12 +58,18 @@ services:
       # フレームを処理している間 1 秒ごとに触る。ホストの deploy/snoo-gpu-perf.sh がこれを見て、
       # 検出が動いている間だけ GPU の時計を上げる（止まれば 3 秒で auto に戻す）
       SNOO_ACTIVE_FILE: /run/snoo/active
+      # 猫が写っている間のフレームを学習用に保存する（app/snoo_record.py。10 枚/秒まで）
+      SNOO_RECORD_DIR: /app/data/snoo_rec
+      SNOO_RECORD_FPS: "${SNOO_RECORD_FPS:-10}"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch-compile/inductor
       TRITON_CACHE_DIR: /root/.cache/torch-compile/triton
     # snoo の見本（scripts/snoo_gallery.py で作る）と、
     # 検出モデル（Hugging Face）を作り直しのたびに取りに行かないためのキャッシュ
     volumes:
       - ./data/snoo:/app/data/snoo:ro
+      # 録画（ファイルの持ち主はこのディレクトリの持ち主に揃える）と、場面の名前を日本時間にするための時刻帯
+      - ./data/snoo_rec:/app/data/snoo_rec
+      - /etc/localtime:/etc/localtime:ro
       - hf-cache:/root/.cache/huggingface
       - torch-compile:/root/.cache/torch-compile
       - /run/snoo:/run/snoo

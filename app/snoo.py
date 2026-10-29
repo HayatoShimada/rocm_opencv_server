@@ -17,6 +17,8 @@ torch・transformers は重いので、使うときだけ読み込む（uv sync 
 LAN 宛ては 3.7 ms）。そのときは 0.0.0.0 で受け、認証の無い UDP なので --allow に書いた送り元
 （Pi の LAN と tailscale の IP）以外は捨てる。
 
+--record-dir を渡すと、猫が写っている間のフレームを学習用に保存する（app/snoo_record.py）。
+
     uv run python -m app.snoo --host 0.0.0.0 --allow 192.168.0.188,100.73.14.8
 """
 
@@ -35,6 +37,8 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+from app.snoo_record import RECORD_DIR, Recorder
 
 HEADER = struct.Struct("<4sIQHH")
 MAGIC = b"SNO1"
@@ -375,6 +379,7 @@ def serve(
     stages: Stages | None = None,
     allow: list | None = None,
     active_file: str = "",
+    recorder: Recorder | None = None,
 ) -> None:
     sock = _bind(host, port)
     allow = allow or []
@@ -422,6 +427,8 @@ def serve(
             sock.sendto(encode_reply(frame, dets, infer_ms), addr)
             stages.mark("送信")
             times.append(infer_ms)
+            if recorder is not None:  # 返事の後に渡す（書き込みは別のスレッド）
+                recorder.offer(addr, frame, dets)
         now = time.monotonic()
         if active_file and times and now - last_touch >= 1.0:
             _touch(active_file)
@@ -464,6 +471,11 @@ def main() -> None:
         default=ACTIVE_FILE,
         help="フレームを処理している間、1 秒ごとに触るファイル（環境変数 SNOO_ACTIVE_FILE）",
     )
+    parser.add_argument(
+        "--record-dir",
+        default=RECORD_DIR,
+        help="猫が写っている間のフレームを保存する所（環境変数 SNOO_RECORD_DIR）。空なら保存しない",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     gallery = args.gallery if os.path.exists(args.gallery) else None
@@ -476,6 +488,7 @@ def main() -> None:
         detector,
         allow=parse_allow(args.allow),
         active_file=args.active_file,
+        recorder=Recorder(args.record_dir) if args.record_dir else None,
     )
 
 
