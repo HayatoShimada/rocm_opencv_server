@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from app import atomic
 from app.snoo_live import sender_name
 
 if TYPE_CHECKING:
@@ -150,8 +151,8 @@ class SlamTap:
                 for det in dets
             ],
         }
-        _replace(d / f"{stem}.jpg", frame.jpeg)
-        _replace(d / f"{stem}.json", json.dumps(info, ensure_ascii=False).encode())
+        atomic.write_bytes(d / f"{stem}.jpg", frame.jpeg)
+        atomic.write_bytes(d / f"{stem}.json", json.dumps(info, ensure_ascii=False).encode())
         self._trim(d)
 
     def _drop_if_clock_went_back(self, d: Path, stem: str) -> None:
@@ -177,9 +178,3 @@ class SlamTap:
 
 # 撮った時刻がこの秒数より前に戻ったら、Pi が起動し直したとみなす
 CLOCK_BACK_S = 60.0
-
-
-def _replace(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
