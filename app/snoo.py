@@ -1,7 +1,8 @@
 """PiCar-X（85pi4 の snoo_trucar）から UDP で届くカメラ画像から猫を検出して返す。
 
 やりとりの仕様は snoo_trucar の docs/PROTOCOL.md。1 データグラム = 1 フレームで、
-20 バイトのヘッダー（struct "<4sIQHH"）の後に JPEG が続く。返事は JSON 1 つで、
+20 バイトのヘッダー（struct "<4sIQHH"）の後に JPEG が続く。版 2（"SNO2"、37 バイト）は
+撮った時刻の指令（ハンドル・速さ・パン・チルト・走っているか）も載せる。返事は JSON 1 つで、
 猫が見つからなくても dets=[] で必ず返す（Pi は返事の有無で通信の状態を見ている）。
 
 検出は RT-DETR v2（COCO の cat。Apache-2.0）を GPU で fp16 で動かす。640x480 で 6 ms ほど
@@ -42,6 +43,11 @@ from app.snoo_record import RECORD_DIR, Recorder
 
 HEADER = struct.Struct("<4sIQHH")
 MAGIC = b"SNO1"
+# 版 2：撮った時刻に Pi が書いていた指令（ハンドル・速さ・パン・チルト）と、走っているかを足す。
+# 走っている間の前の空き（clear_cm）を、これから通る弧の上で測るために要る。SNO1 もそのまま読む
+HEADER_V2 = struct.Struct("<4sIQHHffffB")
+MAGIC_V2 = b"SNO2"
+MOVING, REVERSING = 1, 2  # flags のビット
 MODEL = os.getenv("SNOO_DET_MODEL", "PekingU/rtdetr_v2_r18vd")
 # 返す猫の確からしさの下限（Pi は 0.35 以上を使う。それより少し低いものまで返す）
 CAT_MIN = float(os.getenv("SNOO_CAT_MIN", "0.25"))
@@ -80,6 +86,16 @@ class Frame:
     width: int
     height: int
     jpeg: bytes
+    # 版 2 だけ（撮った時刻の指令。サーボやモーターの実際の値ではない）
+    steer_deg: float | None = None
+    speed: float | None = None
+    pan_deg: float | None = None
+    tilt_deg: float | None = None
+    flags: int = 0
+
+    @property
+    def moving(self) -> bool:
+        return bool(self.flags & MOVING)
 
 
 @dataclass
@@ -90,11 +106,19 @@ class Detection:
 
 
 def parse_frame(data: bytes) -> Frame:
+    magic = data[:4]
+    if magic == MAGIC_V2:
+        if len(data) < HEADER_V2.size:
+            raise FrameError(f"短すぎる（{len(data)} バイト）")
+        _, seq, t_ns, width, height, steer, speed, pan, tilt, flags = HEADER_V2.unpack_from(data)
+        return Frame(
+            seq, t_ns, width, height, data[HEADER_V2.size :], steer, speed, pan, tilt, flags
+        )
+    if magic != MAGIC:
+        raise FrameError(f"先頭が {MAGIC!r} でも {MAGIC_V2!r} でもない（{magic!r}）")
     if len(data) < HEADER.size:
         raise FrameError(f"短すぎる（{len(data)} バイト）")
-    magic, seq, t_capture_ns, width, height = HEADER.unpack_from(data)
-    if magic != MAGIC:
-        raise FrameError(f"先頭が {MAGIC!r} ではない（{magic!r}）")
+    _, seq, t_capture_ns, width, height = HEADER.unpack_from(data)
     return Frame(seq, t_capture_ns, width, height, data[HEADER.size :])
 
 

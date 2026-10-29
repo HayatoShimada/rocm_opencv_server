@@ -21,7 +21,21 @@ def test_parse_frame():
     assert frame.jpeg == b"\xff\xd8jpeg"
 
 
-@pytest.mark.parametrize("data", [b"SNO1", HEADER.pack(b"XXXX", 1, 2, 640, 480)])
+def test_parse_frame_v2_keeps_the_commands():
+    from app.snoo import HEADER_V2
+
+    data = HEADER_V2.pack(b"SNO2", 9, 123, 640, 480, -12.5, 15.0, 10.0, -15.0, 1) + b"\xff\xd8x"
+    frame = parse_frame(data)
+    assert (frame.seq, frame.t_capture_ns, frame.jpeg) == (9, 123, b"\xff\xd8x")
+    commands = (frame.steer_deg, frame.speed, frame.pan_deg, frame.tilt_deg)
+    assert commands == (-12.5, 15.0, 10.0, -15.0)
+    assert frame.moving
+    assert not parse_frame(_packet()).moving  # 版 1 は走っていない扱い
+
+
+@pytest.mark.parametrize(
+    "data", [b"SNO1", b"SNO2" + bytes(10), HEADER.pack(b"XXXX", 1, 2, 640, 480)]
+)
 def test_parse_frame_rejects_bad_packets(data):
     with pytest.raises(FrameError):
         parse_frame(data)
