@@ -295,12 +295,14 @@ def test_low_battery_stops_without_vggt(tmp_path):
     assert (tmp_path / "explore_20261029_201500" / "000" / "meta.json").exists()
 
 
-def test_step_limit_after_30_stations(tmp_path):
+def test_step_limit_after_max_stations(tmp_path):
+    from app.snoo_mapper import MAX_STATIONS
+
     c = _client(tmp_path, no_reconstruct)
     session = tmp_path / "explore_20261029_201500"
-    for i in range(29):
+    for i in range(MAX_STATIONS - 1):
         save_station(session, i, _meta(i), {})
-    r = _post(c, _meta(29))
+    r = _post(c, _meta(MAX_STATIONS - 1))
     assert r.json() == {"action": "done", "reason": "step_limit"}
 
 
