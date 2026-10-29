@@ -383,12 +383,21 @@ def random_step(grid: Grid, pose: Pose, rng, tries: int = 40) -> tuple[float, fl
     for _ in range(tries):
         steer = float(rng.uniform(-max_steer, max_steer))
         run = float(rng.uniform(MIN_RANDOM_STEP_M, MAX_STEP_M))
-        # Pi が走る道（自転車モデル・車の真ん中）で、全部ぶつからずに走れるものだけ
+        k = -math.tan(math.radians(steer)) / WHEELBASE_M  # 左が +
+        if abs(k) < 1e-3:
+            arc = sample_path(pose, "S", (run,), r=1.0)
+        else:
+            arc = sample_path(pose, "L" if k > 0 else "R", (run * abs(k),), r=1 / abs(k))
+        if any(
+            not grid.inside(*grid.cell(p.x, p.y)) or blocked[grid.cell(p.x, p.y)] for p in arc[1:]
+        ):
+            continue
+        # Pi が実際に走る道（後ろの車軸を中心に曲がる自転車モデル・車の真ん中）でもぶつからないこと
+        # （カメラの真下の弧だけでは、ハンドルいっぱいで終点が 22 cm ずれる。コードレビュー）
         clipped = clip_pieces(grid, blocked, pose, [(steer, run)])
         if not clipped or clipped[0][1] < run - 1e-6:
             continue
-        end = camera_of(drive_poses(pose, [(steer, run)])[-1][1])
-        gain = view_gain(grid, state, end, rays=21)
+        gain = view_gain(grid, state, arc[-1], rays=21)
         if gain > best_gain:
             best, best_gain = (steer, run), gain
     return best
@@ -485,9 +494,13 @@ def first_step(
         if travelled >= goal_at:
             aim = b
             break
-    dx, dy = aim.x - pose.x, aim.y - pose.y
-    ahead = math.cos(pose.yaw) * dx + math.sin(pose.yaw) * dy
-    left = -math.sin(pose.yaw) * dx + math.cos(pose.yaw) * dy
+    # Pi は後ろの車軸を中心に曲がるので、pure pursuit も後ろの車軸から、目指す点の後ろの車軸へ
+    # 向けて引く（カメラから引くと、Pi が走る道が経路から外れ、ぶつかる所までに縮められて
+    # 1 歩が短くなり、次に撮る位置をあまり選べなくなった：ベンチの実走の部屋で 16.1 → 11.4 m²）
+    rear, goal = rear_axle(pose), rear_axle(aim)
+    dx, dy = goal.x - rear.x, goal.y - rear.y
+    ahead = math.cos(rear.yaw) * dx + math.sin(rear.yaw) * dy
+    left = -math.sin(rear.yaw) * dx + math.cos(rear.yaw) * dy
     curvature = 2 * left / max(ahead * ahead + left * left, 1e-9)  # 左が +
     curvature = max(-1 / TURN_RADIUS_M, min(1 / TURN_RADIUS_M, curvature))
     run = min(MAX_STEP_M, length)
