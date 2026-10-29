@@ -275,6 +275,9 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 
 ## 実機で探索する日の手順（snoo）
 
+0. **Pi 側の安全の直しを入れる**（まだなら）：snoo_trucar#21 の `review/safety-fixes`
+   （bundle は `~/orca/backups/snoo_trucar_safety_fixes.bundle`）。入れたら、走らせている間に
+   `systemctl --user stop snoo-trucar` で車が止まることを一度確かめる
 1. **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
    すぐ全部起こすなら `make deploy-detector && make deploy-map && systemctl --user start snoo-slam`。
    `make status` で、検出の p50/p95 と「今のフレーム」が新しいことを見る
@@ -288,5 +291,7 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
    - 止まった理由と返事の内訳（random・turn・reverse・done の理由）、散らばりの広さ
    - clear_cm の値が出た割合（settling・out_of_view が多すぎないか）
 6. **決め直す**：直したら `make replay SESSION=<explore_...> STATION=<N>` で、そのステーションの 1 歩を GPU なしで確かめる
-7. **片付け**：`systemctl --user stop snoo-ondemand snoo-slam snoo-map` と `docker compose -f compose.yaml -f compose.dev.yaml stop snoo`
+7. **ディスク**：古いセッションの重いファイル（recon.npz・vggt.npz・SLAM のフレーム）は、地図のサーバーを
+   起こしたときに新しい 5 セッションを残して消える。手でするなら `make prune`（`ARGS=--dry-run` で数だけ）
+8. **片付け**：`systemctl --user stop snoo-ondemand snoo-slam snoo-map` と `docker compose -f compose.yaml -f compose.dev.yaml stop snoo`
    （GPU を握ったプロセスが 2 つ以上あると、何もしていなくても 120 W 食う）
