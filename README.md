@@ -281,6 +281,10 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 1. **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
    すぐ全部起こすなら `make deploy-detector && make deploy-map && systemctl --user start snoo-slam`。
    `make status` で、検出の p50/p95 と「今のフレーム」が新しいことを見る
+1.5 **縮尺を確かめる（一度だけ）**：白い A4 を車の 30〜60 cm 前の床に、縁が全部写るように置き、チルト -15° で 1 枚撮る。
+   `make scale-check IMAGE=<その画像> TILT=-15` でカメラの高さが出る（今は SD カードで測った 8 cm）。
+   5 % 以上違えば、`SNOO_CAMERA_HEIGHT_CM`（compose）と Pi の `camera_height_cm` を直す。
+   長い辺と短い辺で合わなければ、チルトの較正がずれている
 2. **部屋の明かりをつける**（暗いと VGGT の手がかりが取れず、誤検出も増える）。snoo が近くにいないことを確かめる
    （後ろにはセンサーが無く、下がるときに猫に当たりうる）
 3. **電池**：満充電（8.4 V）にしてスイッチを入れる。6.8 V を切ると地図のサーバーが low_battery で止める

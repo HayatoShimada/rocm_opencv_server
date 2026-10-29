@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay
+.PHONY: scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -36,6 +36,10 @@ deploy-map:
 
 status:
 	$(PYTHON) -m scripts.snoo_dev status
+
+scale-check:
+	@test -n "$(IMAGE)" -a -n "$(TILT)" || { echo "make scale-check IMAGE=<A4 を撮った画像> TILT=<チルト>"; exit 2; }
+	$(PYTHON) -m scripts.snoo_scale_check $(IMAGE) --tilt $(TILT) $(ARGS)
 
 prune:
 	$(PYTHON) -m scripts.snoo_prune $(ARGS)
