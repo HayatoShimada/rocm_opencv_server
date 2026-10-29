@@ -15,13 +15,17 @@ from app.roommap import (
     Grid,
     Pose,
     camera_of,
+    consume,
     drive_poses,
     dubins,
+    fit_driven,
     frontiers,
     inflate,
     mark_sonar,
     next_best_view,
+    retrace,
     sample_path,
+    take,
     turn_then_straight,
     view_gain,
 )
@@ -218,3 +222,40 @@ def test_next_best_view_with_segments_keeps_the_first_segment_on_top():
     # segments を頼まなければ今までどおり（区間は無い）
     old = next_best_view(g, Pose(0, 0, 0))
     assert old.segments == [] and old.target == plan.target
+
+
+def test_fit_driven_finds_how_far_the_car_went_along_the_segments():
+    pieces = [(28.3, 0.10), (0.0, 0.30)]
+    start = Pose(0.2, -0.1, 0.5)
+    for went in (0.06, 0.25, 0.55):  # 1 つ目の途中・2 つ目の途中・頼んだより長く
+        end = camera_of(drive_poses(start, take(pieces, went))[-1][1])
+        s, err = fit_driven(start, end, pieces)
+        assert s == pytest.approx(went, abs=0.011) and err < 0.01
+    # 後ろへ走ったときも測れる
+    end = camera_of(drive_poses(start, [(20.0, 0.2)], reverse=True)[-1][1])
+    s, err = fit_driven(start, end, [(20.0, 0.0)], reverse=True)
+    assert s == pytest.approx(0.2, abs=0.011) and err < 0.01
+
+
+def test_retrace_goes_back_over_the_last_arcs_in_reverse_order():
+    trail = [(-20.0, 0.30), (25.0, 0.05), (28.3, 0.12), (0.0, 0.10)]
+    assert retrace(trail, 0.30) == [
+        (0.0, pytest.approx(0.10)),
+        (28.3, pytest.approx(0.12)),
+        (25.0, pytest.approx(0.05)),
+    ]
+    assert retrace(trail, 0.30, max_pieces=1) == [(0.0, pytest.approx(0.10))]
+    assert retrace([(28.3, 0.48)], 0.30) == [(28.3, pytest.approx(0.30))]
+    assert retrace([], 0.30) == []
+    # 戻った分を除くと、その前の道を戻る
+    assert consume(trail, 0.15) == [(-20.0, 0.30), (25.0, 0.05), (28.3, pytest.approx(0.07))]
+    # 同じハンドルの区間はまとめる
+    assert retrace([(10.0, 0.1), (10.0, 0.1)], 0.3) == [(10.0, pytest.approx(0.2))]
+
+
+def test_reversing_with_the_same_steer_retraces_the_arc():
+    start = Pose(0.0, 0.0, 0.0)
+    pieces = [(28.3, 0.15), (0.0, 0.2)]
+    end = camera_of(drive_poses(start, pieces)[-1][1])
+    back = camera_of(drive_poses(end, retrace(pieces, 1.0), reverse=True)[-1][1])
+    assert (back.x, back.y, back.yaw) == pytest.approx((start.x, start.y, start.yaw), abs=1e-6)

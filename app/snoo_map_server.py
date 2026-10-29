@@ -9,6 +9,15 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
   JSON）と images（meta の frames[].file と同じ名前の画像）。返事は次の 1 歩（action=move）か、
   やめる理由（action=done）。Pi は 20 秒待って返事が無ければ自分で探るので、1 ステーションを
   20 秒以内に返す
+  - meta の ultrasonic_cm（と止まって撮ったコマごとの読み）は、そのステーションの前の超音波として
+    格子に足す
+  - meta の supports（Pi ができること）に "segments" があれば、move に
+    segments: [{steer_deg, distance_cm}, ...]（曲がる → まっすぐ、合わせて 40 cm まで）を付ける。
+    上の steer_deg・distance_cm は最初の区間
+  - supports に "reverse" があれば、前へ行ける所が無い（unreachable）とき、来た道を戻る
+    {"action": "move", "reverse": true, steer_deg, speed, distance_cm（30 cm まで）, [segments]}
+    を返す（続けて 2 回まで）
+  - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
 
 受けたステーションは <SNOO_MAP_DATA>/<session_id>/<station_id:03d>/ に画像と meta.json で残し、
@@ -46,7 +55,19 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from app.roommap import Pose
+from app.roommap import (
+    FIT_TOL_M,
+    MAX_SEGMENTS,
+    MIN_STEP_M,
+    REVERSE_MAX_M,
+    Pose,
+    camera_of,
+    consume,
+    drive_poses,
+    fit_driven,
+    retrace,
+    take,
+)
 from app.snoo import _allowed, parse_allow
 from app.snoo_mapper import (
     MAX_FRAMES,
@@ -62,6 +83,7 @@ from app.snoo_mapper import (
     registration_is_bad,
     run_vggt,
     save_vggt,
+    segments_json,
     select_frames,
     unproject,
     write_outputs,
@@ -85,6 +107,11 @@ WINDOW = 6
 DEFAULT_CAMERA_HEIGHT_CM = 8.0
 # 超音波がこれより短く読んだら測れなかったとする（PiCar-X の超音波は 2 cm から）
 MIN_ULTRASONIC_CM = 2.0
+# 行き場が無いときに来た道を戻るのは、続けてこの回数まで
+MAX_REVERSES = 2
+REVERSE_SPEED = 12
+# Pi の speed 1 あたりの速さ（cm/s）。1 回目の実走の VGGT の位置から測った（speed 12 で約 20 cm/s）
+PI_CM_PER_S_PER_SPEED = 1.7
 
 # 置き場の名前になるので、/ や . を含めない（../ で外に書かせない）
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -391,24 +418,170 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
             poses[i] = to_session(anchor, s.pose)
     write_poses(session, poses)
 
-    action = dict(r.action)
+    raw = r.action
+    action = dict(raw)
+    if action == {"action": "done", "reason": "unreachable"} and "reverse" in can:
+        pieces = backtrack(session, station_id, poses, "segments" in can)
+        if pieces:
+            action = reverse_action(pieces, "segments" in can)
+            # 戻る弧を上から見た絵に描き、戻った先を target にする
+            r.step_path = [
+                camera_of(p) for _, p in drive_poses(r.stations[-1].pose, pieces, reverse=True)
+            ]
+            action["target"] = pose_dict(to_session(anchor, r.step_path[-1]))
+            remember_reverse(session, station_id, action)
+            r.action = dict(action)  # room.json の next と絵の見出しは、Pi に返すほうにする
     if action["action"] == "move":
         here = poses.get(station_id)
         if here is None:  # 位置合わせが崩れていれば decide が done にするので、ふつうは来ない
             here = to_session(anchor, r.stations[-1].pose)
         action["pose"] = pose_dict(here)
-        action["target"] = pose_dict(to_session(anchor, r.plan.target))
+        if not action.get("reverse"):
+            action["target"] = pose_dict(to_session(anchor, r.plan.target))
         action["station_index"] = ids.index(station_id)
         action["map_url"] = f"/v1/snoo/map/{session.name}/topdown.png"
     else:
         # bad_registration:<名前> の名前は Pi には要らない（plan.json には残す）
         action = {"action": "done", "reason": action["reason"].split(":")[0]}
-    write_results(session, r, window, anchor, r.action, marks)
+    write_results(session, r, window, anchor, raw, marks, action)
     marks["write"] = time.perf_counter() - t
     return action
 
 
-def write_results(session: Path, r, window: list[int], anchor: Pose, raw: dict, marks: dict):
+# --- 行き場が無いときに来た道を戻る ---
+
+
+def step_pieces(prev: dict) -> list[tuple[float, float]] | None:
+    """prev_step の区間 [(ハンドル°, m), ...]。segments（返した形のまま）があればそれ、
+    無ければ steer_deg の 1 本の弧（長さは分からないので 0 にし、測った分だけ伸ばす）。
+    """
+    segs = prev.get("segments")
+    if isinstance(segs, list) and segs:
+        out = []
+        for x in segs:
+            st = x.get("steer_deg") if isinstance(x, dict) else None
+            cm = x.get("distance_cm") if isinstance(x, dict) else None
+            if not _finite(st) or not _finite(cm) or cm < 0:
+                return None
+            out.append((float(st), float(cm) / 100))
+        return out
+    st = prev.get("steer_deg")
+    return [(float(st), 0.0)] if _finite(st) else None
+
+
+def _finite(v) -> bool:
+    return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def pi_distance_m(prev: dict) -> float | None:
+    """Pi が見積もった、走った長さ（m）。est_distance_cm、無ければ 秒 × speed × 1.7 cm/s。"""
+    est = prev.get("est_distance_cm")
+    if _finite(est) and est >= 0:
+        return float(est) / 100
+    sec, speed = prev.get("seconds"), prev.get("speed")
+    if _finite(sec) and _finite(speed) and sec >= 0:
+        return float(sec) * abs(float(speed)) * PI_CM_PER_S_PER_SPEED / 100
+    return None
+
+
+def moved_m(prev: dict, pieces, a: Pose | None, b: Pose | None, reverse: bool) -> float | None:
+    """ステーション a から b まで、区間に沿って実際に走った長さ（m）。
+
+    VGGT の 2 つの位置に、区間を自転車モデルで走らせた位置を合わせて測る（Pi の見積もりより
+    確か。1 回目の実走では Pi の見積もりは本当の 0.6 倍だった）。合わなければ（位置が無い・
+    ずれが大きい）Pi の見積もりを使う。
+    """
+    if a is not None and b is not None:
+        s, err = fit_driven(a, b, pieces, reverse)
+        if err <= FIT_TOL_M:
+            return s
+    return pi_distance_m(prev)
+
+
+def driven_trail(
+    session: Path, station_id: int, poses: dict[int, Pose]
+) -> tuple[list[tuple[float, float]], int]:
+    """station_id までに前へ走った道（走った順の区間）と、続けて後ろへ戻った回数。
+
+    ステーションの meta の prev_step を順に見る。前へ走ったら区間を足し、後ろへ戻ったら
+    その分を終わりから除く。どう動いたか分からない所（prev_step が無い・ステーションが
+    飛んでいる・長さが測れない）があれば、そこより前へは戻らない。
+    prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
+    """
+    sent = read_reverses(session)
+    trail: list[tuple[float, float]] = []
+    backs = 0
+    before = None
+    for i in station_ids(session):
+        if i > station_id:
+            break
+        prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+        pieces = step_pieces(prev) if isinstance(prev, dict) else None
+        if before is None or i != before + 1 or pieces is None:
+            trail, backs = [], 0
+        else:
+            reverse = prev.get("reverse")
+            reverse = before in sent if reverse is None else bool(reverse)
+            s = moved_m(prev, pieces, poses.get(before), poses.get(i), reverse)
+            if s is None:
+                trail, backs = [], 0
+            elif reverse:
+                trail, backs = consume(trail, s), backs + 1
+            else:
+                trail, backs = trail + take(pieces, s), 0
+        before = i
+    return trail, backs
+
+
+def backtrack(
+    session: Path, station_id: int, poses: dict[int, Pose], segments: bool
+) -> list[tuple[float, float]]:
+    """前へ行ける所が無いときに、来た道を戻る区間（戻る順）。戻れなければ空。
+
+    前にしか走らないと、壁に向いて止まったときに回れずに終わる（1 回目の実走の 4 か所目。
+    シミュレーターでも角で 74 % で止まり、30 cm 下がると 95 % まで調べられた）。
+    続けて戻るのは MAX_REVERSES 回まで（それでも行き場が無ければやめる）。
+    segments を受けない Pi には、最後に走った区間の 1 本だけを返す。
+    """
+    trail, backs = driven_trail(session, station_id, poses)
+    if backs >= MAX_REVERSES:
+        return []
+    pieces = retrace(trail, REVERSE_MAX_M, MAX_SEGMENTS if segments else 1)
+    return pieces if sum(m for _, m in pieces) >= MIN_STEP_M else []
+
+
+def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
+    action = {
+        "action": "move",
+        "reverse": True,
+        "steer_deg": round(pieces[0][0], 1) + 0.0,
+        "speed": REVERSE_SPEED,
+        "distance_cm": round(pieces[0][1] * 100, 1),
+    }
+    if segments:
+        action["segments"] = segments_json(pieces)
+    return action
+
+
+def read_reverses(session: Path) -> dict[int, dict]:
+    """後ろへ戻れと返したステーションと、その返事（reverse.json）。"""
+    p = session / "reverse.json"
+    if not p.exists():
+        return {}
+    return {int(k): v for k, v in json.loads(p.read_text()).items()}
+
+
+def remember_reverse(session: Path, station_id: int, action: dict) -> None:
+    data = read_reverses(session)
+    data[station_id] = {k: v for k, v in action.items() if k != "map_url"}
+    tmp = session / ".reverse.json"
+    tmp.write_text(json.dumps({str(k): v for k, v in sorted(data.items())}, indent=1))
+    tmp.replace(session / "reverse.json")
+
+
+def write_results(
+    session: Path, r, window: list[int], anchor: Pose, raw: dict, marks: dict, reply: dict
+):
     """room.json などを書く。ブラウザで見ている途中に半端なファイルを読ませないよう、
     別の置き場に書いてから 1 つずつ名前を変える。
     """
@@ -421,6 +594,7 @@ def write_results(session: Path, r, window: list[int], anchor: Pose, raw: dict, 
     (tmp / "room.json").write_text(json.dumps(room, ensure_ascii=False, indent=1))
     plan = json.loads((tmp / "plan.json").read_text())
     plan["next"] = raw
+    plan["reply"] = reply  # Pi に返したもの（後ろへ戻るときは next と違う）
     plan["window"] = info
     plan["timing_s"] = {k: round(v, 3) for k, v in marks.items()}
     (tmp / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))

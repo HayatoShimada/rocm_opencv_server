@@ -2,7 +2,8 @@
 
 ルンバのように、止まって首を振って撮る → 地図を更新する → 次の位置へ少し走る、を繰り返して
 部屋を探る。車は前輪で曲がる（その場で向きを変えられない）ので、道のりは最小の回転半径を
-考えた Dubins 経路（前進だけ）で測る。後ろにはセンサーが無いので後退はしない。
+考えた Dubins 経路（前進だけ）で測る。後ろにはセンサーが無いので、後ろへ走るのは、行き場が
+無くなったときに来た道をそのまま戻るとき（retrace）だけにする。
 
 次の位置は「新しく見えるはずの未知のセル × exp(-道のり / 距離の重み)」がいちばん大きい所にする。
 見える範囲はカメラの画角とパンの振り幅（± HALF_VIEW_DEG）、見通せる距離（VIEW_RANGE_M）で、
@@ -535,3 +536,67 @@ def turn_then_straight(
         return []
     pieces = take(pieces, min(max_m, total))
     return clip_pieces(grid, blocked, pose, pieces)
+
+
+# --- 来た道を戻る（Pi が reverse を受けられるとき） ---
+
+# 1 回に戻る長さの上限（Pi も 30 cm で止める）
+REVERSE_MAX_M = 0.30
+# VGGT の位置と、自転車モデルで走らせた位置のずれがこれより大きければ、位置からは測らない
+FIT_TOL_M = 0.08
+
+
+def fit_driven(
+    start: Pose, end: Pose, pieces: list[tuple[float, float]], reverse: bool = False,
+    s_max: float = 1.2,
+) -> tuple[float, float]:  # fmt: skip
+    """start（カメラの真下）から区間を走って end に着いたとして、走った長さ（m）と、
+    そのときの end とのずれ（位置の m + 向きの rad × 0.1）。
+
+    途中で止まったなら区間の途中、頼んだより長く走ったなら最後の区間の先になるよう、
+    最後の区間を s_max まで伸ばして探す（1 回目の実走では、Pi の距離の見積もりが本当の
+    0.6 倍だったので、頼んだ長さの 1.7 倍ほど走っていた）。
+    """
+    best = (0.0, math.inf)
+    for done, r in drive_poses(start, take(pieces, s_max), reverse):
+        c = camera_of(r)
+        err = math.hypot(c.x - end.x, c.y - end.y)
+        err += 0.1 * abs(math.remainder(c.yaw - end.yaw, 2 * math.pi))
+        if err < best[1]:
+            best = (done, err)
+    return best
+
+
+def consume(trail: list[tuple[float, float]], m: float) -> list[tuple[float, float]]:
+    """来た道（走った順の区間）の終わりから m だけ除く（後ろへ戻った分）。"""
+    out = list(trail)
+    while out and m > 1e-9:
+        steer, length = out.pop()
+        if length > m:
+            out.append((steer, length - m))
+        m -= length
+    return out
+
+
+def retrace(
+    trail: list[tuple[float, float]], budget: float = REVERSE_MAX_M, max_pieces: int = MAX_SEGMENTS
+) -> list[tuple[float, float]]:
+    """来た道の終わりから budget m を、戻る順の区間にする。
+
+    同じハンドルのまま後ろへ走ると、自転車モデルでは同じ弧をそのまま戻る。なので、走った区間を
+    逆の順に、同じハンドルで後ろへ走れば、さっき走った（ぶつからなかった）床の上だけを通る。
+    """
+    out: list[tuple[float, float]] = []
+    left = budget
+    for steer, length in reversed(trail):
+        if left <= 1e-9:
+            break
+        use = min(length, left)
+        if out and abs(out[-1][0] - steer) < 0.05:
+            out[-1] = (steer, out[-1][1] + use)
+        elif len(out) == max_pieces:
+            break
+        else:
+            out.append((steer, use))
+        left -= use
+    return [(st, m) for st, m in out if m >= 0.005]

@@ -16,8 +16,10 @@ from app.roommap import Pose
 from app.snoo import parse_allow
 from app.snoo_map_server import (
     Recon,
+    backtrack,
     choose_window,
     create_app,
+    driven_trail,
     save_station,
     to_session,
     ultrasonic_cm,
@@ -310,3 +312,116 @@ def test_to_session_turns_and_shifts():
     assert math.degrees(p.yaw) == pytest.approx(60)
     p = to_session(Pose(0, 0, math.radians(170)), Pose(0, 0, math.radians(20)))
     assert math.degrees(p.yaw) == pytest.approx(-170)
+
+
+# --- 行き場が無いときに来た道を戻る ---
+
+
+@pytest.fixture
+def stuck(monkeypatch):
+    """間取りは作るが、前へ行ける所が無い（unreachable）ことにする。"""
+    import app.snoo_map_server as server
+
+    real = server.build_map
+
+    def build(*a, **kw):
+        r = real(*a, **kw)
+        r.action, r.plan, r.step_path = {"action": "done", "reason": "unreachable"}, None, []
+        return r
+
+    monkeypatch.setattr(server, "build_map", build)
+
+
+# 作り物の部屋の 1 か所目 (0, 0, 0°) から 2 か所目 (0.3, 0.1, 20°) へは、ハンドル -8.9° の
+# 弧で 31 cm ほど。Pi の見積もり（est_distance_cm）はわざと短くしておく
+PREV = {"steer_deg": -8.9, "speed": 12, "seconds": 0.9, "est_distance_cm": 18.0, "reverse": False}
+
+
+def _stuck_session(tmp_path, supports):
+    c = _client(tmp_path)
+    _post(c, _meta(0, supports=supports))
+    return _post(c, _meta(1, prev_step=PREV, supports=supports)).json()
+
+
+def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, stuck):
+    a = _stuck_session(tmp_path, ["reverse", "segments"])
+    assert a["action"] == "move" and a["reverse"] is True
+    assert a["steer_deg"] == -8.9 and a["speed"] == 12
+    assert a["distance_cm"] == 30.0  # min(30, VGGT で測った 31 cm)。Pi の見積もり 18 cm ではない
+    assert a["segments"] == [{"steer_deg": -8.9, "distance_cm": 30.0}]
+    # 戻った先は 1 か所目の近く
+    assert math.hypot(a["target"]["x"], a["target"]["y"]) < 0.05
+    session = tmp_path / "explore_20261029_201500"
+    assert json.loads((session / "reverse.json").read_text())["1"]["reverse"] is True
+    plan = json.loads((session / "plan.json").read_text())
+    assert plan["next"] == {"action": "done", "reason": "unreachable"}
+    assert plan["reply"]["reverse"] is True
+
+
+def test_reverse_without_segments_is_one_arc(tmp_path, stuck):
+    a = _stuck_session(tmp_path, ["reverse"])
+    assert a["reverse"] is True and a["distance_cm"] == 30.0 and "segments" not in a
+
+
+def test_no_reverse_for_a_pi_that_does_not_support_it(tmp_path, stuck):
+    done = {"action": "done", "reason": "unreachable"}
+    assert _stuck_session(tmp_path / "a", None) == done
+    assert _stuck_session(tmp_path / "b", ["segments"]) == done
+
+
+def _line(tmp_path, steps, sent=None):
+    """x 軸の上を走ったセッション。steps は (x, prev_step) の並び（最初は prev_step 無し）。"""
+    session = tmp_path / "line"
+    poses = {}
+    for i, (x, prev) in enumerate(steps):
+        save_station(session, i, _meta(i, session="line", prev_step=prev), {})
+        if x is not None:
+            poses[i] = Pose(x, 0.0, 0.0)
+    if sent:
+        (session / "reverse.json").write_text(json.dumps({str(k): {} for k in sent}))
+    return session, poses
+
+
+def _step(cm, reverse=None, **kw):
+    p = {"steer_deg": 0.0, "speed": 12, "seconds": 1.0, "est_distance_cm": cm, **kw}
+    if reverse is not None:
+        p["reverse"] = reverse
+    return p
+
+
+def test_reverse_at_most_twice_in_a_row(tmp_path):
+    session, poses = _line(
+        tmp_path,
+        [
+            (0.0, None),
+            (0.4, _step(40, False)),
+            (0.8, _step(40, False)),
+            (0.6, _step(20, True)),  # 1 回目に戻った
+            (0.4, _step(20, True)),  # 2 回目に戻った
+        ],
+    )
+    trail, backs = driven_trail(session, 3, poses)
+    assert backs == 1 and sum(m for _, m in trail) == pytest.approx(0.6, abs=0.011)
+    assert backtrack(session, 3, poses, True) == [(0.0, pytest.approx(0.3, abs=0.011))]
+    assert driven_trail(session, 4, poses)[1] == 2
+    assert backtrack(session, 4, poses, True) == []  # 3 回目は戻らない
+
+
+def test_reverse_distance_is_what_the_car_actually_drove(tmp_path):
+    # VGGT では 12 cm しか進んでいない（Pi は 40 cm と見積もった）→ 12 cm だけ戻る
+    session, poses = _line(tmp_path / "a", [(0.0, None), (0.12, _step(40, False))])
+    assert backtrack(session, 1, poses, True) == [(0.0, pytest.approx(0.12, abs=0.011))]
+    # 位置が分からなければ Pi の見積もり（est_distance_cm、無ければ 秒 × speed × 1.7 cm/s）
+    session, _ = _line(tmp_path / "b", [(0.0, None), (None, _step(None, False, seconds=0.5))])
+    pieces = backtrack(session, 1, {0: Pose(0, 0, 0)}, True)
+    assert pieces == [(0.0, pytest.approx(0.5 * 12 * 0.017))]
+    # どう動いたか分からなければ戻らない
+    session, poses = _line(tmp_path / "c", [(0.0, None), (0.3, None)])
+    assert backtrack(session, 1, poses, True) == []
+
+
+def test_old_pi_without_the_reverse_flag_uses_what_the_server_sent(tmp_path):
+    steps = [(0.0, None), (0.4, _step(40)), (0.2, _step(20))]
+    session, poses = _line(tmp_path, steps, sent=[1])
+    trail, backs = driven_trail(session, 2, poses)
+    assert backs == 1 and sum(m for _, m in trail) == pytest.approx(0.2, abs=0.011)

@@ -798,6 +798,7 @@ def render_topdown(r: MapResult, px_per_cell: int = 6, margin_m: float = 0.5) ->
             cv2.putText(canvas, str(i + 1), (a[0] + 8, a[1] - 8), 0, 0.5, (220, 120, 0), 1)
     sep = np.full((left.shape[0], 4, 3), 255, np.uint8)
     img = np.concatenate([left, sep, right], 1)
-    text = f"1 grid = 1 m  next: {r.action.get('action')} {r.action.get('reason', '')}"
+    what = "reverse" if r.action.get("reverse") else r.action.get("reason", "")
+    text = f"1 grid = 1 m  next: {r.action.get('action')} {what}"
     cv2.putText(img, text, (6, 18), 0, 0.5, (0, 0, 200), 1)
     return img
