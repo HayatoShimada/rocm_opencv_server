@@ -202,6 +202,17 @@ def test_select_frames_drops_the_upward_row_and_thins_pans():
     assert any(r.tilt_deg == 0 and r.pan_deg == -5 for r in first)
 
 
+def test_select_frames_keeps_the_latest_station_whole_and_thins_the_older_ones():
+    pans = [-30, -15, 0, 15, 30]  # 3 回目の実走の首振り
+    frames = _scan([-15, 0], pans)
+    sts = [Station(Path(str(i)), frames) for i in range(4)]
+    refs = select_frames(sts, 48, old_frames=6)
+    for i in range(3):
+        old = [r for r in refs if r.station == i]
+        assert sorted({r.pan_deg for r in old}) == [-30, 0, 30] and len(old) == 6
+    assert len([r for r in refs if r.station == 3]) == 10  # 最後は全部
+
+
 def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
     """VGGT が見落とした物（白い壁など）を、超音波で格子に足す。"""
     stations, refs, ext, points, conf = _scene()

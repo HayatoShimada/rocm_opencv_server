@@ -141,16 +141,28 @@ def load_station(d: str | Path, scan_file: str = "scan.json") -> Station:
 
 
 def select_frames(
-    stations: list[Station], max_frames: int = MAX_FRAMES, drop_tilt_above: float = 5.0
+    stations: list[Station],
+    max_frames: int = MAX_FRAMES,
+    drop_tilt_above: float = 5.0,
+    old_frames: int | None = None,
 ) -> list[FrameRef]:
     """VGGT に入れるコマを選ぶ。上向き（tilt > drop_tilt_above）の段は床がほとんど写らないので外し、
     それでも 1 ステーションの割り当て（max_frames ÷ ステーション数）を超えれば、パンを
     1 つおき、2 つおき…に間引く。それでも多ければ tilt 0 から遠い段から外す。
     パン 0 に近いコマ（向きを出すのに使う）は残す。
+
+    old_frames を渡すと、最後でないステーションは old_frames コマまで、最後のステーションは
+    残り（max_frames - 前の分）までにする。前のステーションは、位置がもう決まっていて、
+    最後のステーションを同じ座標に置くための手がかりでしかない。見たものも前に残してある
+    （obs.npz）。最後のステーションのコマを減らさず、VGGT に入れるコマを減らせる。
     """
-    budget = max(1, max_frames // max(1, len(stations)))
+    n = max(1, len(stations))
+    budgets = [max(1, max_frames // n)] * n
+    if old_frames is not None:
+        budgets = [old_frames] * (n - 1) + [max(1, max_frames - old_frames * (n - 1))]
     refs: list[FrameRef] = []
     for si, st in enumerate(stations):
+        budget = budgets[si]
         frames = [f for f in st.frames if f["tilt_deg"] <= drop_tilt_above] or list(st.frames)
         rows: dict[int, list[dict]] = {}
         for f in frames:

@@ -77,7 +77,7 @@ from app.roommap import (
     take,
 )
 from app.snoo import _allowed, parse_allow
-from app.snoo_mapper import (  # noqa: F401  WINDOW・REVERSE_SPEED などはここからも使う
+from app.snoo_mapper import (  # noqa: F401  REVERSE_SPEED などはここからも使う
     CLUSTER_STATIONS,
     MAX_FRAMES,
     MAX_RECENT_REVERSES,
@@ -85,7 +85,6 @@ from app.snoo_mapper import (  # noqa: F401  WINDOW・REVERSE_SPEED などはこ
     MAX_STATIONS,
     RECENT_STATIONS,
     REVERSE_SPEED,
-    WINDOW,
     FrameRef,
     History,
     MapParams,
@@ -130,6 +129,17 @@ LIVE_DIR = os.getenv("SNOO_MAP_LIVE_DIR", "/run/snoo/live")
 CU_MASK = os.getenv("SNOO_MAP_CU_MASK", "0:0-71")
 # 1 回の POST の上限。Pi の画像は 640x480 の JPEG で 1 枚 30 KB ほど、1 ステーション 24 枚ほど
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
+# VGGT に入れるのは、最後のステーションの全部のコマ（10 コマ）と、近くの前の WINDOW - 1 か所の
+# OLD_FRAMES コマずつ（パン -30・0・30 × チルト 2 段）。前のステーションは位置がもう決まって
+# いて、見たものも obs.npz に残してあるので、最後のステーションを同じ座標に置く手がかりで足りる。
+# 3 回目の実走の 15 か所を流し直して測った（scripts/snoo_map_replay.py、72 CU、2026-10-29）：
+#   窓 6・等分（36 コマ）：VGGT 6.5 秒、合わせて 7.4 秒（いちばん遅いとき 9.8 秒）
+#   窓 4・前は 6 コマ（28 コマ）：VGGT 4.5 秒、合わせて 5.3 秒（7.8 秒）。位置の差は
+#     窓 6 と比べて中央値 0.5 cm・いちばん大きいとき 11 cm、向き 3° まで
+#   窓 4・前は 2 コマ（16 コマ）：合わせて 3.1 秒だが、1 か所で位置が 24 cm・向きが 12° ずれ、
+#     1 か所は位置合わせが崩れた。使わない
+WINDOW = 4
+OLD_FRAMES: int | None = 6
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGES = 64
 # これより電池の電圧が低ければ探るのをやめる（2 セルのリチウムイオンで、走ると電圧が落ちる）
@@ -425,7 +435,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     """
     ids = station_ids(session)
     poses = read_poses(session)
-    window = choose_window(ids, station_id, poses)
+    window = choose_window(ids, station_id, poses, WINDOW)
     dirs = [station_dir(session, i) for i in window]
     stations = [load_still(d) for d in dirs]
     can = supports(dirs[-1])
@@ -437,7 +447,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         reverse="reverse" in can,
         seed=station_id,
     )
-    refs = select_frames(stations, MAX_FRAMES)
+    refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
     rec = reconstruct(refs, session / "vggt.npz", marks)
 
     t = time.perf_counter()

@@ -36,13 +36,16 @@ def _scene_for(n: int):
 
 
 def fake_reconstruct(refs, npz, marks):
-    """VGGT の代わり。作り物の部屋の点を、サーバーが選んだコマと同じ並びで返す。"""
+    """VGGT の代わり。作り物の部屋の点を、サーバーが選んだコマと同じ並びで返す
+    （前のステーションはコマを間引くので、選んだコマだけ）。
+    """
     n = max(r.station for r in refs) + 1
     _, want, ext, points, conf = _scene_for(n)
-    got = [(r.station, r.pan_deg, r.tilt_deg) for r in refs]
-    assert got == [(w.station, w.pan_deg, w.tilt_deg) for w in want]
+    index = {(w.station, w.pan_deg, w.tilt_deg): i for i, w in enumerate(want)}
+    got = [index[(r.station, r.pan_deg, r.tilt_deg)] for r in refs]
+    assert sorted(set(r.station for r in refs)) == list(range(n))
     marks["vggt"] = 0.0
-    return Recon(ext, points, conf, None)
+    return Recon(ext[got], points[got], conf[got], None)
 
 
 def no_reconstruct(refs, npz, marks):
