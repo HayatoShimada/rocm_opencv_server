@@ -835,6 +835,21 @@ def write_results(
 # --- HTTP ---
 
 
+# 重いファイルを残す、新しいセッションの数
+PRUNE_KEEP = int(os.getenv("SNOO_MAP_PRUNE_KEEP", "5"))
+
+
+def _prune_old(root: Path) -> None:
+    from scripts.snoo_prune import prune
+
+    try:
+        n, freed = prune(root, PRUNE_KEEP)
+        if n:
+            log.info("古いセッションの重いファイルを %d 個消した（%.0f MB）", n, freed / 1e6)
+    except OSError:
+        log.exception("古いセッションを片付けられなかった")
+
+
 def create_app(
     root: Path | str = DATA,
     allow: list | None = None,
@@ -854,6 +869,9 @@ def create_app(
     async def lifespan(_: FastAPI):
         # VGGT は最初のステーションで読む（7 秒ほど。Pi は 25 秒待つ）。起動したときに読むと、
         # Pi が探っていない間も GPU を握り、検出と合わせて GPU が休めない
+        # 古いセッションの重いファイル（recon.npz など）を消す
+        # （scripts/snoo_prune.py。別のスレッドで）
+        threading.Thread(target=_prune_old, args=(root,), daemon=True, name="prune").start()
         yield
 
     app = FastAPI(title="snoo map", lifespan=lifespan)
