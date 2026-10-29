@@ -65,7 +65,8 @@ MAX_FRAMES = 48
 # 次の位置へ走る速さ（Pi の forward の値）。床が見えている所しか走らないが、ゆっくり行く
 SPEED = 12
 # ステーションの数の上限（これ以上は探らない）
-MAX_STATIONS = 30
+# 1 周が 17 秒ほどになり、30 か所では 8 分で止まるので、電池（10〜20 分）に合わせる
+MAX_STATIONS = 50
 # 床・障害物と見る点の、格子 1 マスあたりの最少の数（1 回の撮影で）。
 # VGGT の点は外れ値があるので 1 点では決めない
 MIN_POINTS_PER_CELL = 3
@@ -537,6 +538,54 @@ def session_grid(observations: list[Observation]) -> tuple[Grid, np.ndarray]:
     return grid, high
 
 
+# SLAM（app/snoo_slam.py）の結果を間取りに足すのは、座標合わせのずれがこれより小さいときだけ
+SLAM_MAX_RMSE_M = 0.08
+# SLAM の点のボクセル（3 cm）に、これより少ない点しか入っていなければ使わない（ノイズ）
+SLAM_MIN_COUNT = 2
+
+
+def mark_slam(grid: Grid, high: np.ndarray, slam_dir: Path, params: MapParams) -> dict:
+    """走りながらの SLAM の点と道筋を、セッションの間取りに足す。足したセルの数を返す。
+
+    止まって撮った VGGT だけでは、走った道の両脇と、ステーションの間で見えた所が地図に入らない。
+    SLAM は 4 枚/秒で走りながら見ているので、そこを埋める。高さの分け方は build_map と同じ。
+    state が ok でないとき・座標合わせが崩れているときは足さない（壊れた点で道をふさがない）。
+    """
+    try:
+        status = json.loads((slam_dir / "status.json").read_text())
+        rmse = (status.get("alignment") or {}).get("rmse_m")
+        if status.get("state") != "ok" or rmse is None or rmse > SLAM_MAX_RMSE_M:
+            return {"used": False, "reason": f"state={status.get('state')} rmse={rmse}"}
+        d = np.load(slam_dir / "points.npz")
+        xyz, count = d["xyz"], d["count"]
+    except (OSError, ValueError, KeyError) as e:
+        return {"used": False, "reason": type(e).__name__}
+    xyz = xyz[count >= SLAM_MIN_COUNT]
+    z = xyz[:, 2]
+    top = params.car_height_m + params.obstacle_margin_m
+    floor = xyz[np.abs(z) <= params.floor_tol_m]
+    obst = xyz[(z > params.floor_tol_m) & (z <= top)]
+    above = xyz[z > top]
+    grid.mark_free(floor[:, 0], floor[:, 1])
+    grid.mark_occupied(obst[:, 0], obst[:, 1])
+    hix, hiy = grid.cell(above[:, 0], above[:, 1])
+    ok = grid.inside(hix, hiy)
+    high[hix[ok], hiy[ok]] += 1
+    # 車が通った所（カメラの真下）は床
+    path = []
+    try:
+        for line in (slam_dir / "trajectory.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            path.append((row["x"], row["y"]))
+    except (OSError, ValueError, KeyError):
+        pass
+    if path:
+        xy = np.array(path)
+        grid.mark_free(xy[:, 0], xy[:, 1])
+    return {"used": True, "floor": len(floor), "obstacle": len(obst), "high": len(above),
+            "path": len(path), "rmse_m": rmse}  # fmt: skip
+
+
 def to_frame(anchor: Pose, p: Pose) -> Pose:
     """anchor を原点にした座標の位置を、anchor のある座標に直す（窓 → セッション）。"""
     c, s = math.cos(anchor.yaw), math.sin(anchor.yaw)
@@ -575,6 +624,8 @@ class MapResult:
     # build_map に anchor を渡したときの、ステーションごとに見たもの（セッションの座標）。
     # 位置合わせが崩れたステーションは None
     observations: list[Observation | None] = field(default_factory=list)
+    # 走りながらの SLAM を足したか（mark_slam の答え。地図のサーバーが入れる）
+    slam: dict | None = None
 
 
 def _cells_with(grid: Grid, x: np.ndarray, y: np.ndarray, min_count: int):

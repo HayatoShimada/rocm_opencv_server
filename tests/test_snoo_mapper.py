@@ -294,3 +294,53 @@ def test_decide_turns_instead_of_looping_when_the_target_is_behind():
     assert a["action"] == "move" and a.get("turn") and a["reverse"] is True and plan is None
     a, _ = decide(g, st, MapParams(segments=True, random_p=0.0), [CAM_H])
     assert not a.get("turn")  # reverse を受けない Pi には今までどおり
+
+
+def _slam_dir(tmp_path, state="ok", rmse=0.03):
+    import json as _json
+
+    d = tmp_path / "slam"
+    d.mkdir()
+    (d / "status.json").write_text(_json.dumps({"state": state, "alignment": {"rmse_m": rmse}}))
+    xs = np.arange(0.0, 1.0, 0.03)
+    floor = np.stack([xs, np.zeros_like(xs), np.zeros_like(xs)], 1)
+    wall = np.array([[1.2, 0.0, 0.06], [1.2, 0.03, 0.06]])
+    table = np.array([[0.5, 0.5, 0.6]])
+    xyz = np.concatenate([floor, wall, table]).astype(np.float32)
+    count = np.full(len(xyz), 3)
+    count[-1] = 1  # 点が 1 つだけのボクセルは使わない
+    np.savez(d / "points.npz", xyz=xyz, count=count)
+    (d / "trajectory.jsonl").write_text(_json.dumps({"x": -0.3, "y": 0.0}) + "\n")
+    return d
+
+
+def test_mark_slam_adds_floor_obstacles_and_the_driven_path(tmp_path):
+    from app.roommap import FREE, OCCUPIED, UNKNOWN, Grid
+    from app.snoo_mapper import MapParams, mark_slam
+
+    g = Grid()
+    high = np.zeros_like(g.logodds, np.int32)
+    info = mark_slam(g, high, _slam_dir(tmp_path), MapParams())
+    s = g.state()
+    assert info["used"] and info["obstacle"] == 2
+    assert s[g.cell(0.5, 0.0)] == FREE
+    assert s[g.cell(1.2, 0.0)] == OCCUPIED
+    assert s[g.cell(-0.3, 0.0)] == FREE  # 走った所
+    assert high.sum() == 0  # 点が少ないボクセルは使わない
+    assert s[g.cell(0.5, 1.0)] == UNKNOWN
+
+
+def test_mark_slam_ignores_a_lost_or_misaligned_slam(tmp_path):
+    from app.roommap import Grid
+    from app.snoo_mapper import MapParams, mark_slam
+
+    for state, rmse in (("lost", 0.03), ("ok", 0.2)):
+        g = Grid()
+        sub = tmp_path / f"{state}{rmse}"
+        sub.mkdir()
+        info = mark_slam(g, np.zeros_like(g.logodds, np.int32), _slam_dir(sub, state, rmse),
+                         MapParams())  # fmt: skip
+        assert not info["used"] and not g.logodds.any()
+    assert not mark_slam(Grid(), np.zeros((240, 240), np.int32), tmp_path / "none", MapParams())[
+        "used"
+    ]

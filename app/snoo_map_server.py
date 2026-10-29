@@ -85,14 +85,14 @@ from app.roommap import (
     take,
 )
 from app.snoo import _allowed, parse_allow
-from app.snoo_mapper import (  # noqa: F401  REVERSE_SPEED などはここからも使う
+from app.snoo_mapper import (
     CLUSTER_STATIONS,
     MAX_FRAMES,
-    MAX_RECENT_REVERSES,
-    MAX_REVERSES,
+    MAX_RECENT_REVERSES,  # noqa: F401  REVERSE_SPEED などはここからも使う
+    MAX_REVERSES,  # noqa: F401
     MAX_STATIONS,
     RECENT_STATIONS,
-    REVERSE_SPEED,
+    REVERSE_SPEED,  # noqa: F401
     FrameRef,
     History,
     MapParams,
@@ -104,6 +104,7 @@ from app.snoo_mapper import (  # noqa: F401  REVERSE_SPEED などはここから
     frame_colors,
     load_station,
     load_vggt_model,
+    mark_slam,
     pose_dict,
     registration_is_bad,
     retrace_step,
@@ -456,6 +457,8 @@ def clustered(poses: dict[int, Pose], station_id: int) -> bool:
     return snoo_mapper.clustered(recent)
 
 
+# 走りながらの SLAM（app/snoo_slam.py）の点と道筋を間取りに足すか
+USE_SLAM = os.getenv("SNOO_MAP_USE_SLAM", "1") == "1"
 # VGGT を回している間置いておくファイル。走りながらの SLAM が同じ GPU で重なると、
 # 1 か所に止まるたびに両方が遅れ、Pi の待ち（25 秒）を越えかねない（2026-10-30）
 GPU_BUSY_FILE = os.getenv("SNOO_GPU_BUSY_FILE", "/run/snoo/map_busy")
@@ -527,6 +530,8 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         r.grid, r.high = session_grid(read_observations(session, station_id))
         if params.driven_free:
             mark_steps_driven(r.grid, session, station_id, poses)
+        if USE_SLAM:  # 走りながらの SLAM で見た所も足す（app/snoo_slam.py が書く）
+            r.slam = mark_slam(r.grid, r.high, session / "slam", params)
         r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
         r.step_path = []
         if r.plan is not None:
@@ -738,6 +743,7 @@ def write_results(
     plan["reply"] = reply  # Pi に返したもの（後ろへ戻るときは next と違う）
     plan["window"] = info
     plan["timing_s"] = {k: round(v, 3) for k, v in marks.items()}
+    plan["slam"] = getattr(r, "slam", None)  # 走りながらの SLAM を間取りに足したか
     (tmp / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
     for f in tmp.iterdir():
         f.replace(session / f.name)
