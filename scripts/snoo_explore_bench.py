@@ -12,9 +12,9 @@
 - 決め方：地図のサーバーと同じ（Sim.think）。Pi は segments・reverse を受け、超音波は格子に足す
 - 止めるのは --minutes（実機の時計）か --cycles のどちらか早いほう
 出すのは部屋とくじごとの数と、部屋ごとの平均。covered_m2 は本当の床のうち床と分かった広さ、
-m2_per_min はそれを --minutes で割ったもの（早く止まっても --minutes で割る。止まらずに
-探り続けるほうが良い）、m2_per_m は走った 1 m あたり。
---param name=value で MapParams を変えて試せる（例 --param long_step=true）。
+m2_at_5min は 5 分の時点の広さ、m2_per_min は covered_m2 を --minutes で割ったもの
+（早く止まっても --minutes で割る。止まらずに探り続けるほうが良い）、m2_per_m は走った 1 m あたり。
+--param name=value で MapParams を変えて試せる（例 --param max_step_m=0.6）。
 --window N は地図のサーバーの窓（N か所だけで間取りを作る）をまねる。
 """
 
@@ -27,8 +27,10 @@ from pathlib import Path
 from app.snoo_mapper import MapParams
 from app.snoo_sim import CAM_H_M, REAL_PACE, Sim, room_from_map, synthetic_room
 
-SEEDS = tuple(range(8))
-FIELDS = ("stations", "t_s", "distance_m", "covered_m2", "m2_per_min", "m2_per_m", "bumps")
+SEEDS = tuple(range(16))
+FIELDS = (
+    "stations", "t_s", "distance_m", "m2_at_5min", "covered_m2", "m2_per_min", "m2_per_m", "bumps",
+)  # fmt: skip
 
 
 def _value(text: str):
@@ -63,6 +65,10 @@ def run_one(room, seed: int, args, params: MapParams) -> dict:
     out["cpu_s"] = round(time.perf_counter() - t0, 1)
     out["m2_per_min"] = round(s.covered_m2 / max(s.t_s / 60, args.minutes), 3)
     out["stops"], out["reverses"], out["kinds"] = s.stops, s.reverses, sim.kinds
+    # 5 分の時点（撮り終えた所で数える）。部屋が狭いと 10 分では全部分かってしまい、差が出ない
+    out["m2_at_5min"] = max([c for t, c in sim.timeline if t <= 300] or [0.0])
+    out["timeline"] = sim.timeline
+    out["bump_log"] = sim.bump_log
     return out
 
 
@@ -96,7 +102,12 @@ def main() -> None:
         for seed in args.seeds:
             row = run_one(room, seed, args, params)
             rows.append(row)
-            print(json.dumps({k: row[k] for k in ("room", "seed", *FIELDS, "reason", "kinds")}))
+            print(
+                json.dumps(
+                    {k: row[k] for k in ("room", "seed", *FIELDS, "reason", "kinds", "bump_log")}
+                ),
+                flush=True,
+            )
     means = {}
     for room in rooms:
         mine = [r for r in rows if r["room"] == room.name]

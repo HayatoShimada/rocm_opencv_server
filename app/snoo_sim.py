@@ -838,6 +838,10 @@ class Sim:
         self.arrived_reverse: list[bool] = []  # ステーションごとの、後ろへ戻って着いたか
         self._reversed = False
         self.obs: list[StationObs] = []
+        self.bump_log: list[dict] = []  # ぶつかったときの時刻・後ろへか・1 歩の種類
+        # 撮り終えるごとの (Sim.t, 本当の床のうち床と分かった m²)
+        self.timeline: list[tuple[float, float]] = []
+        self._truth: np.ndarray | None = None
         self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
@@ -1083,6 +1087,10 @@ class Sim:
         self.arrived_reverse.append(self._reversed)
         self._reversed = False
         self.rebuild_map()
+        if self._truth is None:
+            self._truth = self.truth_floor()
+        covered = float(((self.grid.state() == FREE) & self._truth).sum() * self.grid.res**2)
+        self.timeline.append((round(self.t, 1), round(covered, 3)))
         return st
 
     def rebuild_map(self) -> None:
@@ -1248,6 +1256,18 @@ class Sim:
             if rect_hits(footprint(nx, ny, nyaw), obst):
                 result = "bump"
                 self.bumps += 1
+                a = self.action
+                kind = (
+                    "turn"
+                    if a.get("turn")
+                    else "reverse"
+                    if a.get("reverse")
+                    else ("random" if a.get("random") else "nbv")
+                )
+                cat = rect_hits(footprint(nx, ny, nyaw), snoo_aabb(self.snoo.pose))
+                self.bump_log.append(
+                    {"t": round(self.t, 1), "reverse": reverse, "kind": kind, "snoo": cat}
+                )
                 break
             c.x, c.y, c.yaw = nx, ny, nyaw
             c.wheel_rad += sign * ds / WHEEL_R_M
