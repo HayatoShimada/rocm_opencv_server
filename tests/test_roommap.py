@@ -406,3 +406,29 @@ def test_plan_turn_faces_a_target_behind_with_a_turning_reverse():
     gx, gy = np.meshgrid(xs, xs)
     wall.mark_occupied(gx.ravel(), gy.ravel())
     assert plan_turn(wall, Pose(0.6, 0.6, 0), behind) is None
+
+
+def test_random_and_first_steps_keep_the_real_car_off_obstacles():
+    """Pi は後ろの車軸を中心に曲がる。カメラの真下から引いた弧では車体が障害物に入っていた。"""
+    from app.roommap import blocked_cells, first_step, random_step
+
+    g, _ = _open_floor()
+    for _ in range(3):
+        g.mark_occupied(np.array([0.0]), np.array([0.45]))  # 左前の 1 セル
+    pose = Pose(0.0, 0.0, 0.0)
+    blocked = blocked_cells(g, g.state(), pose)
+
+    def hits(steer, run):
+        for _, r in drive_poses(pose, [(steer, run)])[1:]:
+            c = g.cell(r.x + CAR_CENTER_M * math.cos(r.yaw), r.y + CAR_CENTER_M * math.sin(r.yaw))
+            if blocked[c]:
+                return True
+        return False
+
+    rng = np.random.default_rng(0)
+    for _ in range(30):
+        step = random_step(g, pose, rng)
+        assert step is not None and not hits(*step)
+    path = sample_path(pose, "L", (math.pi / 2,), r=0.26)  # 左へいっぱいに曲がる道
+    steer, run = first_step(g, blocked, pose, path, 0.4)
+    assert run == 0 or not hits(steer, run)
