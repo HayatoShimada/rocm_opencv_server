@@ -181,6 +181,14 @@ class Recorder:
             "size": [frame.width, frame.height],
             "dets": dets,
         }
+        if frame.steer_deg is not None:  # 版 2 のヘッダーなら、撮った時刻の指令も残す
+            line["cmd"] = {
+                "steer_deg": round(frame.steer_deg, 2),
+                "speed": round(frame.speed, 2),
+                "pan_deg": round(frame.pan_deg, 2),
+                "tilt_deg": round(frame.tilt_deg, 2),
+                "flags": frame.flags,
+            }
         with index.open("a") as f:
             f.write(json.dumps(line) + "\n")
         if clip.frames == 0:

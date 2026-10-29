@@ -60,3 +60,15 @@ def test_does_not_start_a_clip_when_the_disk_is_full(tmp_path):
     rec.offer(("10.0.0.1", 1), _frame(1), CAT)
     rec.flush()
     assert _clips(tmp_path) == []
+
+
+def test_keeps_the_v2_commands_with_each_frame(tmp_path):
+    rec = Recorder(tmp_path, min_free_gb=0)
+    frame = Frame(5, 5000, 640, 480, b"\xff\xd8", -10.0, 15.0, 5.0, -15.0, 1)
+    rec.offer(("10.0.0.1", 1), frame, CAT)
+    rec.flush()
+    (clip,) = _clips(tmp_path)
+    (line,) = [json.loads(x) for x in (clip / "frames.jsonl").read_text().splitlines()]
+    assert line["cmd"] == {
+        "steer_deg": -10.0, "speed": 15.0, "pan_deg": 5.0, "tilt_deg": -15.0, "flags": 1
+    }  # fmt: skip
