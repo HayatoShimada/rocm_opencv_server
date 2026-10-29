@@ -25,6 +25,7 @@ import socket
 import statistics
 import struct
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 
 import cv2
@@ -173,6 +174,40 @@ class SnooScorer:
         return self.torch.sigmoid((s - self.mid) * self.gain).cpu().tolist()
 
 
+class Stages:
+    """1 フレームの区間（受信・デコード・検出・CLIP・送信）ごとの時間を集め、p50・p95 を出す。
+
+    検出と CLIP は結果を CPU に移す所で GPU を待つので、その直後に区切れば GPU の時間も入る。
+    """
+
+    ORDER = ("受信", "デコード", "検出", "CLIP", "送信")
+
+    def __init__(self):
+        self.samples: dict[str, list[float]] = defaultdict(list)
+        self._t: float | None = None
+
+    def start(self) -> None:
+        self._t = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        if self._t is None:
+            return
+        now = time.perf_counter()
+        self.samples[name].append((now - self._t) * 1000)
+        self._t = now
+
+    def summary(self) -> str:
+        """「区間 p50/p95 ms」を ORDER の順に並べた 1 行。集めた値は消す。"""
+        parts = []
+        for name in self.ORDER:
+            v = sorted(self.samples.get(name, []))
+            if v:
+                p95 = v[max(0, -(-95 * len(v) // 100) - 1)]  # 小さい順に 95% の所（切り上げ）
+                parts.append(f"{name} {statistics.median(v):.2f}/{p95:.2f}")
+        self.samples.clear()
+        return "  ".join(parts)
+
+
 def _iou(a, b) -> float:
     w = min(a[2], b[2]) - max(a[0], b[0])
     h = min(a[3], b[3]) - max(a[1], b[1])
@@ -235,19 +270,26 @@ class CatDetector:
         for _ in range(3 if compile else 1):
             self.detect(np.zeros((480, 640, 3), np.uint8))
 
-    def detect(self, image: np.ndarray, memory: SnooMemory | None = None) -> list[Detection]:
+    def detect(
+        self, image: np.ndarray, memory: SnooMemory | None = None, stages: Stages | None = None
+    ) -> list[Detection]:
         """BGR の画像から猫を探す。確からしさの高い順に返す。
 
         memory を渡すと、前のフレームと重なる箱は snoo らしさを使い回す。
+        stages を渡すと、検出（GPU に載せるところから）と CLIP の時間を記録する。
         """
         x = to_tensor(image, self.device, self.dtype)
         dets = self.detect_tensor(x)
+        if stages is not None:
+            stages.mark("検出")
         if self.scorer:
             todo = memory.reuse(dets) if memory is not None else list(range(len(dets)))
             for i, s in zip(todo, self.scorer.score(x, [dets[i].box for i in todo]), strict=True):
                 dets[i].snoo = s
             if memory is not None:
                 memory.remember(dets, todo)
+            if stages is not None:
+                stages.mark("CLIP")
         return dets
 
     def detect_tensor(self, x) -> list[Detection]:
@@ -298,17 +340,21 @@ def _bind(host: str, port: int) -> socket.socket:
             time.sleep(5)
 
 
-def serve(host: str, port: int, detector: CatDetector) -> None:
+def serve(host: str, port: int, detector: CatDetector, stages: Stages | None = None) -> None:
     sock = _bind(host, port)
     log.info("%s:%d/udp で待ち受け（%s）", host, port, detector.device)
     times: list[float] = []
     memories: dict[tuple, SnooMemory] = {}
+    stages = Stages() if stages is None else stages
     last_report = time.monotonic()
     while True:
         first = sock.recvfrom(65535)
         t0 = time.perf_counter()
+        stages.start()
         latest = _latest_per_sender(sock, first)
+        stages.mark("受信")
         for addr, data in latest.items():
+            stages.start()  # フレームごとに測り始める（前のフレームの失敗の分を持ち込まない）
             try:
                 frame = parse_frame(data)
             except FrameError as e:
@@ -316,21 +362,28 @@ def serve(host: str, port: int, detector: CatDetector) -> None:
                 continue
             try:
                 memory = memories.setdefault(addr, SnooMemory())
-                dets = detector.detect(decode_jpeg(frame.jpeg), memory)
+                image = decode_jpeg(frame.jpeg)
+                stages.mark("デコード")
+                dets = detector.detect(image, memory, stages)
             except FrameError as e:
                 log.warning("%s の seq=%d: %s", addr, frame.seq, e)
                 dets = []
+                stages.start()  # 読めなかった分は「送信」に入れない
             infer_ms = (time.perf_counter() - t0) * 1000
             sock.sendto(encode_reply(frame, dets, infer_ms), addr)
+            stages.mark("送信")
             times.append(infer_ms)
         now = time.monotonic()
         if now - last_report >= 10:
+            # 返事が無かった間も区間は消す（次の報告に古い値を混ぜない）
+            summary = stages.summary()
             if times:
                 log.info(
-                    "%.1f fps、受けてから返すまで 中央値 %.1f ms・最大 %.1f ms",
+                    "%.1f fps、受けてから返すまで 中央値 %.1f ms・最大 %.1f ms｜p50/p95 ms: %s",
                     len(times) / (now - last_report),
                     statistics.median(times),
                     max(times),
+                    summary,
                 )
             times.clear()
             last_report = now
