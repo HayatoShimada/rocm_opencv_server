@@ -57,7 +57,9 @@ services:
       SNOO_COMPILE: "${SNOO_COMPILE:-1}"
       # フレームを処理している間 1 秒ごとに触る。ホストの deploy/snoo-gpu-perf.sh がこれを見て、
       # 検出が動いている間だけ GPU の時計を上げる（止まれば 3 秒で auto に戻す）
-      SNOO_ACTIVE_FILE: /run/snoo/active
+      # 消費電力を抑えるため、既定では合図を出さず GPU の時計は auto のまま（2026-10-29、遅れより電力）。
+      # 時計を上げたいときは SNOO_ACTIVE_FILE=/run/snoo/active にする
+      SNOO_ACTIVE_FILE: "${SNOO_ACTIVE_FILE-}"
       # 猫が写っている間のフレームを学習用に保存する（app/snoo_record.py。10 枚/秒まで）
       SNOO_RECORD_DIR: /app/data/snoo_rec
       SNOO_RECORD_FPS: "${SNOO_RECORD_FPS:-10}"
