@@ -117,7 +117,9 @@ DEFAULT_CAMERA_HEIGHT_CM = 8.0
 MIN_ULTRASONIC_CM = 2.0
 # 行き場が無いときに来た道を戻るのは、続けてこの回数まで
 MAX_REVERSES = 2
-REVERSE_SPEED = 12
+# 後ろにはセンサーが無く、シミュレーターでは後ろに来た snoo に当たることがあった。
+# 当たっても弱くなるよう、前（12）より遅く戻る（約 14 cm/s）
+REVERSE_SPEED = 8
 # Pi の speed 1 あたりの速さ（cm/s）。1 回目の実走の VGGT の位置から測った（speed 12 で約 20 cm/s）
 PI_CM_PER_S_PER_SPEED = 1.7
 

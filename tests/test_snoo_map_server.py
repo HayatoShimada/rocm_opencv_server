@@ -15,6 +15,7 @@ from test_snoo_mapper import PANS, STATIONS, TILTS, _scene
 from app.roommap import Pose
 from app.snoo import parse_allow
 from app.snoo_map_server import (
+    REVERSE_SPEED,
     Recon,
     backtrack,
     choose_window,
@@ -346,7 +347,7 @@ def _stuck_session(tmp_path, supports):
 def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, stuck):
     a = _stuck_session(tmp_path, ["reverse", "segments"])
     assert a["action"] == "move" and a["reverse"] is True
-    assert a["steer_deg"] == -8.9 and a["speed"] == 12
+    assert a["steer_deg"] == -8.9 and a["speed"] == REVERSE_SPEED
     assert a["distance_cm"] == 30.0  # min(30, VGGT で測った 31 cm)。Pi の見積もり 18 cm ではない
     assert a["segments"] == [{"steer_deg": -8.9, "distance_cm": 30.0}]
     # 戻った先は 1 か所目の近く
