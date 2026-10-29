@@ -3,9 +3,10 @@
   python -m scripts.snoo_replay <セッションの名前か置き場> [--out <出力先>]
   make replay SESSION=explore_20261029_223944
 
-地図のサーバー（app/snoo_map_server.py）はステーションごとに、VGGT の出力をセッションの
-vggt.npz に上書きする。そのため決め直せるのは、vggt.npz を作ったステーション（ふつうは最後）の
-1 歩だけ。VGGT の代わりにその vggt.npz を読み、サーバーと同じ plan_station を通す。
+--station N を渡すと、そのステーションの recon.npz（地図のサーバーがステーションごとに残す
+VGGT の点）を使って、どのステーションの 1 歩でも決め直す。前の返事はそのステーションの reply.json。
+渡さなければ、セッションの vggt.npz（毎回上書きされるので、作ったステーション＝ふつうは最後
+だけ）を使う。VGGT の代わりにそれを読み、サーバーと同じ plan_station を通す。
 
 もとのセッションには書かない。ステーションの画像と meta.json を出力先（既定は
 /tmp/snoo-replay/<セッション>）に写し、poses.json・reverse.json はそのステーションより前の分だけに
@@ -22,7 +23,9 @@ from pathlib import Path
 
 from app.snoo_map_server import (
     DATA,
+    RECON_FILE,
     Recon,
+    load_recon,
     plan_station,
     station_dir,
     station_ids,
@@ -76,6 +79,22 @@ def npz_reconstruct(v: VggtOut):
     return reconstruct
 
 
+def recon_reconstruct(keys: list[str], recon: Recon):
+    """ステーションの recon.npz を返す VGGT の代わり。
+
+    選んだコマが残したときと違えば決め直せない。
+    """
+
+    def reconstruct(refs, npz, marks):
+        now = [f"{Path(r.path).parent.name}/{Path(r.path).name}" for r in refs]
+        if now != keys:
+            raise ReplayError("コマの選び方が recon.npz を残したときと違う（決め直せない）")
+        marks["vggt"] = 0.0
+        return recon
+
+    return reconstruct
+
+
 def _cut(src: Path, dst: Path, before: int) -> None:
     """station_id の書いてある JSON（poses.json・reverse.json）を、before より前の分だけ写す。"""
     if not src.exists():
@@ -115,8 +134,23 @@ def same_reply(a: dict, b: dict) -> bool:
     }
 
 
-def replay(session: Path, out: Path) -> tuple[int, dict, dict | None, dict]:
+def replay(
+    session: Path, out: Path, station: int | None = None
+) -> tuple[int, dict, dict | None, dict]:
     """(ステーション, 決め直した返事, 前の返事, 時間)。"""
+    if station is not None:
+        path = station_dir(session, station) / RECON_FILE
+        if not path.exists():
+            raise ReplayError(f"{path} が無い（recon.npz を残す前の版で受けたステーション）")
+        keys, recon = load_recon(path)
+        prepare(session, out, station)
+        marks: dict = {}
+        t = time.perf_counter()
+        reply = plan_station(out, station, recon_reconstruct(keys, recon), marks)
+        marks["total"] = time.perf_counter() - t
+        before_path = station_dir(session, station) / "reply.json"
+        before = json.loads(before_path.read_text()) if before_path.exists() else None
+        return station, reply, before, marks
     npz = session / "vggt.npz"
     if not npz.exists():
         raise ReplayError(f"{npz} が無い（VGGT を回したステーションが無い）")
@@ -144,12 +178,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("session", help="セッションの名前（SNOO_MAP_DATA の下）か置き場")
     parser.add_argument("--out", type=Path, help="既定は /tmp/snoo-replay/<セッション>")
+    parser.add_argument("--station", type=int, help="このステーションの recon.npz で決め直す")
     parser.add_argument("--allow-diff", action="store_true", help="前の返事と違っても 0 で終わる")
     args = parser.parse_args()
     try:
         session = resolve(args.session)
         out = args.out or Path("/tmp/snoo-replay") / session.name
-        station, reply, before, marks = replay(session, out)
+        station, reply, before, marks = replay(session, out, args.station)
     except ReplayError as e:
         print(e)
         sys.exit(2)
@@ -157,7 +192,7 @@ def main() -> None:
     print("秒: " + " ".join(f"{k} {v:.2f}" for k, v in marks.items()))
     print("今の返事: " + json.dumps(reply, ensure_ascii=False))
     if before is None:
-        print("前の返事: plan.json に無い（比べない）")
+        print("前の返事: 残っていない（比べない）")
         return
     print("前の返事: " + json.dumps(before, ensure_ascii=False))
     same = same_reply(reply, before)

@@ -448,6 +448,37 @@ class VggtReconstruct:
         return Recon(v.extrinsic, points, conf, colors)
 
 
+# ステーションごとに残す VGGT の点（scripts/snoo_replay.py がどのステーションでも決め直すため）。
+# セッションの vggt.npz は毎回上書きされ、最後のステーションしか決め直せなかった。
+# 深度の全部（56 MB）ではなく、build_map に渡す点だけを残す。半精度にすると、次の 1 歩の
+# 候補の点数が僅差のときに選ぶものが変わり、同じ返事にならなかったので float32 のまま
+RECON_FILE = "recon.npz"
+
+
+def save_recon(path: Path, refs: list[FrameRef], rec: Recon) -> None:
+    """refs の並びと、その VGGT の点を残す。書けなくても止めない。"""
+    try:
+        np.savez_compressed(
+            path,
+            keys=np.array([f"{Path(r.path).parent.name}/{Path(r.path).name}" for r in refs]),
+            extrinsic=rec.extrinsic.astype(np.float32),
+            points=rec.points.astype(np.float32),
+            conf=rec.conf.astype(np.float32),
+            colors=np.zeros((0,), np.uint8) if rec.colors is None else rec.colors,
+        )
+    except OSError as e:
+        log.warning("%s を書けない: %s", path, e)
+
+
+def load_recon(path: Path) -> tuple[list[str], Recon]:
+    d = np.load(path)
+    colors = d["colors"] if d["colors"].size else None
+    recon = Recon(
+        d["extrinsic"], d["points"].astype(np.float32), d["conf"].astype(np.float32), colors
+    )
+    return [str(k) for k in d["keys"]], recon
+
+
 # --- 1 ステーションを処理する ---
 
 
@@ -506,6 +537,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
     with gpu_busy():  # SLAM（app/snoo_slam.py）は、この間サブマップを回さずに待つ
         rec = reconstruct(refs, session / "vggt.npz", marks)
+    save_recon(station_dir(session, station_id) / RECON_FILE, refs, rec)
 
     t = time.perf_counter()
     # 窓の原点（いちばん古いステーション）の位置。最初のステーションなら (0, 0, 0)
@@ -565,6 +597,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         # bad_registration:<名前> の名前は Pi には要らない（plan.json には残す）
         action = {"action": "done", "reason": action["reason"].split(":")[0]}
     write_results(session, r, window, anchor, raw, marks, action)
+    (station_dir(session, station_id) / "reply.json").write_text(json.dumps(action))
     marks["write"] = time.perf_counter() - t
     return action
 
