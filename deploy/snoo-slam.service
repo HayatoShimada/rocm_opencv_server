@@ -1,0 +1,34 @@
+# 走っている間の SLAM（app/snoo_slam.py、VGGT-SLAM 2.0）を systemd のユーザーのサービスで動かす。
+# 検出サーバー（Docker の snoo）が /run/snoo/slam に書くフレーム（SNOO_SLAM_TAP_DIR）と、
+# 地図のサーバーが残すステーションを読み、<セッション>/slam/ に位置と点を書く。
+# torch・gtsam・vggt_slam は別の venv（deploy/snoo-slam-venv.sh で作る）にある。
+# 入れ方（sudo は要らない）:
+#   deploy/snoo-slam-venv.sh
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/orca/rocm_opencv_server/deploy/snoo-slam.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now snoo-slam
+#   journalctl --user -u snoo-slam -f
+[Unit]
+Description=snoo の走っている間の SLAM（VGGT-SLAM 2.0）
+After=snoo-map.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/orca/rocm_opencv_server
+ExecStart=%h/orca/vggt-slam-venv/bin/python -m app.snoo_slam
+# 検出（Docker の snoo）のために 96 CU のうち 72 CU にする（地図のサーバーと同じ）
+Environment=HSA_CU_MASK=0:0-71
+Environment=PYTHONUNBUFFERED=1
+# VGGT の重みは ~/.cache/huggingface、SALAD・DINOv2 は ~/.cache/torch/hub にある
+Environment=HF_HUB_OFFLINE=1
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True は付けない（ROCm 10 で最初の VGGT の出力に
+# nan が混ざった）
+# サブマップの大きさ・ループを閉じるかなどは ~/.config/snoo-slam.env に書く
+# （SNOO_SLAM_SUBMAP_SIZE=8、SNOO_SLAM_LOOP=0 など）
+EnvironmentFile=-%h/.config/snoo-slam.env
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
