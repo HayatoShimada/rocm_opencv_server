@@ -504,3 +504,18 @@ def test_resending_the_same_station_does_not_break_the_first(tmp_path):
     for t in ts:
         t.join()
     assert out == [200, 200, 200]
+
+
+def test_read_meta_rereads_when_the_station_is_resent(tmp_path):
+    import os as _os
+
+    from app.snoo_map_server import read_meta
+
+    d = tmp_path / "000"
+    d.mkdir()
+    (d / "meta.json").write_text(json.dumps({"battery_v": 7.8}))
+    assert read_meta(d)["battery_v"] == 7.8
+    (d / "meta.json").write_text(json.dumps({"battery_v": 7.25}))
+    st = (d / "meta.json").stat()
+    _os.utime(d / "meta.json", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert read_meta(d)["battery_v"] == 7.25
