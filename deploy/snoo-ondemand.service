@@ -1,0 +1,17 @@
+# 85pi4 が起きている間だけ、snoo の検出と地図のサーバーを動かす（scripts/snoo_ondemand.sh）。
+#   ln -sf ~/orca/rocm_opencv_server/deploy/snoo-ondemand.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now snoo-ondemand
+# 止まり方を変えるときは ~/.config/snoo-ondemand.env に SNOO_IDLE_S=600 などを書く。
+[Unit]
+Description=snoo の検出と地図のサーバーを、85pi4 が起きている間だけ動かす
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/orca/rocm_opencv_server
+EnvironmentFile=-%h/.config/snoo-ondemand.env
+ExecStart=%h/orca/rocm_opencv_server/scripts/snoo_ondemand.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
