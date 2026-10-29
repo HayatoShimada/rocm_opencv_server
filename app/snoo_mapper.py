@@ -45,6 +45,7 @@ from app.roommap import (
     frontiers,
     mark_sonar,
     next_best_view,
+    random_step,
 )
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
@@ -89,6 +90,11 @@ class MapParams:
     # 1 歩を「曲がる → まっすぐ」の区間（segments）で返す。Pi が meta の supports に
     # "segments" を書いたときだけ（古い Pi は 1 本の弧しか走れない）
     segments: bool = False
+    # 次の 1 歩を、この割合ででたらめな 1 歩にする（ルンバのように行き詰まりから抜け出す）
+    random_p: float = 0.15
+    # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
+    force_random: bool = False
+    seed: int = 0
 
 
 @dataclass
@@ -625,9 +631,27 @@ def decide(
     pose = stations[-1].pose
     if not frontiers(grid.state()).any():
         return {"action": "done", "reason": "no_frontier"}, None
-    plan = next_best_view(grid, pose, segments=params.segments)
-    if plan is None:  # 境目はあるが、見えている床を通って行ける所が無い
-        return {"action": "done", "reason": "unreachable"}, None
+    rng = np.random.default_rng(params.seed)
+    plan = None
+    if not params.force_random and rng.random() >= params.random_p:
+        plan = next_best_view(grid, pose, segments=params.segments)
+    if plan is None:
+        # 行き詰まった・同じ所に固まった・ときどき：でたらめな 1 歩
+        step = random_step(grid, pose, rng)
+        if step is None:  # 境目はあるが、見えている床を通って行ける所が無い
+            return {"action": "done", "reason": "unreachable"}, None
+        steer, run = step
+        action = {
+            "action": "move",
+            "steer_deg": round(steer, 1),
+            "speed": SPEED,
+            "distance_cm": round(run * 100, 1),
+            "pose": pose_dict(pose),
+            "random": True,
+        }
+        if params.segments:
+            action["segments"] = segments_json([(steer, run)])
+        return action, None
     action = {
         "action": "move",
         "steer_deg": round(plan.steer_deg, 1),

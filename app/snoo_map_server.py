@@ -117,6 +117,10 @@ DEFAULT_CAMERA_HEIGHT_CM = 8.0
 MIN_ULTRASONIC_CM = 2.0
 # 行き場が無いときに来た道を戻るのは、続けてこの回数まで
 MAX_REVERSES = 2
+# 間に前へ走っても、直近 RECENT_STATIONS か所で戻るのはこの回数まで。戻る → 前へ → 戻るを
+# 繰り返して同じ所を回り続けないため（シミュレーターで周の多くを使った）
+MAX_RECENT_REVERSES = 3
+RECENT_STATIONS = 6
 # 後ろにはセンサーが無く、シミュレーターでは後ろに来た snoo に当たることがあった。
 # 当たっても弱くなるよう、前（12）より遅く戻る（約 14 cm/s）
 REVERSE_SPEED = 8
@@ -399,6 +403,21 @@ class VggtReconstruct:
 # --- 1 ステーションを処理する ---
 
 
+# 直近 CLUSTER_STATIONS か所が、この半径に固まっていたら、でたらめな 1 歩で抜け出す
+CLUSTER_STATIONS = 4
+CLUSTER_RADIUS_M = 0.30
+
+
+def clustered(poses: dict[int, Pose], station_id: int) -> bool:
+    """直近のステーションが狭い所に固まっているか（同じ所を回り続けている）。"""
+    recent = [poses[i] for i in range(station_id - CLUSTER_STATIONS, station_id) if i in poses]
+    if len(recent) < CLUSTER_STATIONS:
+        return False
+    cx = sum(p.x for p in recent) / len(recent)
+    cy = sum(p.y for p in recent) / len(recent)
+    return all(math.hypot(p.x - cx, p.y - cy) <= CLUSTER_RADIUS_M for p in recent)
+
+
 def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
     """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。"""
     ids = station_ids(session)
@@ -411,6 +430,8 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         camera_height_m=[camera_height_m(d) for d in dirs],
         ultrasonic_cm=[ultrasonic_cm(d) for d in dirs],
         segments="segments" in can,
+        force_random=clustered(poses, station_id),
+        seed=station_id,
     )
     refs = select_frames(stations, MAX_FRAMES)
     rec = reconstruct(refs, session / "vggt.npz", marks)
@@ -446,7 +467,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         if here is None:  # 位置合わせが崩れていれば decide が done にするので、ふつうは来ない
             here = to_session(anchor, r.stations[-1].pose)
         action["pose"] = pose_dict(here)
-        if not action.get("reverse"):
+        if not action.get("reverse") and r.plan is not None:  # でたらめな 1 歩には目標が無い
             action["target"] = pose_dict(to_session(anchor, r.plan.target))
         action["station_index"] = ids.index(station_id)
         action["map_url"] = f"/v1/snoo/map/{session.name}/topdown.png"
@@ -554,10 +575,23 @@ def backtrack(
     segments を受けない Pi には、最後に走った区間の 1 本だけを返す。
     """
     trail, backs = driven_trail(session, station_id, poses)
-    if backs >= MAX_REVERSES:
+    if backs >= MAX_REVERSES or recent_reverses(session, station_id) >= MAX_RECENT_REVERSES:
         return []
     pieces = retrace(trail, REVERSE_MAX_M, MAX_SEGMENTS if segments else 1)
     return pieces if sum(m for _, m in pieces) >= MIN_STEP_M else []
+
+
+def recent_reverses(session: Path, station_id: int) -> int:
+    """直近 RECENT_STATIONS か所（station_id まで）のうち、後ろへ戻って着いたステーションの数。"""
+    sent = read_reverses(session)
+    count = 0
+    for i in station_ids(session):
+        if station_id - RECENT_STATIONS < i <= station_id:
+            prev = json.loads((station_dir(session, i) / "meta.json").read_text()).get("prev_step")
+            if isinstance(prev, dict):
+                reverse = prev.get("reverse")
+                count += bool(reverse) if reverse is not None else (i - 1) in sent
+    return count
 
 
 def reverse_action(pieces: list[tuple[float, float]], segments: bool) -> dict:
@@ -677,7 +711,8 @@ def create_app(
         marks = {"save": time.perf_counter() - t0}
 
         battery = m.get("battery_v")
-        if battery is not None and battery < LOW_BATTERY_V:
+        # 0 V 以下は読めなかった（2 回目の実走の最後で 0.0 が来た）ので、電池切れにしない
+        if battery is not None and 0 < battery < LOW_BATTERY_V:
             log.info("%s/%03d: 電池が %.2f V なのでやめる", session.name, sid, battery)
             return {"action": "done", "reason": "low_battery"}
         if len(station_ids(session)) >= MAX_STATIONS:

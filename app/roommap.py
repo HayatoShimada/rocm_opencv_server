@@ -49,6 +49,8 @@ VIEW_RANGE_M = 2.0
 DISTANCE_SCALE_M = 1.5
 # 1 回に走る長さの上限
 MAX_STEP_M = 0.40
+# でたらめな 1 歩の長さの下限
+MIN_RANDOM_STEP_M = 0.20
 # 1 歩の向きは、経路のこの距離だけ先の点を目指して決める（pure pursuit）
 LOOKAHEAD_M = 0.30
 # 1 回の観測で足す log-odds。障害物は強く、床は弱く数える（同じセルに両方あれば障害物になる。
@@ -326,6 +328,59 @@ class Plan:
     segments: list[tuple[float, float]] = field(default_factory=list)
 
 
+# 1 歩先までの道で曲がる角度の合計の上限。これより大きいのは、その場で輪を描く道
+MAX_TURN_RAD = 1.25 * math.pi
+
+
+def turning(route: tuple) -> float:
+    """Dubins 経路で曲がる角度の合計（rad）。曲がりの区間は r で割った長さ＝角度。"""
+    _, kind, segs = route
+    return sum(seg for c, seg in zip(kind, segs, strict=True) if c != "S")
+
+
+def blocked_cells(grid: Grid, state: np.ndarray, pose: Pose) -> np.ndarray:
+    """車の中心が入れないセル：車の大きさ分を広げた障害物と、床が見えていない所。"""
+    occupied = state == OCCUPIED
+    inflated = inflate(occupied, int(math.ceil(CAR_RADIUS_M / grid.res)))
+    blocked = inflated | (state != FREE)
+    # いま居るセルの周りは撮ったときに足元が写らないので、見ていなくても走れることにする。
+    # ただし障害物から車の大きさ分の所は残す（壁際の足元から壁へ進まないように）
+    ix0, iy0 = grid.cell(pose.x, pose.y)
+    r0 = int(math.ceil(CAR_RADIUS_M / grid.res))
+    near = (slice(max(ix0 - r0, 0), ix0 + r0 + 1), slice(max(iy0 - r0, 0), iy0 + r0 + 1))
+    blocked[near] = inflated[near]
+    return blocked
+
+
+def random_step(grid: Grid, pose: Pose, rng, tries: int = 40) -> tuple[float, float] | None:
+    """床が見えている所に収まる、ハンドル角と長さがでたらめな 1 歩（ハンドル°、m）。
+
+    次に撮る位置の選び方は、同じ所で行き詰まったり、同じ所を回り続けたりする（2 回目の実走で
+    15 か所が半径 30 cm に固まった）。ルンバのように、ときどきでたらめに動いて抜け出す。
+    ぶつからない弧のうち、着いた所から新しく見えそうなセルが多いものを選ぶ。
+    """
+    state = grid.state()
+    blocked = blocked_cells(grid, state, pose)
+    max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
+    best, best_gain = None, -1
+    for _ in range(tries):
+        steer = float(rng.uniform(-max_steer, max_steer))
+        run = float(rng.uniform(MIN_RANDOM_STEP_M, MAX_STEP_M))
+        k = -math.tan(math.radians(steer)) / WHEELBASE_M  # 左が +
+        if abs(k) < 1e-3:
+            arc = sample_path(pose, "S", (run,), r=1.0)
+        else:
+            arc = sample_path(pose, "L" if k > 0 else "R", (run * abs(k),), r=1 / abs(k))
+        if any(
+            not grid.inside(*grid.cell(p.x, p.y)) or blocked[grid.cell(p.x, p.y)] for p in arc[1:]
+        ):
+            continue
+        gain = view_gain(grid, state, arc[-1], rays=21)
+        if gain > best_gain:
+            best, best_gain = (steer, run), gain
+    return best
+
+
 def next_best_view(
     grid: Grid, pose: Pose, candidates_max: int = 400, rng=None, segments: bool = False
 ) -> Plan | None:
@@ -336,15 +391,7 @@ def next_best_view(
     """
     rng = rng or np.random.default_rng(0)
     state = grid.state()
-    occupied = state == OCCUPIED
-    # 車の中心が入れない所：広げた障害物と、床が見えていない所
-    blocked = inflate(occupied, int(math.ceil(CAR_RADIUS_M / grid.res))) | (state != FREE)
-    # いま居るセルの周りは撮ったときに足元が写らないので、走れることにする
-    ix0, iy0 = grid.cell(pose.x, pose.y)
-    r0 = int(math.ceil(CAR_RADIUS_M / grid.res))
-    blocked[max(ix0 - r0, 0) : ix0 + r0 + 1, max(iy0 - r0, 0) : iy0 + r0 + 1] &= occupied[
-        max(ix0 - r0, 0) : ix0 + r0 + 1, max(iy0 - r0, 0) : iy0 + r0 + 1
-    ]
+    blocked = blocked_cells(grid, state, pose)
     front = np.argwhere(frontiers(state))
     if not len(front):
         return None
@@ -367,18 +414,23 @@ def next_best_view(
     best_utility = 0.0
     for i in idx:
         x, y = float(cx[i]), float(cy[i])
-        # 向きは、いちばん近い境目のほうを向く
+        # 向きは、いちばん近い境目のほうを基本に、その左右 60° も試す（首を振れば見える）。
+        # 決めた向きにぴったり着こうとすると、Dubins 経路がその場で一周する輪になり、
+        # 少し進んでは撮り直すのを繰り返す（2 回目の実走の 15 か所）
         j = int(np.argmin((fx - x) ** 2 + (fy - y) ** 2))
-        yaw = math.atan2(fy[j] - y, fx[j] - x)
-        target = Pose(x, y, yaw)
-        gain = view_gain(grid, state, target)
-        if gain == 0:
+        face = math.atan2(fy[j] - y, fx[j] - x)
+        options = []
+        for yaw in (face, face - math.pi / 3, face + math.pi / 3):
+            target = Pose(x, y, yaw)
+            gain = view_gain(grid, state, target)
+            route = dubins(pose, target) if gain else None
+            if route is None or turning(route) > MAX_TURN_RAD:
+                continue
+            options.append((gain * math.exp(-route[0] / DISTANCE_SCALE_M), target, gain, route))
+        if not options:
             continue
-        route = dubins(pose, target)
-        if route is None:
-            continue
+        utility, target, gain, route = max(options, key=lambda o: o[0])
         length, kind, segs = route
-        utility = gain * math.exp(-length / DISTANCE_SCALE_M)
         if utility <= best_utility:
             continue
         path = sample_path(pose, kind, segs)

@@ -259,3 +259,31 @@ def test_reversing_with_the_same_steer_retraces_the_arc():
     end = camera_of(drive_poses(start, pieces)[-1][1])
     back = camera_of(drive_poses(end, retrace(pieces, 1.0), reverse=True)[-1][1])
     assert (back.x, back.y, back.yaw) == pytest.approx((start.x, start.y, start.yaw), abs=1e-6)
+
+
+def test_random_step_stays_on_the_seen_floor():
+    from app.roommap import blocked_cells, random_step
+
+    g = _room()
+    rng = np.random.default_rng(3)
+    blocked = blocked_cells(g, g.state(), Pose(0, 0, 0))
+    for _ in range(5):
+        steer, run = random_step(g, Pose(0, 0, 0), rng)
+        assert abs(steer) <= 30.0 and 0.2 <= run <= 0.4
+        k = -math.tan(math.radians(steer)) / 0.14
+        end = sample_path(
+            Pose(0, 0, 0), "S" if abs(k) < 1e-3 else ("L" if k > 0 else "R"),
+            (run,) if abs(k) < 1e-3 else (run * abs(k),), r=1.0 if abs(k) < 1e-3 else 1 / abs(k),
+        )[-1]  # fmt: skip
+        assert not blocked[g.cell(end.x, end.y)]
+
+
+def test_random_step_is_none_when_boxed_in():
+    from app.roommap import random_step
+
+    g = Grid(size_m=2.0)
+    g.mark_free(np.array([0.0]), np.array([0.0]))  # 足元だけ床
+    # 15 cm 先をぐるりと障害物で囲む（足元の 20 cm 四方は走れる扱いなので、それより内側に）
+    a, r = np.meshgrid(np.linspace(0, 2 * np.pi, 300), np.linspace(0.12, 0.18, 4))
+    g.mark_occupied((r * np.cos(a)).ravel(), (r * np.sin(a)).ravel())
+    assert random_step(g, Pose(0, 0, 0), np.random.default_rng(0)) is None

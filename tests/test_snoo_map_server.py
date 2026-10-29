@@ -426,3 +426,14 @@ def test_old_pi_without_the_reverse_flag_uses_what_the_server_sent(tmp_path):
     session, poses = _line(tmp_path, steps, sent=[1])
     trail, backs = driven_trail(session, 2, poses)
     assert backs == 1 and sum(m for _, m in trail) == pytest.approx(0.2, abs=0.011)
+
+
+def test_clustered_stations_force_a_random_step():
+    from app.roommap import Pose
+    from app.snoo_map_server import clustered
+
+    near = {i: Pose(0.05 * (i % 2), 0.05 * (i // 2), 0.0) for i in range(5)}
+    assert clustered(near, 4)
+    spread = {i: Pose(0.4 * i, 0.0, 0.0) for i in range(5)}
+    assert not clustered(spread, 4)
+    assert not clustered({0: Pose(0, 0, 0)}, 1)  # まだ少ない
