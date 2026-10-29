@@ -38,6 +38,8 @@ sim = [
 ]
 
 [tool.ruff]
+# サブエージェントの作業ツリー（.claude/worktrees）は見ない
+extend-exclude = [".claude"]
 line-length = 100
 
 [tool.ruff.lint]
