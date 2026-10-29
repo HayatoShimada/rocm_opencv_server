@@ -344,17 +344,25 @@ def turning(route: tuple) -> float:
     return sum(seg for c, seg in zip(kind, segs, strict=True) if c != "S")
 
 
-def blocked_cells(grid: Grid, state: np.ndarray, pose: Pose) -> np.ndarray:
-    """車の中心が入れないセル：車の大きさ分を広げた障害物と、床が見えていない所。"""
+# 車の幅の半分と余裕。いま居る所のまわりだけは、障害物をこれだけ広げて見る（blocked_cells）
+NEAR_RADIUS_M = 0.10
+
+
+def blocked_cells(grid: Grid, state: np.ndarray, pose: Pose, unseen_ok: bool = False) -> np.ndarray:
+    """車の中心が入れないセル：車の大きさ分を広げた障害物と、床が見えていない所
+    （unseen_ok なら見えていない所は入れる）。"""
     occupied = state == OCCUPIED
     inflated = inflate(occupied, int(math.ceil(CAR_RADIUS_M / grid.res)))
-    blocked = inflated | (state != FREE)
+    blocked = inflated if unseen_ok else inflated | (state != FREE)
     # いま居るセルの周りは撮ったときに足元が写らないので、見ていなくても走れることにする。
-    # ただし障害物から車の大きさ分の所は残す（壁際の足元から壁へ進まないように）
+    # 障害物は車の幅の半分（NEAR_RADIUS_M）だけ広げて見る。車の大きさ分（17 cm）で見ると、
+    # 家具のそばで止まったとき自分の居る所がふさがり、どこへも行けなくなる（3 回目の実走の
+    # 最後は、左前 14 cm の障害物で周りが全部ふさがって unreachable だった）。
+    # 少し先からは車の大きさ分で見るので、離れる向きの道だけが通る
     ix0, iy0 = grid.cell(pose.x, pose.y)
     r0 = int(math.ceil(CAR_RADIUS_M / grid.res))
     near = (slice(max(ix0 - r0, 0), ix0 + r0 + 1), slice(max(iy0 - r0, 0), iy0 + r0 + 1))
-    blocked[near] = inflated[near]
+    blocked[near] = inflate(occupied, int(math.ceil(NEAR_RADIUS_M / grid.res)))[near]
     return blocked
 
 
@@ -653,7 +661,7 @@ def turning_reverse(
     """
     state = grid.state()
     blocked = blocked_cells(grid, state, pose)
-    hard = inflate(state == OCCUPIED, int(math.ceil(CAR_RADIUS_M / grid.res)))
+    hard = blocked_cells(grid, state, pose, unseen_ok=True)
     max_steer = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))
     best, best_gain = [], -1
     for steer in (max_steer, -max_steer):
