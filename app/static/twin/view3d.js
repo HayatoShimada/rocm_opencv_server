@@ -56,7 +56,7 @@ class View3D {
   }
 
   _camera(W, H) {
-    const d = (this.radius * 1.7) / this.zoom;
+    const d = (this.radius * 1.25) / this.zoom;
     const ce = Math.cos(this.el);
     const t = this.target;
     const eye = [t[0] + d * ce * Math.cos(this.az), t[1] + d * ce * Math.sin(this.az),

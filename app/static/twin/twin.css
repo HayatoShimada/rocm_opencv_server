@@ -83,7 +83,7 @@ h2 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-tra
 .ln.rev { background: var(--rev); }
 .ln.nbv { background: repeating-linear-gradient(90deg, var(--nbv) 0 4px, transparent 4px 7px); }
 
-.live-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 200px;
+.live-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(170px, 200px);
   gap: 10px; }
 .live-frame { position: relative; min-height: 0; background: #0a0c0e; border-radius: 4px;
   overflow: hidden; display: flex; align-items: center; justify-content: center; }
@@ -92,6 +92,7 @@ h2 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-tra
 .live-frame.stale img { opacity: .45; filter: grayscale(.7); }
 .empty { position: absolute; color: var(--muted); font-size: 12px; padding: 10px; text-align: center; }
 
+.live .kv { overflow-y: auto; min-height: 0; }
 .kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; align-content: start;
   font-size: 12px; }
 .kv dt { color: var(--muted); white-space: nowrap; }
