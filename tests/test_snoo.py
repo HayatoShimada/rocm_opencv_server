@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from app import snoo
-from app.snoo import HEADER, Detection, FrameError, encode_reply, parse_frame
+from app.snoo import HEADER, Detection, FrameError, SnooMemory, encode_reply, parse_frame
 
 
 def _packet(seq=7, t=123456789012, jpeg=b"\xff\xd8jpeg"):
@@ -41,7 +41,7 @@ def test_reply_echoes_header_and_allows_null_snoo():
 class _FakeDetector:
     device = "cpu"
 
-    def detect(self, image):
+    def detect(self, image, memory=None):
         assert image.shape == (480, 640, 3)
         return [Detection((0.4, 0.3, 0.6, 0.7), 0.9)]
 
@@ -80,3 +80,20 @@ def test_background_boxes_stay_off_the_cat():
     assert boxes
     assert not any(_overlaps(b, cat) for b in boxes)
     assert _overlaps((0.0, 0.0, 0.3, 0.3), cat)  # 猫の箱の外でも、広げた毛の分にかかれば使わない
+
+
+def test_snoo_memory_reuses_overlapping_boxes_for_a_few_frames():
+    memory = SnooMemory(frames=2)
+    first = [Detection((0.40, 0.30, 0.60, 0.70), 0.9)]
+    assert memory.reuse(first) == [0]
+    first[0].snoo = 0.8
+    memory.remember(first, [0])
+    for _ in range(2):  # 少しずれた同じ猫は CLIP を回さない。重ならない箱は回す
+        dets = [Detection((0.42, 0.31, 0.62, 0.71), 0.9), Detection((0.0, 0.0, 0.1, 0.1), 0.5)]
+        assert memory.reuse(dets) == ([1] if _ == 0 else [])
+        assert dets[0].snoo == 0.8
+        if _ == 0:
+            dets[1].snoo = 0.1
+            memory.remember(dets, [1])
+    dets = [Detection((0.42, 0.31, 0.62, 0.71), 0.9)]
+    assert memory.reuse(dets) == [0]  # frames 回使い回したら CLIP をかけ直す

@@ -4,7 +4,10 @@
 20 バイトのヘッダー（struct "<4sIQHH"）の後に JPEG が続く。返事は JSON 1 つで、
 猫が見つからなくても dets=[] で必ず返す（Pi は返事の有無で通信の状態を見ている）。
 
-検出は RT-DETR v2（COCO の cat。Apache-2.0）を GPU で fp16 で動かす。640x480 で 6 ms ほど。
+検出は RT-DETR v2（COCO の cat。Apache-2.0）を GPU で fp16 で動かす。640x480 で 6 ms ほど
+（--compile で 3.7 ms）。入力を 640 より小さくしても速くならず（GPU の呼び出しの手間が大半）、
+320 で 7〜10% 見落とすので小さくしない。暗い 60 fps の画像（ゲイン 16 相当のノイズ）でも 640 なら
+見つかる割合は変わらず、明るさを補正するとかえって下がったので補正もしない。
 snoo らしさは、猫の箱を CLIP で埋め込み、snoo の写真から作った見本（scripts/snoo_gallery.py）との
 近さを 0..1 にしたもの。家の猫は snoo だけなので、実際には猫でない物の誤検出を落とす役目が大きい。
 見本が無ければ snoo は null で返す（Pi 側は require_snoo=false で猫を追う）。
@@ -40,6 +43,13 @@ CLIP_MODEL = "ViT-B-16"
 CLIP_PRETRAINED = "laion2b_s34b_b88k"
 # 見本のうち近い順に何枚の類似度を平均するか
 TOP_K = 5
+# 同じ猫（前のフレームの箱と IoU がこれ以上）の snoo らしさは、
+# このフレーム数まで CLIP を回さずに使い回す
+REUSE_IOU = 0.5
+REUSE_FRAMES = int(os.getenv("SNOO_REUSE_FRAMES", "6"))
+# 検出を torch.compile（HIP グラフ）で動かす。6 ms → 3.7 ms。
+# 初回の準備に数分かかる（キャッシュがあれば数秒）
+COMPILE = os.getenv("SNOO_COMPILE", "0") == "1"
 
 log = logging.getLogger("snoo")
 
@@ -163,8 +173,46 @@ class SnooScorer:
         return self.torch.sigmoid((s - self.mid) * self.gain).cpu().tolist()
 
 
+def _iou(a, b) -> float:
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+
+
+class SnooMemory:
+    """送り元ごとに、前のフレームの箱と snoo らしさを覚えておく。
+
+    60 fps では隣のフレームの猫はほぼ同じ所にいるので、重なる箱は前の値を使い回し、
+    CLIP（1 箱 2 ms）は REUSE_FRAMES フレームに 1 回だけ回す。
+    """
+
+    def __init__(self, frames: int = REUSE_FRAMES):
+        self.frames = frames
+        self.items: list[tuple[tuple, float, int]] = []  # (箱, snoo, 使い回した回数)
+
+    def reuse(self, dets: list[Detection]) -> list[int]:
+        """使い回せる箱に snoo を入れ、CLIP にかける必要がある箱の番号を返す。"""
+        todo, items = [], []
+        for i, d in enumerate(dets):
+            best = max(self.items, key=lambda m: _iou(m[0], d.box), default=None)
+            if best is not None and best[2] < self.frames and _iou(best[0], d.box) >= REUSE_IOU:
+                d.snoo = best[1]
+                items.append((d.box, best[1], best[2] + 1))
+            else:
+                todo.append(i)
+        self.items = items
+        return todo
+
+    def remember(self, dets: list[Detection], scored: list[int]) -> None:
+        self.items += [(dets[i].box, dets[i].snoo, 0) for i in scored]
+
+
 class CatDetector:
-    def __init__(self, model: str = MODEL, cat_min: float = CAT_MIN, gallery: str | None = None):
+    def __init__(self, model: str = MODEL, cat_min: float = CAT_MIN, gallery: str | None = None,
+                 compile: bool = False):  # fmt: skip
         import torch
         from transformers import RTDetrV2ForObjectDetection
 
@@ -178,15 +226,28 @@ class CatDetector:
         self.size = 640  # RT-DETR は 640x640 で学習している（正規化はしない）
         self.cat_min = cat_min
         self.scorer = SnooScorer(self.device, self.dtype, gallery) if gallery else None
-        self.detect(np.zeros((480, 640, 3), np.uint8))  # 最初の 1 回は遅いので先に済ませる
+        self.forward = self.model
+        if compile and self.device == "cuda":
+            # 入力はいつも 640x640 なので dynamic=False。出力はグラフの中の同じ領域に
+            # 上書きされるので、次に呼ぶ前に CPU に移す（detect_tensor の中で済ませている）
+            self.forward = torch.compile(self.model, mode="reduce-overhead", dynamic=False)
+        # 最初の数回は遅い（compile なら準備と HIP グラフの記録）ので先に済ませる
+        for _ in range(3 if compile else 1):
+            self.detect(np.zeros((480, 640, 3), np.uint8))
 
-    def detect(self, image: np.ndarray) -> list[Detection]:
-        """BGR の画像から猫を探す。確からしさの高い順に返す。"""
+    def detect(self, image: np.ndarray, memory: SnooMemory | None = None) -> list[Detection]:
+        """BGR の画像から猫を探す。確からしさの高い順に返す。
+
+        memory を渡すと、前のフレームと重なる箱は snoo らしさを使い回す。
+        """
         x = to_tensor(image, self.device, self.dtype)
         dets = self.detect_tensor(x)
         if self.scorer:
-            for d, s in zip(dets, self.scorer.score(x, [d.box for d in dets]), strict=True):
-                d.snoo = s
+            todo = memory.reuse(dets) if memory is not None else list(range(len(dets)))
+            for i, s in zip(todo, self.scorer.score(x, [dets[i].box for i in todo]), strict=True):
+                dets[i].snoo = s
+            if memory is not None:
+                memory.remember(dets, todo)
         return dets
 
     def detect_tensor(self, x) -> list[Detection]:
@@ -195,7 +256,7 @@ class CatDetector:
 
         x = torch.nn.functional.interpolate(x, size=(self.size, self.size), mode="bilinear")
         with torch.inference_mode():
-            out = self.model(pixel_values=x)
+            out = self.forward(pixel_values=x)
             scores = out.logits[0, :, self.cat_class].sigmoid().float()
             keep = scores >= self.cat_min
             scores = scores[keep]
@@ -241,6 +302,7 @@ def serve(host: str, port: int, detector: CatDetector) -> None:
     sock = _bind(host, port)
     log.info("%s:%d/udp で待ち受け（%s）", host, port, detector.device)
     times: list[float] = []
+    memories: dict[tuple, SnooMemory] = {}
     last_report = time.monotonic()
     while True:
         first = sock.recvfrom(65535)
@@ -253,7 +315,8 @@ def serve(host: str, port: int, detector: CatDetector) -> None:
                 log.warning("%s から: %s", addr, e)
                 continue
             try:
-                dets = detector.detect(decode_jpeg(frame.jpeg))
+                memory = memories.setdefault(addr, SnooMemory())
+                dets = detector.detect(decode_jpeg(frame.jpeg), memory)
             except FrameError as e:
                 log.warning("%s の seq=%d: %s", addr, frame.seq, e)
                 dets = []
@@ -280,12 +343,18 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--cat-min", type=float, default=CAT_MIN)
     parser.add_argument("--gallery", default=GALLERY, help="snoo の見本。無ければ snoo は null")
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=COMPILE,
+        help="検出を torch.compile で速くする（環境変数 SNOO_COMPILE=1）",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     gallery = args.gallery if os.path.exists(args.gallery) else None
     if gallery is None:
         log.warning("snoo の見本（%s）が無いので、snoo は null で返す", args.gallery)
-    serve(args.host, args.port, CatDetector(args.model, args.cat_min, gallery))
+    serve(args.host, args.port, CatDetector(args.model, args.cat_min, gallery, args.compile))
 
 
 if __name__ == "__main__":
