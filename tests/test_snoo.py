@@ -1,6 +1,7 @@
 import json
 import socket
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -41,8 +42,10 @@ def test_reply_echoes_header_and_allows_null_snoo():
 class _FakeDetector:
     device = "cpu"
 
-    def detect(self, image, memory=None):
+    def detect(self, image, memory=None, stages=None):
         assert image.shape == (480, 640, 3)
+        if stages is not None:
+            stages.mark("検出")
         return [Detection((0.4, 0.3, 0.6, 0.7), 0.9)]
 
 
@@ -97,3 +100,54 @@ def test_snoo_memory_reuses_overlapping_boxes_for_a_few_frames():
             memory.remember(dets, [1])
     dets = [Detection((0.42, 0.31, 0.62, 0.71), 0.9)]
     assert memory.reuse(dets) == [0]  # frames 回使い回したら CLIP をかけ直す
+
+
+def test_stages_summary_is_in_a_fixed_order_with_p50_and_p95():
+    from app.snoo import Stages
+
+    stages = Stages()
+    stages.samples["送信"] = [0.1]
+    stages.samples["デコード"] = [float(v) for v in range(1, 21)]  # 1..20
+    assert stages.summary() == "デコード 10.50/19.00  送信 0.10/0.10"
+    assert stages.summary() == ""  # 出したら消える
+    stages.mark("検出")  # start の前は記録しない
+    assert stages.summary() == ""
+
+
+def test_serve_does_not_count_a_failed_decode_as_send_time(monkeypatch):
+    from app.snoo import Stages
+
+    def decode(jpeg):
+        if jpeg == b"slow broken":
+            time.sleep(0.05)
+            raise FrameError("JPEG を読めない")
+        return np.zeros((480, 640, 3), np.uint8)
+
+    monkeypatch.setattr(snoo, "decode_jpeg", decode)
+    stages = Stages()
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    server.close()
+    threading.Thread(
+        target=snoo.serve, args=("127.0.0.1", port, _FakeDetector(), stages), daemon=True
+    ).start()
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(2)
+    for _ in range(50):  # サーバーが bind するまで送り直す
+        client.sendto(_packet(seq=1, jpeg=b"\xff\xd8ok"), ("127.0.0.1", port))
+        try:
+            client.recv(65535)
+            break
+        except TimeoutError:
+            continue
+    client.sendto(b"XXXX", ("127.0.0.1", port))  # 読めないヘッダーには返さない
+    client.sendto(_packet(seq=2, jpeg=b"slow broken"), ("127.0.0.1", port))
+    assert json.loads(client.recv(65535))["dets"] == []
+    for _ in range(100):  # 返事の後の mark を待つ
+        if len(stages.samples["送信"]) >= 2:
+            break
+        time.sleep(0.01)
+    assert len(stages.samples["デコード"]) == len(stages.samples["送信"]) - 1
+    assert max(stages.samples["送信"]) < 40  # 50 ms かかったデコードは入っていない
