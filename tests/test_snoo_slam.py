@@ -344,6 +344,18 @@ def test_service_reads_stations_and_queue_and_writes_the_outputs(tmp_path):
     lines = (out / "frames.jsonl").read_text().splitlines()
     assert len(lines) == 26 and json.loads(lines[1])["boxes"] == []
 
+    # 使わないので終えて起動し直しても、同じセッションのそれまでのコマを読み直す
+    # （タップの置き場からは消えていても、frames/ に写したものがある）
+    for p in (tmp_path / "queue").rglob("*"):
+        if p.is_file():
+            p.unlink()
+    again = SlamService(
+        tmp_path / "data", tmp_path / "queue", submap_size=8, flush_s=1.5,
+        slam_factory=lambda: FakeSlam(sc, truth), clock=clock,
+    )  # fmt: skip
+    again.start(session)
+    assert len(again.kfs) == 26 and len(again.pending) == 26
+
 
 def test_service_starts_a_new_segment_when_tracking_is_lost(tmp_path):
     sc = Scene(STATIONS)
