@@ -151,3 +151,60 @@ def test_serve_does_not_count_a_failed_decode_as_send_time(monkeypatch):
         time.sleep(0.01)
     assert len(stages.samples["デコード"]) == len(stages.samples["送信"]) - 1
     assert max(stages.samples["送信"]) < 40  # 50 ms かかったデコードは入っていない
+
+
+def test_allow_list_accepts_only_listed_senders():
+    from app.snoo import _allowed, parse_allow
+
+    allow = parse_allow("192.168.0.188, 100.64.0.0/10")
+    assert _allowed(("192.168.0.188", 5000), allow)
+    assert _allowed(("100.73.14.8", 5000), allow)
+    assert not _allowed(("192.168.0.50", 5000), allow)
+    assert _allowed(("192.168.0.50", 5000), [])  # 空ならすべて
+
+
+def test_serve_ignores_senders_not_in_the_allow_list():
+    from app.snoo import parse_allow
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    server.close()
+    threading.Thread(
+        target=snoo.serve,
+        args=("127.0.0.1", port, _FakeDetector()),
+        kwargs={"allow": parse_allow("10.0.0.1")},
+        daemon=True,
+    ).start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(0.3)
+    jpeg = cv2.imencode(".jpg", np.zeros((480, 640, 3), np.uint8))[1].tobytes()
+    for _ in range(5):
+        client.sendto(_packet(seq=1, jpeg=jpeg), ("127.0.0.1", port))
+        with pytest.raises(TimeoutError):  # 127.0.0.1 は受ける送り元に無いので返事が無い
+            client.recv(65535)
+
+
+def test_serve_touches_the_active_file_while_frames_arrive(tmp_path):
+    active = tmp_path / "active"
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    server.close()
+    threading.Thread(
+        target=snoo.serve,
+        args=("127.0.0.1", port, _FakeDetector()),
+        kwargs={"active_file": str(active)},
+        daemon=True,
+    ).start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(0.3)
+    jpeg = cv2.imencode(".jpg", np.zeros((480, 640, 3), np.uint8))[1].tobytes()
+    for _ in range(50):
+        client.sendto(_packet(seq=1, jpeg=jpeg), ("127.0.0.1", port))
+        try:
+            client.recv(65535)
+            break
+        except TimeoutError:
+            continue
+    assert active.exists() and time.time() - active.stat().st_mtime < 5

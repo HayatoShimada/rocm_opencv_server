@@ -13,11 +13,16 @@ snoo らしさは、猫の箱を CLIP で埋め込み、snoo の写真から作�
 見本が無ければ snoo は null で返す（Pi 側は require_snoo=false で猫を追う）。
 torch・transformers は重いので、使うときだけ読み込む（uv sync --group clip --group clef-local）。
 
-    uv run python -m app.snoo --host 100.108.168.101
+家の中では、Pi は tailscale を通さず LAN の IP に送る（tailscale 経由の ping は平均 6.7 ms、
+LAN 宛ては 3.7 ms）。そのときは 0.0.0.0 で受け、認証の無い UDP なので --allow に書いた送り元
+（Pi の LAN と tailscale の IP）以外は捨てる。
+
+    uv run python -m app.snoo --host 0.0.0.0 --allow 192.168.0.188,100.73.14.8
 """
 
 import argparse
 import errno
+import ipaddress
 import json
 import logging
 import os
@@ -51,6 +56,11 @@ REUSE_FRAMES = int(os.getenv("SNOO_REUSE_FRAMES", "6"))
 # 検出を torch.compile（HIP グラフ）で動かす。6 ms → 3.7 ms。
 # 初回の準備に数分かかる（キャッシュがあれば数秒）
 COMPILE = os.getenv("SNOO_COMPILE", "0") == "1"
+# 受ける送り元（IP か CIDR をカンマで区切る）。空ならどこからでも受ける
+ALLOW = os.getenv("SNOO_ALLOW", "")
+# フレームを処理している間、1 秒ごとに触る（更新時刻を新しくする）ファイル。ホストの
+# deploy/snoo-gpu-perf.sh がこれを見て、検出が動いている間だけ GPU の時計を上げる
+ACTIVE_FILE = os.getenv("SNOO_ACTIVE_FILE", "")
 
 log = logging.getLogger("snoo")
 
@@ -325,6 +335,15 @@ def _latest_per_sender(sock: socket.socket, first: tuple[bytes, tuple]) -> dict[
     return latest
 
 
+def parse_allow(text: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """「192.168.0.188,100.73.14.8」のような並びを、送り元を調べるための範囲にする。"""
+    return [ipaddress.ip_network(s.strip(), strict=False) for s in text.split(",") if s.strip()]
+
+
+def _allowed(addr: tuple, allow: list) -> bool:
+    return not allow or any(ipaddress.ip_address(addr[0]) in net for net in allow)
+
+
 def _bind(host: str, port: int) -> socket.socket:
     """起動直後は tailscale の IP がまだ無いことがあるので、付くまで待ってから受ける。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -340,9 +359,34 @@ def _bind(host: str, port: int) -> socket.socket:
             time.sleep(5)
 
 
-def serve(host: str, port: int, detector: CatDetector, stages: Stages | None = None) -> None:
+def _touch(path: str) -> None:
+    """path の更新時刻を今にする（書けなくても検出は止めない）。"""
+    try:
+        with open(path, "a"):
+            os.utime(path)
+    except OSError as e:
+        log.warning("%s を更新できない: %s", path, e)
+
+
+def serve(
+    host: str,
+    port: int,
+    detector: CatDetector,
+    stages: Stages | None = None,
+    allow: list | None = None,
+    active_file: str = "",
+) -> None:
     sock = _bind(host, port)
-    log.info("%s:%d/udp で待ち受け（%s）", host, port, detector.device)
+    allow = allow or []
+    log.info(
+        "%s:%d/udp で待ち受け（%s、受ける送り元: %s）",
+        host,
+        port,
+        detector.device,
+        ", ".join(map(str, allow)) or "すべて",
+    )
+    refused: set[str] = set()
+    last_touch = 0.0
     times: list[float] = []
     memories: dict[tuple, SnooMemory] = {}
     stages = Stages() if stages is None else stages
@@ -354,6 +398,11 @@ def serve(host: str, port: int, detector: CatDetector, stages: Stages | None = N
         latest = _latest_per_sender(sock, first)
         stages.mark("受信")
         for addr, data in latest.items():
+            if not _allowed(addr, allow):
+                if addr[0] not in refused:  # 同じ送り元は 1 回だけ書く
+                    refused.add(addr[0])
+                    log.warning("%s は受ける送り元に無いので捨てる", addr[0])
+                continue
             stages.start()  # フレームごとに測り始める（前のフレームの失敗の分を持ち込まない）
             try:
                 frame = parse_frame(data)
@@ -374,6 +423,9 @@ def serve(host: str, port: int, detector: CatDetector, stages: Stages | None = N
             stages.mark("送信")
             times.append(infer_ms)
         now = time.monotonic()
+        if active_file and times and now - last_touch >= 1.0:
+            _touch(active_file)
+            last_touch = now
         if now - last_report >= 10:
             # 返事が無かった間も区間は消す（次の報告に古い値を混ぜない）
             summary = stages.summary()
@@ -402,12 +454,29 @@ def main() -> None:
         default=COMPILE,
         help="検出を torch.compile で速くする（環境変数 SNOO_COMPILE=1）",
     )
+    parser.add_argument(
+        "--allow",
+        default=ALLOW,
+        help="受ける送り元の IP か CIDR（カンマ区切り。環境変数 SNOO_ALLOW）。空ならすべて",
+    )
+    parser.add_argument(
+        "--active-file",
+        default=ACTIVE_FILE,
+        help="フレームを処理している間、1 秒ごとに触るファイル（環境変数 SNOO_ACTIVE_FILE）",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     gallery = args.gallery if os.path.exists(args.gallery) else None
     if gallery is None:
         log.warning("snoo の見本（%s）が無いので、snoo は null で返す", args.gallery)
-    serve(args.host, args.port, CatDetector(args.model, args.cat_min, gallery, args.compile))
+    detector = CatDetector(args.model, args.cat_min, gallery, args.compile)
+    serve(
+        args.host,
+        args.port,
+        detector,
+        allow=parse_allow(args.allow),
+        active_file=args.active_file,
+    )
 
 
 if __name__ == "__main__":
