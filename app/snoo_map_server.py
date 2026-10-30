@@ -113,6 +113,7 @@ from app.snoo_mapper import (
     pose_dict,
     registration_is_bad,
     retrace_step,
+    reverse_action,
     run_vggt,
     save_vggt,
     select_frames,
@@ -637,6 +638,14 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         # 前の前へ行く 1 歩を Pi が 1 cm も走らなかった（超音波・clear_cm で止まった）。同じ所から
         # でたらめな前への 1 歩を出し続けても走らないので、下がる 1 歩にする（下がれなければ終える）
         action = {"action": "done", "reason": "unreachable"}
+    back = (
+        retrace_after_bad(session, station_id, raw, r.stations[-1].name) if params.reverse else None
+    )
+    if back:
+        # このステーションの位置合わせが崩れた。探索を終えずに、いま走った 1 歩を同じ道で戻り、
+        # 位置の分かっている前のステーションの所で撮り直す
+        action = reverse_action(back, params.segments)
+        action["retrace"] = True
     action, pieces = or_reverse(action, r.grid, pose, history(session, station_id, poses), params)
     if pieces:  # 戻る弧を上から見た絵に描き、戻った先を target にする
         r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
@@ -663,6 +672,43 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     (station_dir(session, station_id) / "reply.json").write_text(json.dumps(action))
     marks["write"] = time.perf_counter() - t
     return action
+
+
+# --- 位置合わせが崩れたら、来た道を戻って撮り直す ---
+
+# これより短く走っただけなら、戻らずに終える（同じ所で撮り直しても同じになりやすい）
+RETRACE_MIN_M = 0.05
+
+
+def retrace_after_bad(
+    session: Path, station_id: int, raw: dict, last_name: str
+) -> list[tuple[float, float]] | None:
+    """最後のステーションの位置合わせが崩れたとき、いま走った 1 歩を戻る区間（後ろへ走る順）。
+
+    18:49 の探索では 4 か所目で VGGT がコマの位置を 1〜16 cm に散らし、1 回の bad_registration で
+    探索を終えていた。同じハンドルで後ろへ走れば同じ弧を戻るので、走ったばかりの床（空いている）
+    を通って前のステーションへ戻れる。続けて崩れたら（前の返事も戻る 1 歩なら）終える。
+    """
+    if raw.get("reason") != f"bad_registration:{last_name}":
+        return None
+    prev = read_meta(station_dir(session, station_id)).get("prev_step")
+    if not isinstance(prev, dict) or prev.get("reverse"):
+        return None
+    before = station_dir(session, station_id - 1) / "reply.json"
+    if before.is_file() and json.loads(before.read_text()).get("retrace"):
+        return None
+    pieces, moved = step_pieces(prev), pi_distance_m(prev)
+    if not pieces or moved is None or moved < RETRACE_MIN_M:
+        return None
+    if sum(m for _, m in pieces) <= 0:  # 長さの無い 1 本の弧（古い Pi）は、走った長さにする
+        pieces = [(pieces[0][0], moved)]
+    out, left = [], moved
+    for steer, m in pieces:  # 走った分だけ（止まった所まで）
+        take = min(m, left)
+        if take > 1e-3:
+            out.append((steer, take))
+        left -= take
+    return list(reversed(out)) or None
 
 
 # --- 前へ出せないのを見る ---

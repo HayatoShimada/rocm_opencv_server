@@ -571,3 +571,45 @@ def test_a_step_that_moved_is_not_a_stall():
     assert not _stalled({**_stuck(), "stop_reason": None})  # 言われた長さを走りきった
     assert not _stalled(None)
     assert _stalled(_stuck())
+
+
+def _write_meta(session, i, prev, reply=None):
+    d = session / f"{i:03d}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps({"station_id": i, "prev_step": prev}))
+    if reply is not None:
+        (d / "reply.json").write_text(json.dumps(reply))
+
+
+def test_a_bad_registration_retraces_the_step_just_driven(tmp_path):
+    from app.snoo_map_server import retrace_after_bad
+
+    session = tmp_path / "explore_20261030_184931"
+    driven = {
+        "steer_deg": 26.6, "speed": 12.0, "reverse": False, "est_distance_cm": 35.7,
+        "segments": [{"steer_deg": 26.6, "distance_cm": 35.7}], "stop_reason": None,
+    }  # fmt: skip
+    _write_meta(session, 3, None, {"action": "move"})
+    _write_meta(session, 4, driven)
+    bad = {"action": "done", "reason": "bad_registration:004"}
+    assert np.allclose(retrace_after_bad(session, 4, bad, "004"), [(26.6, 0.357)])
+    # ほかの理由・ほかのステーションの崩れ・下がった後・続けて崩れたら戻らない
+    assert retrace_after_bad(session, 4, {"action": "done", "reason": "no_frontier"}, "004") is None
+    assert retrace_after_bad(session, 4, {**bad, "reason": "bad_registration:002"}, "004") is None
+    _write_meta(session, 4, {**driven, "reverse": True})
+    assert retrace_after_bad(session, 4, bad, "004") is None
+    _write_meta(session, 4, driven)
+    _write_meta(session, 3, None, {"action": "move", "reverse": True, "retrace": True})
+    assert retrace_after_bad(session, 4, bad, "004") is None
+
+
+def test_a_retrace_follows_only_what_was_driven_in_reverse_order(tmp_path):
+    from app.snoo_map_server import retrace_after_bad
+
+    session = tmp_path / "s"
+    segs = [{"steer_deg": 20.0, "distance_cm": 10.0}, {"steer_deg": 0.0, "distance_cm": 40.0}]
+    prev = {"steer_deg": 20.0, "speed": 12.0, "reverse": False, "est_distance_cm": 30.0,
+            "segments": segs, "stop_reason": "clear"}  # fmt: skip
+    _write_meta(session, 1, prev)
+    out = retrace_after_bad(session, 1, {"action": "done", "reason": "bad_registration:001"}, "001")
+    assert np.allclose(out, [(0.0, 0.2), (20.0, 0.1)])  # 止まった所まで、後ろから

@@ -397,3 +397,15 @@ def test_only_tiny_holes_left_means_done():
     st = [StationResult("000", Pose(0.0, 0.0, 0.0), 0.08, 0.0, 10)]
     action, _ = decide(g, st, MapParams(), [0.08])
     assert action == {"action": "done", "reason": "no_frontier"}
+
+
+def test_station_inliers_drops_one_frame_far_from_the_rest():
+    from app.snoo_mapper import station_inliers
+
+    cams = np.zeros((6, 3))
+    cams[:, 0] = [0.0, 0.01, -0.01, 0.005, 0.0, 0.20]  # 1 コマだけ 20 cm 外れた
+    assert station_inliers(cams).tolist() == [True] * 5 + [False]
+    # みんな散っていれば外さない（ばらつきで位置合わせの失敗と分かる）
+    spread = np.zeros((6, 3))
+    spread[:, 0] = [0.0, 0.08, 0.16, -0.08, -0.16, 0.12]
+    assert station_inliers(spread).all()
