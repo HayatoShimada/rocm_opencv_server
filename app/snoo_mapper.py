@@ -51,6 +51,7 @@ from app.roommap import (
     bearing,
     big_frontiers,
     camera_of,
+    cap_turn,
     drive_poses,
     mark_sonar,
     moves_are_clear,
@@ -83,6 +84,13 @@ OUTLIER_M = 0.06
 OUTLIER_KEEP = 0.6
 
 _NAME = re.compile(r"pan([+-]\d+)_tilt([+-]\d+)")
+
+
+def _env_float(name: str, default: float | None) -> float | None:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return None if v.strip().lower() in ("", "none", "off") else float(v)
 
 
 @dataclass
@@ -124,6 +132,12 @@ class MapParams:
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
     force_random: bool = False
     seed: int = 0
+    # 前へ進む 1 歩で向きが変わる量の上限（度）。None なら切らない（既定）。SNOO_MAX_STEP_TURN_DEG
+    # で入れる。シミュレーターでは位置合わせの崩れを作らないので、切ると遅くなるだけに見える
+    # （実走の部屋 8 分で 15.5 → 25° で 12.3 m²）。実機で崩れが減るかを確かめてから既定を決める
+    max_step_turn_deg: float | None = field(
+        default_factory=lambda: _env_float("SNOO_MAX_STEP_TURN_DEG", None)
+    )
     # 学んだ選び方（app/snoo_explore_policy.py）の重みのファイル。None なら今までの決め方。
     # 既定は環境変数 SNOO_EXPLORE_POLICY（無ければ使わない）
     policy: str | None = field(default_factory=lambda: os.getenv("SNOO_EXPLORE_POLICY") or None)
@@ -919,8 +933,16 @@ def decide(
     return plan_action(plan, pose, params), plan
 
 
+def capped(pieces: list[tuple[float, float]], params: MapParams) -> list[tuple[float, float]]:
+    """前へ進む 1 歩の、向きが変わる量を max_step_turn_deg までにする（roommap.cap_turn）。"""
+    if params.max_step_turn_deg is None:
+        return pieces
+    out = cap_turn(pieces, math.radians(params.max_step_turn_deg))
+    return out or pieces[:1]
+
+
 def random_action(step: tuple[float, float], pose: Pose, params: MapParams) -> dict:
-    steer, run = step
+    steer, run = capped([step], params)[0]
     action = {
         "action": "move",
         "steer_deg": round(steer, 1),
@@ -935,17 +957,19 @@ def random_action(step: tuple[float, float], pose: Pose, params: MapParams) -> d
 
 
 def plan_action(plan: Plan, pose: Pose, params: MapParams) -> dict:
+    pieces = plan.segments if params.segments and plan.segments else [(plan.steer_deg, plan.step_m)]
+    pieces = capped(pieces, params)
     action = {
         "action": "move",
-        "steer_deg": round(plan.steer_deg, 1),
+        "steer_deg": round(pieces[0][0], 1),
         "speed": SPEED,
-        "distance_cm": round(plan.step_m * 100, 1),
+        "distance_cm": round(pieces[0][1] * 100, 1),
         "pose": pose_dict(pose),
         "target": pose_dict(plan.target),
     }
     if params.segments:
         # 上の steer_deg・distance_cm は最初の区間（segments を知らない Pi でも同じに動く）
-        action["segments"] = segments_json(plan.segments)
+        action["segments"] = segments_json(pieces)
     return action
 
 
