@@ -1,5 +1,6 @@
 """app/snoo_posegraph.py（位置のグラフ）を、作り物の道筋で試す。GPU は使わない。"""
 
+import json
 import math
 
 import numpy as np
@@ -148,3 +149,18 @@ def test_window_edges_bridge_a_gap_in_the_odometry():
     sol = pg.optimize(edges, fixed=0)
     for i, p in enumerate(t):
         _close(sol.poses[i], p, m=1e-3, rad=1e-3)
+
+
+def test_edge_round_trip_connected_and_warm_start():
+    e = pg.odom_edge(0, 1, [(10.0, 0.3)], False)
+    back = pg.edge_from_dict(json.loads(json.dumps(pg.edge_to_dict(e, 1))))
+    _close(back.z, e.z)
+    assert (back.a, back.b, back.kind, back.sigma_m) == (0, 1, "odom", e.sigma_m)
+    far = pg.odom_edge(5, 6, [(0.0, 0.2)], False)
+    assert pg.connected([e, far], 0) == {0, 1}
+    # 前の答え（start）から始めると、そこにあるものは動かさず、無いものだけを辺でたどる
+    start = {0: Pose(0, 0, 0), 1: Pose(0.31, 0.01, 0.2)}
+    two = pg.odom_edge(1, 2, [(0.0, 0.2)], False)
+    init = pg.chain_init([0, 1, 2], [e, two], 0, start=start)
+    _close(init[1], start[1])
+    _close(init[2], to_frame(start[1], two.z))
