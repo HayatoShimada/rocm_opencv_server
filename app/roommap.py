@@ -463,16 +463,36 @@ def next_best_view(
     合わせて max_step_m まで）。分けられない候補（Dubins 経路が曲がる・曲がる・曲がるの形など）は、
     今までの 1 本の弧にする（MAX_STEP_M まで）。
     """
+    plans = next_best_views(grid, pose, 1, candidates_max, rng, segments, max_step_m)
+    return plans[0] if plans else None
+
+
+def next_best_views(
+    grid: Grid,
+    pose: Pose,
+    k: int = 1,
+    candidates_max: int = 400,
+    rng=None,
+    segments: bool = False,
+    max_step_m: float = MAX_STEP_M,
+    min_apart_m: float = 0.4,
+) -> list[Plan]:
+    """next_best_view の上位 k 個（利得 × exp(-道のり) の大きい順）。行き先どうしは
+    min_apart_m 以上離す（同じ所の言い換えばかりにしない。学んだ選び方の候補にする）。
+
+    k = 1 なら next_best_view と同じものを返す：候補のセルごとにいちばん良い向きを選び、
+    良い順に、道がふさがっていない・1 歩を走れるものを探す（同じ値なら先の候補）。
+    """
     rng = rng or np.random.default_rng(0)
     state = grid.state()
     blocked = blocked_cells(grid, state, pose)
     front = np.argwhere(big_frontiers(state))
     if not len(front):
-        return None
+        return []
     # 候補：境目の近く（1.2 m 以内）の、車が入れるセル
     free_ok = np.argwhere(~blocked)
     if not len(free_ok):
-        return None
+        return []
     fx, fy = grid.center(front[:, 0], front[:, 1])
     cx, cy = grid.center(free_ok[:, 0], free_ok[:, 1])
     near = np.zeros(len(free_ok), bool)
@@ -484,8 +504,7 @@ def next_best_view(
     idx = np.flatnonzero(near)
     if len(idx) > candidates_max:
         idx = rng.choice(idx, candidates_max, replace=False)
-    best: Plan | None = None
-    best_utility = 0.0
+    scored = []
     for i in idx:
         x, y = float(cx[i]), float(cy[i])
         # 向きは、いちばん近い境目のほうを基本に、その左右 60° も試す（首を振れば見える）。
@@ -501,12 +520,18 @@ def next_best_view(
             if route is None or turning(route) > MAX_TURN_RAD:
                 continue
             options.append((gain * math.exp(-route[0] / DISTANCE_SCALE_M), target, gain, route))
-        if not options:
+        if options:
+            utility, target, gain, route = max(options, key=lambda o: o[0])
+            if utility > 0:
+                scored.append((utility, target, gain, route))
+    # 良い順（同じ値なら先の候補が先。sorted は安定）
+    scored.sort(key=lambda o: -o[0])
+    plans: list[Plan] = []
+    for _, target, gain, route in scored:
+        if any(math.hypot(p.target.x - target.x, p.target.y - target.y) < min_apart_m
+               for p in plans):  # fmt: skip
             continue
-        utility, target, gain, route = max(options, key=lambda o: o[0])
         length, kind, segs = route
-        if utility <= best_utility:
-            continue
         path = sample_path(pose, kind, segs)
         if not path_is_clear(grid, blocked, path):
             continue
@@ -518,9 +543,10 @@ def next_best_view(
             if step <= 0:
                 continue
             pieces = [(steer, step)] if segments else []
-        best_utility = utility
-        best = Plan(target, gain, length, path, steer, step, pieces)
-    return best
+        plans.append(Plan(target, gain, length, path, steer, step, pieces))
+        if len(plans) >= k:
+            break
+    return plans
 
 
 def first_step(

@@ -255,6 +255,8 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 | 地図（app/snoo_map_server.py など）を直して試す | `make deploy-map` | 約 7 秒 |
 | 両方の様子を見る | `make status` | 0.1 秒 |
 | 保存したセッションの最後の 1 歩を GPU なしで決め直す | `make replay SESSION=explore_20261029_223944` | 1 秒 |
+| 作った 30 坪の家で、次の 1 歩の選び方を学ぶ（続きから） | `make train-explore`（`ARGS="--hours 4"`） | 上限まで（SIGTERM で書いて止まる） |
+| 学んだ選び方を、学んでいない家で今の決め方と比べる | `make eval-explore` | 48 軒 × 3 通りで約 1 分 |
 
 - **検出**: `compose.dev.yaml` が `./app` をコンテナに読み取り専用で重ねるので、app/ を直したら作り直さずに起動し直すだけで新しいコードで動く。`make deploy-detector` は、上書きの無いコンテナなら一度だけ作り直し（`docker compose -f compose.yaml -f compose.dev.yaml up -d snoo`）、あとは `restart` して「待ち受け」まで待ち、最初の p50/p95 の行を出す。起動に失敗したら Traceback を出してやめる。torch.compile の準備は torch-compile ボリュームのキャッシュが効く（検出 約 11 秒・clear_cm の深度 約 2.5 秒）。もっと速く試すときは `SNOO_CLEARANCE=0`（約 16 秒）・`SNOO_COMPILE=0`（clear も切って約 9 秒）を付けて `make deploy-detector`（作り直しになる）。pyproject.toml・uv.lock・Dockerfile を変えたときは `docker compose build snoo` が要る（`make deploy-detector` が知らせる）。本番の形（上書きなし）に戻すのは `docker compose up -d snoo`、その後に待つだけなら `.venv/bin/python -m scripts.snoo_dev wait-detector`
 - **地図**: systemd のユーザーのサービス（`deploy/snoo-map.service`）で動かす。落ちたら 3 秒後に起動し直し、ホストを起動し直しても動く。入れ方（sudo は要らない。手で起動したものを先に止める）:
@@ -271,6 +273,7 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
   送り元（`SNOO_MAP_ALLOW`）などを変えるときは `~/.config/snoo-map.env` に書いて `make deploy-map`
 - **走っている間の SLAM**: 検出が走っている間のフレームを 4 枚/秒ほど `/run/snoo/slam` に書き（`SNOO_SLAM_TAP_DIR`、app/snoo_slam_tap.py）、ホストの app/snoo_slam.py（VGGT-SLAM 2.0）がステーションと合わせて読み、`<セッション>/slam/` に trajectory.jsonl・points.npz・status.json を書く（形は app/snoo_slam.py の先頭）。torch・gtsam は別の venv にあるので、`deploy/snoo-slam-venv.sh` で作ってから `deploy/snoo-slam.service` を地図と同じやり方で入れる（`systemctl --user enable --now snoo-slam`）。保存したセッションを流し直して poses.json と比べるのは `HSA_CU_MASK=0:0-71 ~/orca/vggt-slam-venv/bin/python -m scripts.snoo_slam_replay <セッションの置き場> --out /tmp/slam`
 - **テスト**: 重いテストの印（slow）は `tests/conftest.py` の `SLOW` に名前で書く（テストのファイルは直さない）。`make test-fast` で、印が無いのに 3 秒を超えたテストは最後に名前が出る。`make test ARGS='-x'` のように pytest に引数を渡せる
+- **学んだ探り方**: app/snoo_homes.py が 30 坪の家（間取り・家具・人・snoo）をくじから作り、app/snoo_gridsim.py（numpy だけの速いシミュレーター）で探って、次の 1 歩の候補（NBV の上位・切り返し・向きを変える・でたらめ・決まった弧）から選ぶ点数（app/snoo_explore_policy.py の小さな MLP）を PPO で学ぶ（`make train-explore`。重みは `data/snoo_policy/`、確かめの家でいちばん良かったものの写しが `app/snoo_explore_policy.npz`）。候補の作り方と安全の確かめは今と同じで、選ぶところだけが変わる。使うときは地図のサーバーの環境（`~/.config/snoo-map.env`）に `SNOO_EXPLORE_POLICY=<重みの npz の絶対パス>` を書いて `make deploy-map`。書かなければ今まで通り（`decide`）。MuJoCo のベンチ（scripts/snoo_explore_bench.py）では `--param policy=<npz>` か同じ環境変数で試せる。学ぶ側だけが GPU を使い（`--device cuda`）、子のプロセスは torch を読まない。ほかに GPU を開いているプロセスがあれば空くまで待つので、ずっと動いている画像のサーバー（rocm_opencv_server-server-1。`make phase-train` でも止まらない）は `make train-explore ARGS="--gpu-allow <その pid>"` で待たないことにする。2026-10-30 の結果（150 回・10800 軒・1.9 時間）：学んでいない 48 軒の 20 分で decide 25.8 → 30.3 m²（家具にぶつかった数 11 → 0）、MuJoCo のベンチ（8 くじ × 8 分）で作り物の部屋 8.93 → 9.56 m²・実走の部屋 14.52 → 15.76 m²（家具 0 のまま）
 - **replay**: 地図のサーバーはステーションごとに VGGT の出力をセッションの `vggt.npz` に上書きするので、決め直せるのはそれを作ったステーション（ふつうは最後）の 1 歩。VGGT の代わりに `vggt.npz` を読み、サーバーと同じ `plan_station` を通す。もとのセッションには書かず、`/tmp/snoo-replay/<セッション>` に room.json・topdown.png・plan.json を作る。前に Pi に返したものと違えば終了コード 1（`ARGS=--allow-diff` で 0）
 
 ## 実機で探索する日の手順（snoo）
