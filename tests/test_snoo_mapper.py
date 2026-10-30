@@ -409,3 +409,14 @@ def test_station_inliers_drops_one_frame_far_from_the_rest():
     spread = np.zeros((6, 3))
     spread[:, 0] = [0.0, 0.08, 0.16, -0.08, -0.16, 0.12]
     assert station_inliers(spread).all()
+
+
+def test_forward_actions_are_capped_but_can_be_turned_off():
+    from app.roommap import Pose
+    from app.snoo_mapper import MapParams, random_action
+
+    pose = Pose(0.0, 0.0, 0.0)
+    a = random_action((28.0, 0.40), pose, MapParams(segments=True, max_step_turn_deg=25.0))
+    assert a["distance_cm"] < 15 and a["segments"][0]["distance_cm"] == a["distance_cm"]
+    b = random_action((28.0, 0.40), pose, MapParams(segments=True, max_step_turn_deg=None))
+    assert b["distance_cm"] == 40.0
