@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<!-- PiCar-X（snoo_trucar）を手で動かす画面。地図のサーバー（app/snoo_teleop.py）が返す。
+     家の外へ出られなくても使えるよう、外の CDN もビルドも使わない（素の JS）。
+     入力と送る周り（deadman）は /controller/controller.js（シミュレーターの /sim と共に使う）。 -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0e1114">
+<title>snoo 操縦</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/controller/controller.css">
+<style>
+  .map-img { width: 100%; border-radius: 6px; background: #000; display: block; min-height: 60px; }
+  .toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: #222a33;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; font-size: 13px; opacity: 0;
+    transition: opacity .2s; pointer-events: none; z-index: 10; }
+  .toast.show { opacity: 1; }
+  .warnbox { border-color: #5a4a1e; color: var(--warn); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>snoo <span>操縦</span></h1>
+  <span class="pill" id="pill-pi"><i></i><span>Pi：まだ見えない</span></span>
+  <span class="pill" id="pill-op"><i></i><span>送っていない</span></span>
+  <span class="pill" id="pill-pad"><i></i><span>ゲームパッド無し</span></span>
+  <div class="spacer"></div>
+  <a href="/twin" style="color:var(--muted);font-size:12px">ツイン</a>
+</header>
+
+<main class="ctl">
+  <section class="view">
+    <div class="frame" id="cam-frame">
+      <img id="cam" alt="">
+      <span class="tag" id="cam-tag">カメラ</span>
+      <div class="empty" id="cam-empty">今のカメラの画像はまだ無い（検出サーバーにフレームが来ていない）</div>
+    </div>
+    <button class="stop" id="stop">止める</button>
+    <div id="sticks"></div>
+    <div class="card warnbox" id="not-accepted" hidden>
+      Pi は今 teleop のモードではないので、送っても車は動かない。USR を 6 回押すか、右の「teleop に入れる」
+      （Pi が対応していれば）で入れる。
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="card">
+      <h2>車</h2>
+      <dl class="kv" id="kv"></dl>
+    </section>
+    <section class="card">
+      <h2>操作</h2>
+      <div class="buttons">
+        <button id="mode-teleop">teleop に入れる</button>
+        <button id="mode-idle">idle に戻す</button>
+      </div>
+      <div class="buttons" style="margin-top:8px">
+        <button id="horn">鳴らす（A）</button>
+        <button id="center">首を正面に（Y）</button>
+        <button id="hold" title="右のスティックを離しても首をその向きに保つ">首を保つ：切</button>
+      </div>
+      <div class="inputs" id="inputs" style="margin-top:8px"></div>
+    </section>
+    <section class="card">
+      <h2>地図</h2>
+      <img class="map-img" id="map" alt="">
+    </section>
+    <section class="card desk help">
+      <h2>使い方</h2>
+      ゲームパッド：左のスティック＝前後とハンドル、右のスティック＝首、A＝鳴らす、B＝止める、Y＝首を正面に。<br>
+      キーボード：<kbd>W</kbd><kbd>S</kbd> 前後、<kbd>A</kbd><kbd>D</kbd> ハンドル、矢印＝首、
+      <kbd>Space</kbd> 止める、<kbd>H</kbd> 鳴らす。<br>
+      離して 0.5 秒で止める指令を送る。Pi は 0.3 秒新しい指令が来なければ自分で止まる。
+      速さは前 15（約 25 cm/s）・後ろ 10 まで。Pi の安全（snoo に 30 cm より近づかない・電池・
+      超音波・clear_cm）はいつも効く。<br>
+      スマホで開くときは、その IP を SNOO_MAP_ALLOW に足す（README の「操縦」）。
+    </section>
+  </aside>
+</main>
+<div class="toast" id="toast"></div>
+
+<script src="/controller/controller.js"></script>
+<script src="/drive/static/drive.js"></script>
+</body>
+</html>

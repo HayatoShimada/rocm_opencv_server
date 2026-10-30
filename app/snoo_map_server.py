@@ -36,6 +36,9 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
   認証が無く、撮った部屋の画像が見えるため）。例：
       SNOO_MAP_ALLOW=192.168.0.188,100.73.14.8,127.0.0.1,100.x.y.z \\
           .venv/bin/python -m app.snoo_map_server
+  入っていない機械のブラウザには、足し方を書いた 403 の画面を返す
+- GET /drive・/v1/snoo/teleop/...：人がゲームパッド・キーボード・スマホで車を動かす画面と API
+  （app/snoo_teleop.py。Pi 側の決まりは docs/teleop.md）
 
 受けたステーションは <SNOO_MAP_DATA>/<session_id>/<station_id:03d>/ に画像と meta.json で残し、
 結果（vggt.npz・room.json・topdown.png・plan.json など）はセッションの置き場に書く。
@@ -75,7 +78,7 @@ from typing import Annotated
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from app import snoo_mapper
 from app.roommap import (
@@ -1185,6 +1188,9 @@ def create_app(
             if host not in refused:  # 同じ送り元は 1 回だけ書く
                 refused.add(host)
                 log.warning("%s は受ける送り元に無いので断る", host)
+            if "text/html" in request.headers.get("accept", ""):
+                # ブラウザ（スマホで /drive を開いたときなど）には、足し方を日本語で見せる
+                return HTMLResponse(refused_page(host), 403)
             return JSONResponse({"detail": "この送り元からは受けない"}, 403)
         if request.method == "POST":
             # 読み始める前に大きさで断る（multipart はいったん全部読まれてしまう）
@@ -1285,7 +1291,42 @@ def create_app(
         add_home(app, home_root)
     add_twin(app, root, Path(live_dir) if live_dir else None)
     add_agent(app, root, Path(live_dir) if live_dir else None)
+    add_teleop_api(app)
     return app
+
+
+def refused_page(host: str) -> str:
+    """送り元の制限で断ったときにブラウザへ見せる、足し方の説明（HTML）。"""
+    import html
+
+    h = html.escape(host or "?")
+    return f"""<!DOCTYPE html><html lang="ja"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snoo：この機械は入れない</title>
+<body style="font:15px/1.6 system-ui,sans-serif;background:#0e1114;color:#d5dbe2;
+padding:16px;max-width:40em">
+<h1 style="font-size:18px">この機械（{h}）からは開けない</h1>
+<p>地図のサーバーには認証が無く、部屋の画像が見えて車も動かせるので、決めた送り元（SNOO_MAP_ALLOW）
+だけを受けています。この機械で開くには、サーバーのマシンで次のようにして IP を足してください。</p>
+<ol>
+<li><code>~/.config/snoo-map.env</code> の <code>SNOO_MAP_ALLOW=</code> の行の終わりに
+<code>,{h}</code> を足す（無ければ
+<code>SNOO_MAP_ALLOW=192.168.0.188,100.73.14.8,127.0.0.1,{h}</code> と書く）</li>
+<li><code>make deploy-map</code>（地図のサービスを起動し直す）</li>
+</ol>
+<p>スマホは家の Wi-Fi か tailscale の IP（100.x.y.z）で開くと IP が変わりにくい。</p>
+</body></html>"""
+
+
+def add_teleop_api(app: FastAPI) -> None:
+    """手で動かす API と /drive の画面（app/snoo_teleop.py）を足す。読み込めなくても
+    地図のサーバーは動かす。"""
+    try:
+        from app.snoo_teleop import add_teleop
+
+        add_teleop(app)
+    except Exception:
+        log.exception("teleop の API を足せなかった（地図のサーバーはそのまま動かす）")
 
 
 HOME_OUTPUTS = {"home.png": "image/png", "home.json": "application/json"}
