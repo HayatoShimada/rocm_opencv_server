@@ -90,7 +90,8 @@ def relative(a: Pose, b: Pose) -> Pose:
 
 @dataclass
 class Edge:
-    """a から見た b の位置（z）と、その確からしさ（1σ）。kind は window・odom・loop。"""
+    """a から見た b の位置（z）と、その確からしさ（1σ）。kind は window・odom・loop・roma
+    （roma は app/snoo_roma.py。odom 以外は外れ値として外せる）。"""
 
     a: int
     b: int
