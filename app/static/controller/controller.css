@@ -45,6 +45,7 @@ main.ctl { flex: 1; display: grid; gap: 10px; padding: 10px;
 .frame { position: relative; background: #000; border-radius: 8px; overflow: hidden;
   aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center; }
 .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.frame .tag.bottom { top: auto; bottom: 6px; }
 .frame .empty { position: absolute; color: var(--muted); font-size: 13px; padding: 12px; text-align: center; }
 .frame .tag { position: absolute; left: 8px; top: 6px; font: 11px var(--mono); color: #fff;
   background: rgba(0, 0, 0, .55); padding: 1px 6px; border-radius: 4px; }

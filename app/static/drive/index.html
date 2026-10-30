@@ -17,6 +17,9 @@
     transition: opacity .2s; pointer-events: none; z-index: 10; }
   .toast.show { opacity: 1; }
   .warnbox { border-color: #5a4a1e; color: var(--warn); font-size: 13px; }
+  /* 止めるのボタンが、いつもスクロールせずに見えるように */
+  #cam-frame { max-height: 62vh; }
+  @media (max-width: 760px) { #cam-frame { max-height: 42vh; } }
 </style>
 </head>
 <body>
@@ -33,7 +36,7 @@
   <section class="view">
     <div class="frame" id="cam-frame">
       <img id="cam" alt="">
-      <span class="tag" id="cam-tag">カメラ</span>
+      <span class="tag bottom" id="cam-tag">カメラ</span>
       <div class="empty" id="cam-empty">今のカメラの画像はまだ無い（検出サーバーにフレームが来ていない）</div>
     </div>
     <button class="stop" id="stop">止める</button>

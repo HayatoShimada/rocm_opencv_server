@@ -41,7 +41,7 @@ snoo_trucar で作るものを、迷わずに作れるよう決めたもの。
 
 ### POST /v1/snoo/teleop/stop（ブラウザ）
 
-体は `{"reason": "button"}` か空。すぐ `speed` を 0 にする（ハンドル・首はそのまま）。seq を見ない。
+体は `{"reason": "button"}` か空（空でも `Content-Length: 0` を付ける。地図のサーバーは長さの無い POST を 411 で断る）。すぐ `speed` を 0 にする（ハンドル・首はそのまま）。seq を見ない。
 次に新しい seq の指令が来るまで止まったまま。
 
 ### GET /v1/snoo/teleop/latest（Pi）
