@@ -613,3 +613,15 @@ def test_a_retrace_follows_only_what_was_driven_in_reverse_order(tmp_path):
     _write_meta(session, 1, prev)
     out = retrace_after_bad(session, 1, {"action": "done", "reason": "bad_registration:001"}, "001")
     assert np.allclose(out, [(0.0, 0.2), (20.0, 0.1)])  # 止まった所まで、後ろから
+
+
+def test_one_stall_without_a_way_back_keeps_the_planned_step(tmp_path, monkeypatch):
+    import app.snoo_map_server as server
+
+    # 下がる道が無いとき（or_reverse が替えない）。1 回止まっただけでは終えない（18:55 の探索）
+    monkeypatch.setattr(server, "or_reverse", lambda action, *a: (action, []))
+    c = _client(tmp_path)
+    can = ["reverse", "segments", "long_step"]
+    assert _post(c, _meta(0, supports=can)).json()["action"] == "move"
+    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
+    assert a["action"] == "move" and not a.get("reverse")

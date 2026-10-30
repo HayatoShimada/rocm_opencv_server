@@ -634,9 +634,15 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     if stalls >= STALL_DONE:
         # 前へ出せない（Pi が 1 cm も走らなかった）が続いたら、待たせ続けずに終える
         action = {"action": "done", "reason": "stalled"}
-    elif stalls and action.get("action") == "move" and not action.get("reverse"):
+    planned = action
+    if (
+        stalls
+        and stalls < STALL_DONE
+        and action.get("action") == "move"
+        and not action.get("reverse")
+    ):
         # 前の前へ行く 1 歩を Pi が 1 cm も走らなかった（超音波・clear_cm で止まった）。同じ所から
-        # でたらめな前への 1 歩を出し続けても走らないので、下がる 1 歩にする（下がれなければ終える）
+        # 前へ出し続けても走らないので、まず下がる 1 歩にする（下がれなければ、下で元の 1 歩に戻す）
         action = {"action": "done", "reason": "unreachable"}
     back = (
         retrace_after_bad(session, station_id, raw, r.stations[-1].name) if params.reverse else None
@@ -647,6 +653,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         action = reverse_action(back, params.segments)
         action["retrace"] = True
     action, pieces = or_reverse(action, r.grid, pose, history(session, station_id, poses), params)
+    if action is not planned and action == {"action": "done", "reason": "unreachable"}:
+        # 下がれなかった。1〜2 回止まっただけで終えると早すぎる（18:55 の探索は 11 か所目で
+        # 終えた）。決めた 1 歩をそのまま試し、続けて止まれば STALL_DONE で終える
+        action = planned
     if pieces:  # 戻る弧を上から見た絵に描き、戻った先を target にする
         r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
         action["target"] = pose_dict(r.step_path[-1])
