@@ -32,6 +32,11 @@ ALIASES = {
     "curl": "sleep",
     "curled": "sleep",
     "rest": "sit",
+    # app/snoo_behavior.py の BehaviorSnoo の名前（走るのは歩く形で脚を速く振る。
+    # 毛づくろいは座った形、嗅ぐのは首を伸ばして立つ形に近い）
+    "run": "walk",
+    "groom": "sit",
+    "sniff": "alert",
 }
 # 毛の色。写真の体の真ん中の色（灰色に少し茶色が混ざる。部屋の明かりで暗く見える）から決めた
 FUR_RGBA = (0.46, 0.43, 0.41, 1.0)
