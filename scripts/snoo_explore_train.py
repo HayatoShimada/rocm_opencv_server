@@ -111,13 +111,20 @@ def make_pool(workers: int):
     return pool
 
 
+# GPU を開いていても待たないプロセス（コマンドラインに含まれる文字）。画像の API のサーバー
+# （compose の server、OpenCL）はずっと動いていて、学習と一緒でも GPU は 7〜9 W のまま
+# だった（ユーザーが「止めなくても良い」と決めた）。番号は起動し直すと変わるので名前で見る
+GPU_ALLOW_CMDS = ("uvicorn app.main:app",)
+
+
 def gpu_users(allow: tuple[int, ...] = ()) -> list[int]:
-    """GPU（/dev/kfd）を開いているプロセスの番号（自分と allow を除く）。"""
+    """GPU（/dev/kfd）を開いているプロセスの番号（自分・allow・GPU_ALLOW_CMDS を除く）。"""
     root = Path("/sys/class/kfd/kfd/proc")
     if not root.is_dir():
         return []
     skip = {os.getpid(), *allow}
-    return [int(p.name) for p in root.iterdir() if p.name.isdigit() and int(p.name) not in skip]
+    pids = [int(p.name) for p in root.iterdir() if p.name.isdigit() and int(p.name) not in skip]
+    return [p for p in pids if not any(c in _cmdline(p) for c in GPU_ALLOW_CMDS)]
 
 
 def _cmdline(pid: int) -> str:
