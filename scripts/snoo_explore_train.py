@@ -78,7 +78,11 @@ def _job(args: tuple) -> dict:
     from app.snoo_explore_rollout import run_episode
 
     seed, mode, weights, sample, budget_s = args
-    r = run_episode(seed, mode, weights, sample=sample, budget_s=budget_s)
+    # 相手の猫（--cat）。mix なら家ごとに、車に反応する猫とでたらめに歩く猫を交互にする
+    cat = os.environ.get("SNOO_TRAIN_CAT", "random")
+    if cat == "mix":
+        cat = "behavior" if seed % 2 == 0 else "random"
+    r = run_episode(seed, mode, weights, sample=sample, budget_s=budget_s, snoo=cat)
     e = r["episode"]
     return {
         "seed": seed,
@@ -317,6 +321,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=OUT)
     parser.add_argument("--hours", type=float, default=4.0, help="今までの分も含めた時間の上限")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    parser.add_argument(
+        "--cat", choices=("random", "behavior", "mix"), default=os.environ.get("SNOO_TRAIN_CAT", "random"),
+        help="相手の猫。behavior は本物に似せて車に反応する猫（座ったまま動かないことも多い）",
+    )  # fmt: skip
     parser.add_argument("--episodes", type=int, default=72, help="1 回に回す家の数")
     parser.add_argument("--budget-s", type=float, default=1200.0, help="1 回の探索（実機の秒）")
     parser.add_argument("--bc-iters", type=int, default=0)
@@ -347,6 +355,7 @@ def main() -> None:
     _LOG = args.out / "train.log"
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, _on_signal)
+    os.environ["SNOO_TRAIN_CAT"] = args.cat  # 子のプロセスは環境変数で受ける
     pool = make_pool(args.workers)
     try:
         run(args, pool)

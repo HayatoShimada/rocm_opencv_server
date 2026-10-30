@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import numpy as np
 
@@ -26,7 +27,9 @@ TIME_COST = 0.002
 # ぶつかった数は重めに数える（1 m² では、後ろの見ていない家具に挟まって前にも後ろにも 1 cm も
 # 動けなくなった家で、同じ切り返しを 40 回以上選び続けた）
 BUMP_COST = 3.0
-AGENT_BUMP_COST = 5.0
+# 人と猫に当たったときの罰（m² 分）。座ったまま動かない猫に何度も当たっていたので、学び直しでは
+# SNOO_AGENT_BUMP_COST で重くする
+AGENT_BUMP_COST = float(os.environ.get("SNOO_AGENT_BUMP_COST", "5.0"))
 
 
 @dataclasses.dataclass
