@@ -148,3 +148,19 @@ def test_window_keeps_only_the_stations_near_the_car():
 
     assert two_stations(1) < two_stations(None)
     assert two_stations(2) == two_stations(None)
+
+
+def test_sim_can_use_the_behavior_cat():
+    sim = Sim(synthetic_room(), rays=(40, 30), seed=3, snoo="behavior")
+    from app.snoo_behavior import BehaviorSnoo
+
+    assert isinstance(sim.snoo, BehaviorSnoo)
+    probe = Sim(synthetic_room(), rays=(40, 30), seed=3)  # 既定は前と同じ RandomWalkSnoo
+    assert type(probe.snoo).__name__ == "RandomWalkSnoo"
+    for _ in range(50):
+        sim.advance(0.5)
+    p = sim.snoo.pose
+    assert p.posture in ("walk", "run", "stand", "sit", "lie", "sleep", "groom", "sniff")
+    assert probe.snoo.free_at(p.x, p.y)
+    with pytest.raises(ValueError):
+        Sim(synthetic_room(), rays=(40, 30), snoo="tiger")

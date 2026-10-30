@@ -643,15 +643,29 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
 # --- 人と snoo ---
 
 
+def agent_ok(home: Home, radius: float, name: str) -> np.ndarray:
+    """人・snoo の真ん中が立てるセル。人は机の下をくぐらない。車が行ける床とつながった所だけ。"""
+    free = home.passable() & (home.kind != HIGH) if name == "person" else home.passable()
+    dist = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 5) * RES_M
+    return (dist > radius + RES_M) & home.reachable_floor()
+
+
+def behavior_snoo(home: Home, start: tuple[float, float], seed: int):
+    """車に反応する snoo（app/snoo_behavior.BehaviorAgent）。start から始める。"""
+    from app.snoo_behavior import BehaviorAgent, BehaviorPose, BehaviorSnoo, grid_free
+
+    rng = np.random.default_rng(seed)
+    free = grid_free(agent_ok(home, SNOO_R_M, "snoo"), home.origin, home.res)
+    pose = BehaviorPose(start[0], start[1], float(rng.uniform(-math.pi, math.pi)))
+    return BehaviorAgent(BehaviorSnoo(pose, free, rng), SNOO_R_M, SNOO_H_M)
+
+
 def _walk(
     home: Home, rng: np.random.Generator, radius: float, speed: float, walk_s, rest_s,
     t_s: float, away: tuple[float, float], name: str, height: float,
 ) -> Agent:  # fmt: skip
     """床の上を、歩く（向きを少しずつ変える）・止まるを繰り返す道のり。"""
-    free = home.passable() & (home.kind != HIGH) if name == "person" else home.passable()
-    dist = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 5) * RES_M
-    ok = dist > radius + RES_M
-    ok &= home.reachable_floor()
+    ok = agent_ok(home, radius, name)
     cells = np.argwhere(ok)
     cx, cy = home.origin + (cells[:, 0] + 0.5) * RES_M, home.origin + (cells[:, 1] + 0.5) * RES_M
     far = np.hypot(cx - away[0], cy - away[1]) > 1.0

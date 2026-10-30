@@ -1,0 +1,268 @@
+{
+ "version": 1,
+ "postures": {
+  "walk": {
+   "duration_s": {
+    "median": 4.0,
+    "sigma": 0.7,
+    "source": "prior",
+    "why": "家の中の 1 回の歩きは数秒〜十数秒",
+    "n": 0,
+    "longest_seen_s": 7.8
+   },
+   "next": {
+    "value": {
+     "stand": 0.35,
+     "sit": 0.35,
+     "lie": 0.15,
+     "groom": 0.1,
+     "sleep": 0.05
+    },
+    "source": "prior",
+    "n": 0
+   }
+  },
+  "stand": {
+   "duration_s": {
+    "median": 3.0,
+    "sigma": 0.8,
+    "source": "prior",
+    "why": "立ち止まりは数秒",
+    "n": 0,
+    "longest_seen_s": 0.0
+   },
+   "next": {
+    "value": {
+     "walk": 0.55,
+     "sit": 0.3,
+     "lie": 0.1,
+     "groom": 0.05
+    },
+    "source": "prior",
+    "n": 0
+   }
+  },
+  "sit": {
+   "duration_s": {
+    "median": 30.0,
+    "sigma": 1.0,
+    "source": "prior",
+    "why": "座って見ているのは数十秒〜数分",
+    "n": 2,
+    "longest_seen_s": 85.5
+   },
+   "next": {
+    "value": {
+     "walk": 0.35,
+     "lie": 0.3,
+     "groom": 0.2,
+     "stand": 0.15
+    },
+    "source": "prior",
+    "n": 2.0
+   }
+  },
+  "lie": {
+   "duration_s": {
+    "median": 120.0,
+    "sigma": 1.0,
+    "source": "prior",
+    "why": "寝そべりは数分",
+    "n": 0,
+    "longest_seen_s": 93.0
+   },
+   "next": {
+    "value": {
+     "sleep": 0.35,
+     "sit": 0.3,
+     "groom": 0.2,
+     "walk": 0.1,
+     "stand": 0.05
+    },
+    "source": "prior",
+    "n": 0
+   }
+  },
+  "sleep": {
+   "duration_s": {
+    "median": 900.0,
+    "sigma": 0.8,
+    "source": "prior",
+    "why": "猫は 1 日 12〜16 時間寝て、1 回は数十分",
+    "n": 0,
+    "longest_seen_s": 93.0
+   },
+   "next": {
+    "value": {
+     "lie": 0.5,
+     "groom": 0.25,
+     "sit": 0.15,
+     "walk": 0.1
+    },
+    "source": "prior",
+    "n": 0
+   }
+  },
+  "groom": {
+   "duration_s": {
+    "median": 40.0,
+    "sigma": 0.9,
+    "source": "prior",
+    "why": "毛づくろいは 1 回 数十秒〜数分",
+    "n": 0,
+    "longest_seen_s": 0.0
+   },
+   "next": {
+    "value": {
+     "lie": 0.35,
+     "sit": 0.3,
+     "walk": 0.25,
+     "sleep": 0.1
+    },
+    "source": "prior",
+    "n": 0
+   }
+  }
+ },
+ "share": {
+  "value": {
+   "walk": 0.023,
+   "stand": 0.0,
+   "sit": 0.394,
+   "lie": 0.429,
+   "sleep": 0.154,
+   "groom": 0.0
+  },
+  "source": "data",
+  "n": 327,
+  "why": "録画で snoo が見えていた秒の割合（2026-10-29 夜と動画）"
+ },
+ "walk": {
+  "speed_m_s": {
+   "median": 0.25,
+   "sigma": 0.35,
+   "source": "prior",
+   "why": "猫の歩きは 0.2〜0.5 m/s（家の中ではゆっくり）"
+  },
+  "turn_sd_deg_s": {
+   "value": 25.0,
+   "source": "prior",
+   "why": "歩く向きの揺れ。家具の間をゆっくり曲がる"
+  },
+  "run_speed_m_s": {
+   "value": 1.2,
+   "source": "prior",
+   "why": "驚いて逃げる猫は 1〜2 m/s。家の中は狭いので低め"
+  },
+  "max_speed_m_s": {
+   "value": 2.0,
+   "source": "prior"
+  }
+ },
+ "reaction": {
+  "notice_m": {
+   "value": {
+    "awake": 2.0,
+    "sleep": 0.6
+   },
+   "source": "prior",
+   "why": "起きていれば部屋の向こうの動く物に気づく。寝ていると音か近さで"
+  },
+  "flight_m": {
+   "value": 0.7,
+   "source": "prior",
+   "why": "臆病な猫が速く近づく物から飛び退く距離 0.5〜1 m。録画では 0.56 m/s 以下の行き来なら 0.62 m まで逃げなかった（矛盾しない）"
+  },
+  "fast_m_s": {
+   "value": 0.56,
+   "source": "data",
+   "n": 5,
+   "why": "0.7 m より内で 0.51 m/s で近づかれても逃げなかった。速いのはこれより上"
+  },
+  "choice": {
+   "value": {
+    "fast": {
+     "flee": 0.55,
+     "retreat": 0.25,
+     "freeze": 0.15,
+     "approach": 0.0,
+     "ignore": 0.05
+    },
+    "slow": {
+     "flee": 0.068,
+     "retreat": 0.136,
+     "freeze": 0.682,
+     "approach": 0.045,
+     "ignore": 0.068
+    },
+    "still": {
+     "flee": 0.0,
+     "retreat": 0.1,
+     "freeze": 0.25,
+     "approach": 0.25,
+     "ignore": 0.4
+    }
+   },
+   "source": "data",
+   "n": {
+    "slow": 6
+   },
+   "why": "車が動いた回の、その間と後 5 秒の様子の数え（prior を 5 回分混ぜた）。n の無い組は prior のまま。その場に居た回は freeze"
+  },
+  "freeze_s": {
+   "median": 11.8,
+   "sigma": 0.8,
+   "source": "data",
+   "n": 5,
+   "why": "車が行き来する間、その場で座って見ていた長さ（場面の端で切れるので下限）"
+  },
+  "sniff_m": {
+   "value": 0.3,
+   "source": "prior",
+   "why": "嗅ぐときは鼻が届くまで（体の中心で 30 cm ほど）"
+  },
+  "sniff_s": {
+   "median": 4.0,
+   "sigma": 0.6,
+   "source": "prior",
+   "why": "嗅ぐのは数秒"
+  },
+  "approach_speed_m_s": {
+   "median": 0.15,
+   "sigma": 0.3,
+   "source": "prior",
+   "why": "知らない物にはそろそろと近づく"
+  },
+  "retreat_m": {
+   "value": 1.2,
+   "source": "prior",
+   "why": "ゆっくり離れて、この距離まで空ける"
+  },
+  "safe_m": {
+   "value": 1.8,
+   "source": "prior",
+   "why": "逃げたら、この距離まで離れる（部屋の外へ出ることもある）"
+  },
+  "cooldown_s": {
+   "value": 8.0,
+   "source": "prior",
+   "why": "反応の後しばらくは同じ車に反応し直さない"
+  },
+  "habituation": {
+   "value": 0.85,
+   "source": "prior",
+   "why": "何も起きなかった反応 1 回ごとに逃げる確率を掛ける"
+  },
+  "habituation_floor": {
+   "value": 0.35,
+   "source": "prior",
+   "why": "慣れても逃げる確率はこれより下げない"
+  }
+ },
+ "meta": {
+  "note": "scripts/snoo_behavior_fit.py が data/snoo_behavior/tracks から作った",
+  "sessions": 73,
+  "snoo_seen_s": 327.4,
+  "events": 8
+ }
+}

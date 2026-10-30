@@ -47,10 +47,14 @@ def run_episode(
     budget_s: float = 1200.0,
     rng_seed: int = 0,
     keep_sim: bool = False,
+    snoo: str = "random",
 ) -> dict:
-    """1 回探って、結果（Episode）と、点数で選んだ周ごとの Step（学ぶとき）を返す。"""
+    """1 回探って、結果（Episode）と、点数で選んだ周ごとの Step（学ぶとき）を返す。
+
+    snoo="behavior" なら、猫は車に反応する BehaviorSnoo（app/snoo_behavior.py）になる。
+    """
     home = make_home(home_seed, agent_t_s=budget_s + 120)
-    sim = GridSim(home)
+    sim = GridSim(home, snoo=snoo)
     steps: list[Step] = []
     marks: list[tuple[float, float, int, int]] = []  # 選んだときの (秒, 床 m², 家具, 人と猫)
     scorer = Scorer(weights) if weights is not None else None

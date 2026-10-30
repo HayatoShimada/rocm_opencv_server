@@ -132,6 +132,7 @@ class GridSim:
         view_m: float = 2.0,
         ray_deg: float = 0.5,
         agents: bool = True,
+        snoo: str = "random",
     ):
         self.home = home
         self.pace = pace
@@ -139,9 +140,21 @@ class GridSim:
         self.params = params or MapParams(
             camera_height_m=CAM_H_M, segments=True, reverse=True, max_stations=400, policy=None
         )
-        self.agents = home.agents if agents else []
+        self.agents = list(home.agents) if agents else []
+        if agents and snoo == "behavior":
+            # 前もって作った道のりの snoo を、車に反応する猫に替える（同じ所から始める）
+            from app.snoo_homes import behavior_snoo
+
+            self.agents = [
+                behavior_snoo(home, a.at(0.0), home.seed + 7) if a.name == "snoo" else a
+                for a in self.agents
+            ]
+        elif snoo not in ("random", "behavior"):
+            raise ValueError(f"snoo の種類が分からない: {snoo}")
         self.grid: Grid = home.grid()
         self.pose = home.start  # カメラの真下
+        # 動く物（BehaviorAgent）に見せる、いまの車のカメラの姿勢（走っている間も 1 cm ごとに）
+        self.pose_now = home.start
         self.t = 0.0
         self.stations: list[StationResult] = []
         self.driven: list[tuple[float, float]] = []
@@ -174,7 +187,10 @@ class GridSim:
     # --- 家の様子 ---
 
     def agents_at(self, t: float) -> list[tuple[float, float, float, float]]:
-        """時刻 t の人・snoo の (x, y, 半径, 高さ)。"""
+        """時刻 t の人・snoo の (x, y, 半径, 高さ)。車に反応する物には、いまの車を見せてから。"""
+        for a in self.agents:
+            if hasattr(a, "follow"):
+                a.follow(t, self.pose_now)
         return [(*a.at(t), a.radius, a.height) for a in self.agents]
 
     def _layers(self, t: float, ix: np.ndarray, iy: np.ndarray):
@@ -298,6 +314,7 @@ class GridSim:
         done, result = 0.0, "ok"
         while done < distance_m - 1e-9:
             ds = min(0.01, distance_m - done)
+            self.pose_now = Pose(x + CAM_X_M * math.cos(yaw), y + CAM_X_M * math.sin(yaw), yaw)
             nx, ny, nyaw = arc(x, y, yaw, steer, sign * ds)
             hit = self._hits(nx, ny, nyaw, self.t)
             if hit:
@@ -319,7 +336,7 @@ class GridSim:
                     break
         c, s = math.cos(yaw), math.sin(yaw)
         cyaw = (yaw + math.pi) % (2 * math.pi) - math.pi
-        self.pose = Pose(x + CAM_X_M * c, y + CAM_X_M * s, cyaw)
+        self.pose = self.pose_now = Pose(x + CAM_X_M * c, y + CAM_X_M * s, cyaw)
         self.trail.append(self.pose)
         return result, done
 
