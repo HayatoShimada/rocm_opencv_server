@@ -229,3 +229,15 @@ def test_decide_uses_the_policy_when_given(tmp_path):
     assert action["action"] == "move" and action["policy"]["kind"] in (
         "nbv", "turn", "reverse", "random", "arc",
     )  # fmt: skip
+
+
+def test_reference_weights_load_and_choose_a_step():
+    """リポジトリに置いた重み（app/snoo_explore_policy.npz）が特徴の数と合い、decide で使える。"""
+    from pathlib import Path
+
+    ref = Path(__file__).resolve().parents[1] / "app" / "snoo_explore_policy.npz"
+    Scorer.load(ref)
+    sim = _scanned()
+    params = MapParams(camera_height_m=0.08, segments=True, reverse=True, policy=str(ref))
+    action, _ = decide(sim.grid, sim.stations, params, [0.08])
+    assert action["action"] == "move" and "policy" in action
