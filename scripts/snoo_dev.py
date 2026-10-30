@@ -335,11 +335,47 @@ def journal(since: float) -> str:
     return user("journalctl", "--user", "-u", MAP_UNIT, "--since", since_arg, "-o", "cat").stdout
 
 
-def deploy_map(timeout: float) -> int:
+# 探索中に起動し直すなら、返事を返してからこの秒までに始める（Pi は 1 歩走って首を振るので、
+# 次のステーションを送るまで 10 秒ほどある。起動し直しは 1 秒ほど）
+LIVE_WINDOW_S = 3.0
+# これより長く返事が無ければ、探索していないとみなしてすぐ起動し直す
+LIVE_IDLE_S = 60.0
+
+
+def busy_state() -> dict | None:
+    try:
+        with urllib.request.urlopen(f"{MAP_URL}/v1/snoo/map/busy", timeout=2) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def wait_between_stations(timeout: float) -> bool:
+    """Pi が 1 歩走っている間（move を返した直後）か、探索していないときまで待つ。"""
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        b = busy_state()
+        if b is None:  # 古いサーバー（busy が無い）・止まっている
+            return True
+        age = b.get("since_reply_s")
+        if b.get("in_flight", 0) == 0 and (age is None or age >= LIVE_IDLE_S):
+            return True
+        if b.get("in_flight", 0) == 0 and age is not None and age <= LIVE_WINDOW_S:
+            print(f"返事を返して {age:.1f} 秒（Pi は走っている）。いま起動し直す")
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def deploy_map(timeout: float, wait_s: float = 90.0) -> int:
     t0 = time.monotonic()
     if user("systemctl", "--user", "cat", MAP_UNIT).returncode != 0:
         print(f"{MAP_UNIT} のサービスが無い。README の「開発の流れ」の入れ方で入れる")
         return 2
+    # 探索を止めずに入れ替える：ステーションを受けている間は起動し直さない
+    if not wait_between_stations(wait_s):
+        print(f"{wait_s:.0f} 秒待っても、ステーションの間が来なかった。起動し直さない")
+        return 1
     since = time.time() - 1
     p = user("systemctl", "--user", "restart", MAP_UNIT)
     if p.returncode != 0:
@@ -435,6 +471,7 @@ def main() -> None:
     w.add_argument("--latency-timeout", type=float, default=15)
     m = sub.add_parser("deploy-map")
     m.add_argument("--timeout", type=float, default=60)
+    m.add_argument("--wait", type=float, default=90, help="ステーションの間を待つ秒")
     args = parser.parse_args()
     if args.cmd == "status":
         sys.exit(status())
@@ -446,7 +483,7 @@ def main() -> None:
             print(f"{CONTAINER} が無い")
             sys.exit(1)
         sys.exit(wait_detector(info["State"]["StartedAt"], args.timeout, args.latency_timeout))
-    sys.exit(deploy_map(args.timeout))
+    sys.exit(deploy_map(args.timeout, args.wait))
 
 
 if __name__ == "__main__":
