@@ -162,7 +162,7 @@ def main() -> None:
     load_postures()  # 姿勢の本が読めることを先に確かめる
     views = Views()
     rows = []
-    for name in POSTURES:
+    for name in (n for n in POSTURES if n in SOURCES):  # 写真の無い姿勢（毛づくろい・嗅ぐ）は除く
         place(views.sim, name, 1.0, 30)
         cam = label(views.car_cam(), f"robot camera 8 cm ({library[name]['source']})")
         q34 = label(views.three_quarter(), "3/4 view")
