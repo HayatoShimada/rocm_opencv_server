@@ -1123,6 +1123,17 @@ def create_router(
                         "checks": checks,
                     }
                 )
+                if c.kind == "stop":
+                    # Pi は stop を先に受けて前のものを飛ばすので、まだ渡していないものは取り消す
+                    # （残すと期限まで queued のままで、次の move を並べられない）
+                    res = latest_results()
+                    for x in commands.read():
+                        if int(x["id"]) < cid and status_of(x, res, now) == "queued":
+                            with results.lock:
+                                results.append(
+                                    {"id": int(x["id"]), "t": round(now, 3),
+                                     "status": "cancelled", "reason": "stop", "detail": {}}
+                                )  # fmt: skip
         support = pi_support()
         return {
             "queued": ok,

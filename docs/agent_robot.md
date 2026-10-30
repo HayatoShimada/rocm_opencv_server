@@ -172,6 +172,7 @@ GET /v1/snoo/agent/commands/next?after=11&mode=agent&battery_v=7.62&sonar_cm=&ru
   `battery_v`、`sonar_cm`（測れなければ空）、`running`: 実行中の指令の id（無ければ省く）、`supports`: 受けられる kind）
 - `command` は `after` より大きい id の、まだ誰も受けていない（結果の無い）・期限の切れていない指令のうち、
   いちばん古いもの。ただし `stop` があれば、それより前のものを飛ばして最新の `stop` を返す
+  （stop を並べたとき、まだ Pi が受けていない前の指令はサーバーが `cancelled`（reason `stop`）にする）
 - 期限（`expires_at`、並べてから 15 秒。stop は 60 秒）を過ぎたものはサーバーが渡さない。サーバーが確かめた
   ときの様子から変わっているかもしれないので、遅れた move は走らない
 - Pi は受けたらすぐ `accepted` を書き（下）、`after` をその id にする。Pi を起動し直したら `after=0` でよい

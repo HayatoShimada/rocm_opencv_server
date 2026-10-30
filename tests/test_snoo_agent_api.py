@@ -423,6 +423,15 @@ def test_pi_poll_gets_commands_reports_status_and_stop_goes_first(env):
     assert "pi_mode" in failed(move(c))
 
 
+def test_stop_cancels_commands_the_pi_has_not_taken(env):
+    c = env["client"]
+    move(c)
+    c.post(f"{PREFIX}/command", json={"kind": "stop"})
+    got = c.get(f"{PREFIX}/command/1").json()
+    assert got["status"] == "cancelled" and got["result"]["reason"] == "stop"
+    assert move(c)["queued"]  # 取り消した move は待たない
+
+
 def test_commands_expire(env):
     now = [1000.0]
     app = FastAPI()
