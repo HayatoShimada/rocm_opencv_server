@@ -58,6 +58,8 @@ SNOO_POSE_GRAPH=1（既定）なら、ステーションの位置は位置のグ
 graph_edges.jsonl に足し、全部を解き直して graph_poses.json と poses.json に書く。前に残した
 obs.npz は、読むときにグラフの位置へ置き直す。窓で位置合わせが崩れても、グラフで位置が
 決まれば戻らずにそのまま探る（見たものは足さない）。グラフで落ちたら今までの決め方で続ける。
+SNOO_ROMA_EDGES=1（既定は 0）なら、前のステーションと近くに戻ってきた組の候補 1 つを RoMa v2 に
+通した辺（app/snoo_roma.py、kind "roma"）もグラフに足す。RoMa v2 は使うときに読む。
 
 認証が無いので、SNOO_MAP_ALLOW に書いた送り元（Pi の LAN と tailscale の IP）以外には 403 を返す
 （app/snoo.py の検出サーバーと同じやり方）。GPU は猫の検出（Docker の snoo）と分け合うので、
@@ -87,6 +89,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from app import atomic, snoo_mapper
 from app import snoo_posegraph as pg
+from app import snoo_roma as sr
 from app.roommap import (
     FIT_TOL_M,
     LONG_STEP_M,
@@ -670,8 +673,9 @@ def solve_graph(
     results: list,
     heights: list[float | None],
     known: dict[int, Pose],
+    extra: list[pg.Edge] | None = None,
 ) -> GraphPoses:
-    """このステーションの窓の辺と走った辺を足し、全部の辺で位置を解き直す。
+    """このステーションの窓の辺と走った辺（と extra。RoMa の辺）を足し、全部の辺で位置を解き直す。
 
     results は窓の座標のステーションの位置（build_map の答えを to_session で直す前のもの）。
     known は今までの決め方の位置（セッションの座標）。グラフは最初のステーションを止めて解き、
@@ -684,6 +688,7 @@ def solve_graph(
     odom = odom_edge_for(session, station_id)
     if odom is not None:
         edges.append(odom)
+    edges += extra or []
     rows = write_graph_edges(session, station_id, edges)
     state = read_graph_state(session)
     bad = {int(i) for i in state.get("bad", [])} - {station_id}
@@ -751,13 +756,74 @@ def graph_poses(
     results: list,
     heights: list,
     known: dict[int, Pose],
+    extra: list[pg.Edge] | None = None,
 ) -> GraphPoses | None:
     """solve_graph。落ちたら None（今までの決め方で続ける。地図のサーバーを 500 にしない）。"""
     try:
-        return solve_graph(session, station_id, window, results, heights, known)
+        return solve_graph(session, station_id, window, results, heights, known, extra)
     except Exception:
         graph_failed(session, "解く")
         return None
+
+
+# --- RoMa v2 の辺（app/snoo_roma.py） ---
+
+# 新しいステーションと前のステーション、近くに戻ってきた組の候補 1 つを RoMa v2 に通し、
+# 位置のグラフに "roma" の辺を足すか（SNOO_POSE_GRAPH=1 のときだけ）。既定は使わない。
+# VGGT が白い壁・暗い所で崩れたステーションでも、向きを 2〜3° で測れる。保存した
+# explore_20261030_190244 で、壁の重なりが 0.74 → 0.84〜0.86、確かめに取っておいた戻ってきた組
+# との差が 6.7・20.5 → 1.7・15.0 cm（中央値・90 %）になった（scripts/snoo_roma_eval.py）。
+# この口を 1 か所ずつ流し直すと（scripts/snoo_graph_replay.py --roma）、その差は 5.7・12.0 →
+# 2.1・5.8 cm、走った辺だけで決まったステーションは 9 → 2 か所
+# RoMa v2 は venv に入れずに、clone した src（SNOO_ROMA_SRC）から読む。重みは約 1.5 GB、
+# GPU のメモリは 1 組ずつで 3.5 GB ほど。1 組 0.6 秒ほどで、1 か所 2 ジョブ・8 組まで
+ROMA_EDGES = os.getenv("SNOO_ROMA_EDGES", "0") == "1"
+# 1 組ごとに、かかった時間の何倍休むか（家のブレーカーが落ちたので、GPU の電力の山を下げる）
+ROMA_REST = float(os.getenv("SNOO_ROMA_REST", "1.0"))
+_roma_model = None
+_roma_failed: set[str] = set()
+
+
+def roma_match(pairs: list[tuple[str, str]]) -> list[dict]:
+    """コマの組を 1 組ずつ RoMa v2 に通す。最初に呼ばれたときに読む。"""
+    global _roma_model
+    if _roma_model is None:
+        t = time.perf_counter()
+        _roma_model = sr.load_model()
+        log.info("RoMa v2 を読んだ（%.1f 秒）", time.perf_counter() - t)
+    out = []
+    for k, p in enumerate(pairs):
+        t = time.perf_counter()
+        out += sr.match_pairs(_roma_model, [p])
+        if ROMA_REST > 0 and k < len(pairs) - 1:
+            time.sleep(ROMA_REST * (time.perf_counter() - t))
+    return out
+
+
+def roma_edges_for(session: Path, station_id: int, match=None) -> tuple[list[pg.Edge], list]:
+    """station_id の RoMa の辺（前のステーションと、戻ってきた組の候補 1 つまで）と記録。
+    今の位置は graph_poses.json（前のステーションまで）に、走った辺を足したもの。
+    落ちたら空（セッションごとに 1 回だけ書く。地図のサーバーは止めない）。
+    """
+    try:
+        state = read_graph_state(session)
+        prior = {int(k): Pose(*map(float, v)) for k, v in state.get("poses", {}).items()}
+        odom = odom_edge_for(session, station_id)
+        if odom is not None and station_id - 1 in prior:
+            prior[station_id] = to_frame(prior[station_id - 1], odom.z)
+        need = {station_id - 1, station_id, sr.revisit_candidate(station_id, prior)}
+        dirs = {i: station_dir(session, i) for i in need if i is not None and i >= 0}
+        dirs = {i: d for i, d in dirs.items() if (d / "meta.json").is_file()}
+        if station_id not in dirs:
+            return [], []
+        stills = {i: load_still(d).frames for i, d in dirs.items()}
+        dyaw = math.degrees(odom.z.yaw) if odom is not None else None
+        return sr.station_edges(stills, dirs, station_id, prior, match or roma_match, dyaw)
+    except Exception:
+        if session.name not in _roma_failed:
+            _roma_failed.add(session.name)
+            log.exception("%s: RoMa の辺で落ちたので、RoMa の辺なしで続ける", session.name)
+        return [], []
 
 
 def bad_stations(session: Path) -> set[int]:
@@ -826,9 +892,20 @@ def plan_station(
             poses[i] = to_session(anchor, s.pose)
     graph = None
     if POSE_GRAPH:
+        extra = []
+        if ROMA_EDGES:
+            t_roma = time.perf_counter()
+            with gpu_busy():
+                extra, jobs = roma_edges_for(session, station_id)
+            marks["roma"] = time.perf_counter() - t_roma
+            marks["roma_edges"] = float(len(extra))  # marks は数だけ（ログで %.2f にする）
+            if jobs:
+                log.info("%s/%03d: RoMa %s", session.name, station_id, jobs)
         # 窓の座標のままのステーションの位置（to_session で直す前）で、窓の辺を作る
         t_graph = time.perf_counter()
-        graph = graph_poses(session, station_id, window, r.stations, params.camera_height_m, poses)
+        graph = graph_poses(
+            session, station_id, window, r.stations, params.camera_height_m, poses, extra
+        )
         marks["graph"] = time.perf_counter() - t_graph
     # 自分の窓で崩れたステーションは、後の窓で位置が合っても見たものを足さない（点が当てにならない）
     bad = graph.bad if graph is not None else bad_stations(session) if POSE_GRAPH else set()

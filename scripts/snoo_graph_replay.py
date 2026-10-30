@@ -12,6 +12,8 @@ VGGT の代わりに、ステーションごとに残した recon.npz（地図�
 次のステーションは変わらない。
 
 もとのセッションには書かない。--out に meta.json だけを写して流す（画像は読まない）。
+--roma にすると、RoMa v2 の辺（SNOO_ROMA_EDGES）も足す。そのときだけ画像へのリンクを置く
+（RoMa は GPU を使う。1 か所 2 ジョブ・8 組まで）。
 """
 
 from __future__ import annotations
@@ -118,6 +120,7 @@ def main() -> None:
     ap.add_argument("--json", type=Path)
     ap.add_argument("--png", type=Path)
     ap.add_argument("--title", default="")
+    ap.add_argument("--roma", action="store_true", help="RoMa v2 の辺も足す（GPU）")
     args = ap.parse_args()
     src = Path(args.session).resolve()
     out = args.out
@@ -127,6 +130,7 @@ def main() -> None:
     out.mkdir(parents=True)
     use_graph = args.graph == "1"
     server.POSE_GRAPH = use_graph  # 古い版（POSE_GRAPH が無い）でも害は無い
+    server.ROMA_EDGES = args.roma
     from scripts.snoo_replay import recon_reconstruct
 
     windows: dict[int, list[int]] = {}
@@ -137,6 +141,9 @@ def main() -> None:
         d = out / f"{i:03d}"
         d.mkdir()
         shutil.copy2(src / f"{i:03d}" / "meta.json", d / "meta.json")
+        if args.roma:
+            for f in (src / f"{i:03d}").glob("*.jpg"):
+                (d / f.name).symlink_to(f)
         recon = src / f"{i:03d}" / server.RECON_FILE
         if not recon.is_file():
             rows.append({"station": i, "skipped": "recon.npz が無い"})
@@ -190,6 +197,9 @@ def main() -> None:
         "map_s_med": _q([r["marks"].get("map") for r in done], 50),
         "map_s_max": _q([r["marks"].get("map") for r in done], 100),
         "graph_s_last10_med": _q([r["marks"].get("graph") for r in done[-10:]], 50),
+        "roma_s_med": _q([r["marks"].get("roma") for r in done], 50),
+        "roma_s_max": _q([r["marks"].get("roma") for r in done], 100),
+        "roma_edges": sum(r["marks"].get("roma_edges", 0) for r in done),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     if args.json:

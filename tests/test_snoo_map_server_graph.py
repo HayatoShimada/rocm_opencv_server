@@ -224,3 +224,67 @@ def test_the_home_map_reads_the_replaced_observations(tmp_path):
     after, _, _ = load_session_grid(session)
     ix, iy = before.cell(np.array([0.5]), np.array([1.0]))
     assert after.logodds[ix[0], iy[0]] > 0 and before.logodds[ix[0], iy[0]] == 0
+
+
+def _fake_roma(truth: Pose, calls: list):
+    """RoMa の代わり：コマの名前のパン・チルトから、truth だけ動いた作り物の対応を返す。"""
+    import re
+
+    from test_snoo_roma import _matches
+
+    def match(pairs):
+        calls.append(pairs)
+        out = []
+        for pa, pb in pairs:
+            (p1, t1), (p2, t2) = (
+                map(int, re.search(r"pan([+-]\d+)_tilt([+-]\d+)", x).groups()) for x in (pa, pb)
+            )
+            ka, kb = _matches(truth, p1, t1, p2, t2)
+            out.append({"ka": ka, "kb": kb, "cert": np.ones(len(ka))})
+        return out
+
+    return match
+
+
+def test_roma_edges_are_added_only_with_the_flag(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "roma_match", _fake_roma(Pose(0.25, 0.0, 0.1), calls))
+    for on in (False, True):
+        root = tmp_path / str(on)
+        monkeypatch.setattr(server, "ROMA_EDGES", on)
+        c = _client(root)
+        assert _post(c, _meta(0)).status_code == 200
+        assert _post(c, _meta(1, prev_step=PREV)).status_code == 200
+        if not on:  # 既定は使わない
+            assert calls == [] and "roma" not in {r["kind"] for r in _rows(root)}
+    roma = [r for r in _rows(root) if r["kind"] == "roma"]
+    assert len(calls) == 1 and len(calls[0]) == 4  # 前のステーションとだけ、コマ 4 組
+    assert [(r["a"], r["b"], r["station"]) for r in roma] == [(0, 1, 1)]
+    x, y, yaw = roma[0]["z"]
+    assert abs(x - 0.25) < 0.02 and abs(y) < 0.02 and abs(yaw - 0.1) < 0.02
+
+
+def test_a_failing_roma_keeps_the_station_going(tmp_path, monkeypatch, caplog):
+    def broken(pairs):
+        raise RuntimeError("GPU が無い")
+
+    monkeypatch.setattr(server, "ROMA_EDGES", True)
+    monkeypatch.setattr(server, "roma_match", broken)
+    monkeypatch.setattr(server, "_roma_failed", set())
+    c = _client(tmp_path)
+    assert _post(c, _meta(0)).status_code == 200
+    with caplog.at_level(logging.ERROR, logger="snoo_map"):
+        assert _post(c, _meta(1, prev_step=PREV)).status_code == 200
+    assert "RoMa の辺で落ちた" in caplog.text
+    assert sorted(r["kind"] for r in _rows(tmp_path)) == ["odom", "window"]
+
+
+def test_roma_revisit_candidate_is_near_and_far_in_order():
+    from app import snoo_roma as sr
+
+    prior = {i: Pose(0.3 * i, 0.0, 0.0) for i in range(6)}
+    prior[6] = Pose(0.1, 0.05, 0.0)  # 0 の近くに戻ってきた
+    assert sr.revisit_candidate(6, prior) == 0
+    assert sr.revisit_candidate(3, prior) is None  # 番号が近いものは数えない
+    prior[6] = Pose(5.0, 5.0, 0.0)
+    assert sr.revisit_candidate(6, prior) is None  # 遠い
