@@ -9,8 +9,9 @@ VGGT の点）を使って、どのステーションの 1 歩でも決め直す
 だけ）を使う。VGGT の代わりにそれを読み、サーバーと同じ plan_station を通す。
 
 もとのセッションには書かない。ステーションの画像と meta.json を出力先（既定は
-/tmp/snoo-replay/<セッション>）に写し、poses.json・reverse.json はそのステーションより前の分だけに
-戻してから決め直す。出力先には room.json・topdown.png・plan.json などができる。
+/tmp/snoo-replay/<セッション>）に写し、poses.json・reverse.json（と位置のグラフの
+graph_edges.jsonl・graph_poses.json）はそのステーションより前の分だけに戻してから決め直す。
+出力先には room.json・topdown.png・plan.json などができる。
 前の返事（plan.json の reply）と同じかを出す。違えば終了コード 1（--allow-diff で 0）。
 """
 
@@ -114,6 +115,27 @@ def prepare(session: Path, out: Path, station: int) -> None:
             shutil.copytree(station_dir(session, i), station_dir(out, i))
     _cut(session / "poses.json", out / "poses.json", station)
     _cut(session / "reverse.json", out / "reverse.json", station)
+    _cut_graph(session, out, station)
+
+
+def _cut_graph(session: Path, out: Path, before: int) -> None:
+    """位置のグラフ（graph_edges.jsonl・graph_poses.json）を、before より前の分だけ写す。
+    graph_poses.json の位置は最後に解いたもので、受けたときのものではない（始めの位置に使うだけ）。
+    """
+    from app.snoo_map_server import GRAPH_EDGES, GRAPH_POSES
+
+    edges = session / GRAPH_EDGES
+    if edges.exists():
+        rows = [x for x in edges.read_text().splitlines() if x.strip()]
+        keep = [x for x in rows if json.loads(x)["station"] < before]
+        (out / GRAPH_EDGES).write_text("".join(x + "\n" for x in keep))
+    state = session / GRAPH_POSES
+    if state.exists():
+        d = json.loads(state.read_text())
+        d["poses"] = {k: v for k, v in d.get("poses", {}).items() if int(k) < before}
+        d["localized"] = [i for i in d.get("localized", []) if i < before]
+        d["bad"] = [i for i in d.get("bad", []) if i < before]
+        (out / GRAPH_POSES).write_text(json.dumps(d, indent=1))
 
 
 def previous_reply(session: Path, station: int) -> dict | None:
