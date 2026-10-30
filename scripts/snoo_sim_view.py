@@ -4,6 +4,7 @@
   MUJOCO_GL=egl python -m scripts.snoo_sim_view --room data/snoo_map/sessions/<id> --out out/sim
 --room が無ければ作り物の部屋（4 x 3 m の居間）を使う。--room には地図のサーバーのセッションの
 置き場か room.json を渡す（その間取りを部屋にする）。
+--fpv は車のカメラから見た動画（explore_fpv.mp4）。--minutes は実機の速さの時計で区切る。
 --explore N で「撮る → 地図を直す → 1 歩走る」を N 回まわし、explore.mp4・last.png・
 summary.json・grid.png を書く。--explore が無ければ、--room の間取りをそのまま地図として
 1 枚だけ描く（frame.png）。
@@ -20,7 +21,7 @@ from pathlib import Path
 import cv2
 
 from app.snoo_mapper import MapParams, grid_png
-from app.snoo_sim import CAM_H_M, Sim, room_from_map, synthetic_room
+from app.snoo_sim import CAM_H_M, REAL_PACE, Sim, room_from_map, synthetic_room
 
 
 def _rays(text: str) -> tuple[int, int]:
@@ -66,19 +67,24 @@ def main() -> None:
     parser.add_argument("--sonar", action="store_true", help="前の超音波を格子に足す")
     parser.add_argument("--segments", action="store_true", help="1 歩を曲がる → まっすぐで走る")
     parser.add_argument("--viewer", action="store_true", help="MuJoCo の窓で見る")
+    parser.add_argument(
+        "--fpv", action="store_true", help="車のカメラから見た動画にする（explore_fpv.mp4）"
+    )
+    parser.add_argument("--minutes", type=float, help="Sim の時計でこの分まで（実機の速さで）")
     args = parser.parse_args()
 
     room = room_from_map(args.room, args.high_board_m) if args.room else synthetic_room()
     params = MapParams(camera_height_m=CAM_H_M, segments=args.segments)
-    sim = Sim(room, rays=args.rays, params=params, seed=args.seed, sonar_map=args.sonar)
+    pace = REAL_PACE if args.minutes else None
+    sim = Sim(room, rays=args.rays, params=params, seed=args.seed, sonar_map=args.sonar, pace=pace)
     if args.viewer:
         run_viewer(sim, args.explore or 20, args.backtrack)
         return
 
-    from app.snoo_sim_render import SimRenderer, VideoWriter
+    from app.snoo_sim_render import FpvRenderer, SimRenderer, VideoWriter
 
     args.out.mkdir(parents=True, exist_ok=True)
-    renderer = SimRenderer(sim)
+    renderer = FpvRenderer(sim) if args.fpv else SimRenderer(sim)
     try:
         if not args.explore:
             if args.room:
@@ -87,7 +93,7 @@ def main() -> None:
             cv2.imwrite(str(args.out / "frame.png"), img)
             print(f"{args.out / 'frame.png'}  next: {json.dumps(sim.action, ensure_ascii=False)}")
             return
-        video = VideoWriter(args.out / "explore.mp4", args.fps)
+        video = VideoWriter(args.out / ("explore_fpv.mp4" if args.fpv else "explore.mp4"), args.fps)
         t0 = time.time()
         last = None
 
@@ -97,7 +103,10 @@ def main() -> None:
             video.write(last)
 
         on_frame(sim)
-        summary = sim.explore(args.explore, on_frame, backtrack=args.backtrack)
+        budget = args.minutes * 60 if args.minutes else None
+        summary = sim.explore(
+            args.explore, on_frame, backtrack=args.backtrack, time_budget_s=budget
+        )
         last = renderer.frame()
         for _ in range(args.fps * 2):  # 最後の絵を 2 秒見せる
             video.write(last)
