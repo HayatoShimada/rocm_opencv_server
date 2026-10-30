@@ -464,7 +464,25 @@ def clearance_from_disparity(
         return Clearance(None, 0.0, grid.blind_cm, "depth")
     with np.errstate(divide="ignore", invalid="ignore"):
         z = np.where(disp - b > 1e-6, a / (disp - b), np.inf)
-    ray = g["ray"]
+    return clearance_from_z(z, grid, path, inliers, max_cm, min_points)
+
+
+def clearance_from_z(
+    z: np.ndarray,
+    grid: Grid,
+    path: Path,
+    confidence: float,
+    max_cm: float = MAX_CM,
+    min_points: int = 4,
+) -> Clearance:
+    """画素ごとの奥行き z（cm、カメラの前への距離。分からない所は inf）から clear_cm を出す。
+
+    相対の深度を床に合わせたもの（clearance_from_disparity）と、metric の単眼の深度
+    （app/snoo_monodepth.py）の両方が、同じ「障害物とみなす点」の決め方を使うために分けた。
+    grid は z と同じ大きさのカメラで作ったもの。
+    """
+    cam = grid.cam
+    ray = grid.rays()["ray"]
     near = np.isfinite(z) & (z < 3 * max_cm)
     z = z[near]
     height = cam.height_cm + z * ray[..., 2][near]
@@ -478,7 +496,7 @@ def clearance_from_disparity(
     counts = np.bincount(si * nl + li, minlength=ns * nl).reshape(ns, nl)
     hit = first_blocked(counts, grid.s, min_points)
     clear = grid.seen_cm if hit is None else min(hit, grid.seen_cm)
-    return Clearance(clear, inliers, grid.blind_cm, "depth")
+    return Clearance(clear, confidence, grid.blind_cm, "depth")
 
 
 class DepthClearance:
