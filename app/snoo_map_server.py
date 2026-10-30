@@ -24,6 +24,9 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
     Pi は今までどおり超音波・clear_cm・動かないときに止まる
   - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
+- SNOO_HOME_MAP=1 なら、セッションを家の地図（app/snoo_home.py、SNOO_HOME_DIR）に合わせて足し、
+  合えば次の 1 歩を家の地図で埋めた格子で決める。GET /v1/snoo/map/home.png・home.json で
+  家の地図とセッションごとの変換を返す。既定は使わない（今までと同じに動く）
 - /v1/snoo/agent/...：AI のエージェントがロボットを見て・印を付けて・動かすための API
   （app/snoo_agent_api.py・docs/agent_robot.md）。読み込めなくても地図のサーバーは動く
 - GET /twin：車と部屋をブラウザで見る画面（app/snoo_twin.py）。地図・ステーション・次の 1 歩・
@@ -566,13 +569,22 @@ def gpu_busy():
             path.unlink(missing_ok=True)
 
 
-def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks: dict) -> dict:
+def plan_station(
+    session: Path,
+    station_id: int,
+    reconstruct: Reconstruct,
+    marks: dict,
+    home_root: Path | None = None,
+) -> dict:
     """セッションのステーションから間取りを作り直し、次の 1 歩を返す（Pi に返す形）。
 
     VGGT は窓（WINDOW か所）だけに通し、最後のステーションの位置と見たものをセッションの座標に
     直して置き場に残す（obs.npz）。次の 1 歩は、全部のステーションの見たものを足した
     セッションの間取り（session_grid）で決める。窓の外で見た所も覚えているので、見た所へ
     戻らない。room.json などもセッションの座標で書く。
+
+    home_root（SNOO_HOME_MAP=1 のとき）があれば、セッションを家の地図に合わせて足し、合っていれば
+    次の 1 歩をセッションと家を合わせた格子で決める（use_home）。
     """
     ids = station_ids(session)
     poses = read_poses(session)
@@ -627,6 +639,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
             mark_steps_driven(r.grid, session, station_id, poses)
         if USE_SLAM:  # 走りながらの SLAM で見た所も足す（app/snoo_slam.py が書く）
             r.slam = mark_slam(r.grid, r.high, session / "slam", params)
+        if home_root is not None:
+            t_home = time.perf_counter()
+            r.grid, r.home = use_home(home_root, session, station_id, r.grid, r.high)
+            marks["home"] = time.perf_counter() - t_home
         r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
         r.step_path = []
         if r.plan is not None:
@@ -767,6 +783,30 @@ def take_override(root: Path, session: str, grid, pose: Pose, params: MapParams)
     if o.get("note"):
         action["note"] = str(o["note"])[:200]
     return action
+
+
+# --- 家の地図（app/snoo_home.py。SNOO_HOME_MAP=1 のとき） ---
+
+# 家の地図を使うか。まだ試しなので既定は使わない
+HOME_MAP = os.getenv("SNOO_HOME_MAP", "0") == "1"
+HOME_DIR = os.getenv("SNOO_HOME_DIR", "data/snoo_map/home")
+
+
+def use_home(home_root: Path, session: Path, station_id: int, grid, high):
+    """セッションを家の地図に合わせて足し、(次の 1 歩に使う格子, plan.json に残す様子) を返す。
+
+    合っていれば、セッションで見ていない所を家の地図で埋めた格子（障害物はどちらかで障害物なら
+    障害物）。見た所へまた行かず、家の地図の境目へ向かう。合っていない・落ちたときは
+    セッションの格子のまま（家の地図が無いときと同じに動く）。
+    """
+    from app.snoo_home import on_station
+
+    try:
+        union, info = on_station(home_root, session, station_id, grid, high)
+    except Exception as e:  # 家の地図で探索を止めない
+        log.exception("%s/%03d: 家の地図を使えなかった", session.name, station_id)
+        return grid, {"error": f"{type(e).__name__}: {e}"}
+    return (union if union is not None else grid), info
 
 
 # --- 止まらずに探り続ける ---
@@ -1073,6 +1113,8 @@ def write_results(
     plan["window"] = info
     plan["timing_s"] = {k: round(v, 3) for k, v in marks.items()}
     plan["slam"] = getattr(r, "slam", None)  # 走りながらの SLAM を間取りに足したか
+    if getattr(r, "home", None) is not None:  # 家の地図に合わせたか（SNOO_HOME_MAP=1）
+        plan["home"] = r.home
     (tmp / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
     for f in tmp.iterdir():
         f.replace(session / f.name)
@@ -1102,10 +1144,15 @@ def create_app(
     allow: list | None = None,
     reconstruct: Reconstruct | None = None,
     live_dir: Path | str | None = LIVE_DIR,
+    home_dir: Path | str | None = None,
 ) -> FastAPI:
+    """home_dir を渡すか SNOO_HOME_MAP=1 なら、家の地図（app/snoo_home.py）を使う。"""
     from app.snoo_twin import add_twin  # snoo_twin がこのモジュールを使うので、ここで読む
 
     root = Path(root)
+    if home_dir is None and HOME_MAP:
+        home_dir = HOME_DIR
+    home_root = Path(home_dir) if home_dir is not None else None
     allow = parse_allow(ALLOW) if allow is None else allow
     reconstruct = VggtReconstruct() if reconstruct is None else reconstruct
     # GPU は 1 つずつ使う。同時に来たリクエストはここで順に待つ
@@ -1207,7 +1254,7 @@ def create_app(
                 )
                 return {"action": "done", "reason": "step_limit"}
             try:
-                action = plan_station(session, sid, reconstruct, marks)
+                action = plan_station(session, sid, reconstruct, marks, home_root)
             except Exception as e:
                 log.exception("%s/%03d を処理できなかった", session.name, sid)
                 raise HTTPException(500, f"間取りを作れなかった: {e}") from e
@@ -1234,9 +1281,33 @@ def create_app(
             raise HTTPException(404, "まだ作っていない")
         return FileResponse(path, media_type=OUTPUTS[name], headers={"Cache-Control": "no-store"})
 
+    if home_root is not None:
+        add_home(app, home_root)
     add_twin(app, root, Path(live_dir) if live_dir else None)
     add_agent(app, root, Path(live_dir) if live_dir else None)
     return app
+
+
+HOME_OUTPUTS = {"home.png": "image/png", "home.json": "application/json"}
+
+
+def add_home(app: FastAPI, home_root: Path) -> None:
+    """GET /v1/snoo/map/home.png・home.json：家の地図と、セッションごとの変換・島の一覧。"""
+
+    def serve(name: str):
+        path = home_root / name
+        if not path.is_file():
+            raise HTTPException(404, "家の地図はまだ無い")
+        return FileResponse(path, media_type=HOME_OUTPUTS[name],
+                            headers={"Cache-Control": "no-store"})  # fmt: skip
+
+    @app.get("/v1/snoo/map/home.png")
+    def home_png():
+        return serve("home.png")
+
+    @app.get("/v1/snoo/map/home.json")
+    def home_json():
+        return serve("home.json")
 
 
 def add_agent(app: FastAPI, root: Path, live_dir: Path | None) -> None:
