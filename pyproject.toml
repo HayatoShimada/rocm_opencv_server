@@ -36,6 +36,11 @@ dev = [
 sim = [
     "mujoco>=3.17.0",
 ]
+# エージェントが話す声（app/snoo_agent_api.py の say）。検出の Docker には要らないので本体とは分ける
+# （uv sync --group agent。main の .venv には VGGT があるので uv pip install pyopenjtalk で足す）
+agent = [
+    "pyopenjtalk>=0.4.1",
+]
 
 [tool.ruff]
 # サブエージェントの作業ツリー（.claude/worktrees）は見ない
