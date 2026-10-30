@@ -62,7 +62,7 @@ from app.roommap import (
     mark_driven,
     mark_sonar,
 )
-from app.snoo_body import FUR_RGBA, JOINT_NAMES, SnooAnimator, body_xml
+from app.snoo_body import JOINT_NAMES, SnooAnimator, assets_xml, body_xml, default_xml
 from app.snoo_mapper import (
     CLUSTER_STATIONS,
     RECENT_STATIONS,
@@ -463,11 +463,12 @@ def build_mjcf(room: Room) -> str:
     <material name="floor" texture="floor" texrepeat="2 2" texuniform="true"/>
     <texture name="sky" type="skybox" builtin="gradient" rgb1="0.32 0.35 0.4"
              rgb2="0.08 0.08 0.1" width="64" height="64"/>
+    {assets_xml()}
   </asset>
   <default>
     <geom contype="0" conaffinity="0"/>
     <default class="car"><geom group="{GROUP_CAR}"/></default>
-    <default class="snoo"><geom group="{GROUP_SNOO}" rgba="{_f(*FUR_RGBA)}"/></default>
+    {default_xml(GROUP_SNOO)}
   </default>
   <worldbody>
     <light name="top" pos="{_f(cx, cy, 3.5)}" dir="0 0 -1" diffuse="0.55 0.55 0.55"
@@ -1047,7 +1048,7 @@ class Sim:
             snoo = make_snoo(room, spot, snoo or "random", seed + 1)
         self.snoo = snoo
         # snoo の関節の角度（姿勢と歩く振り）。描くためで、地図の決め方には関わらない
-        self.snoo_anim = SnooAnimator()
+        self.snoo_anim = SnooAnimator(seed=seed + 2)
         self.snoo_anim.update(0.0, snoo.pose)
         self.car_aabbs = low_aabbs(room, CAR_HEIGHT_M)
         self.grid = Grid()
@@ -1376,7 +1377,9 @@ class Sim:
         """時間を進める（snoo が動く）。"""
         self.t += dt
         self.snoo.step(dt, self.car.camera_pose())
-        self.snoo_anim.update(dt, self.snoo.pose)
+        # 猫はロボットのカメラの方を見る（立って見る・座る・伏せるとき）
+        cam = self.car.camera_pose()
+        self.snoo_anim.update(dt, self.snoo.pose, (cam.x, cam.y, CAM_H_M))
         self.snoo_trail.append(self.snoo.pose)
         if len(self.snoo_trail) > 400:
             self.snoo_trail = self.snoo_trail[-400:]

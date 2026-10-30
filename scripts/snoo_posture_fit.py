@@ -427,6 +427,11 @@ def main() -> None:
                 for j in js:
                     i, k = sb.JOINT_INDEX[f"snoo_{a}_{j}"], sb.JOINT_INDEX[f"snoo_{b}_{j}"]
                     q[i] = q[k] = (q[i] + q[k]) / 2
+        old = postures.get(name, {})
+        if "tail_note" in old:
+            # しっぽを録画に合わせて手で直した姿勢は、しっぽだけ前の値を残す
+            for j in sb.TAIL_JOINTS:
+                q[sb.JOINT_INDEX[j.name]] = sb.to_vector(old["joints"])[sb.JOINT_INDEX[j.name]]
         postures[name] = {
             "source": "hand" if hand else "fit",
             "image": src.image
@@ -436,7 +441,7 @@ def main() -> None:
             "rms": round(fit.rms, 3),
             "camera": [round(float(v), 3) for v in fit.cam],
             "joints": sb.to_angles(q),
-        }
+        } | ({"tail_note": old["tail_note"]} if "tail_note" in old else {})
         print(f"{name}: {src.image} rms {fit.rms:.3f} 点 {len(fit.used)} "
               f"cam {np.round(fit.cam, 2).tolist()} {'hand' if hand else 'fit'}")  # fmt: skip
         img = load_image(src.image)
