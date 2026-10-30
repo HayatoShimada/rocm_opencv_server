@@ -188,3 +188,20 @@ def test_same_reply_ignores_map_url():
     a = {"action": "move", "map_url": "/v1/snoo/map/a/topdown.png"}
     assert snoo_replay.same_reply(a, {"action": "move", "map_url": "/v1/snoo/map/b/topdown.png"})
     assert not snoo_replay.same_reply(a, {"action": "done"})
+
+
+def test_deploy_waits_for_the_gap_between_stations(monkeypatch):
+    import scripts.snoo_dev as dev
+
+    states = iter([
+        {"in_flight": 1, "since_reply_s": 9.0, "last": "move"},  # 受けている
+        {"in_flight": 0, "since_reply_s": 9.0, "last": "move"},  # 次がもうすぐ来る
+        {"in_flight": 0, "since_reply_s": 0.5, "last": "move"},  # 返した直後（Pi は走っている）
+    ])  # fmt: skip
+    monkeypatch.setattr(dev, "busy_state", lambda: next(states))
+    monkeypatch.setattr(dev.time, "sleep", lambda s: None)
+    assert dev.wait_between_stations(5)
+    monkeypatch.setattr(dev, "busy_state", lambda: {"in_flight": 0, "since_reply_s": 600.0})
+    assert dev.wait_between_stations(5)  # 探索していない
+    monkeypatch.setattr(dev, "busy_state", lambda: None)
+    assert dev.wait_between_stations(5)  # busy の無いサーバー

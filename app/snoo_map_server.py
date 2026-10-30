@@ -97,7 +97,6 @@ from app.snoo_mapper import (
     MAX_FRAMES,
     MAX_RECENT_REVERSES,  # noqa: F401  REVERSE_SPEED などはここからも使う
     MAX_REVERSES,  # noqa: F401
-    MAX_STATIONS,
     RECENT_STATIONS,
     REVERSE_SPEED,  # noqa: F401
     FrameRef,
@@ -1038,6 +1037,10 @@ def create_app(
     # GPU は 1 つずつ使う。同時に来たリクエストはここで順に待つ
     gpu = threading.Lock()
     refused: set[str] = set()
+    # 受けている数と最後に返した時刻。make deploy-map が、Pi が走っている間（返した直後）を
+    # 待って起動し直し、探索を止めずにコードを入れ替えるのに使う（GET /v1/snoo/map/busy）
+    busy = {"in_flight": 0, "last_reply": 0.0, "last": None}
+    busy_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1081,12 +1084,27 @@ def create_app(
         enter = getattr(reconstruct, "enter", None)
         if enter is not None and not enter():
             raise HTTPException(503, "GPU を手放して終えるところ（すぐ起動し直す）")
+        with busy_lock:
+            busy["in_flight"] += 1
         try:
-            return handle(meta, images, t0)
+            action = handle(meta, images, t0)
+            with busy_lock:
+                busy["last"] = action.get("action")
+            return action
         finally:
+            with busy_lock:
+                busy["in_flight"] -= 1
+                busy["last_reply"] = time.time()
             leave = getattr(reconstruct, "leave", None)
             if leave is not None:
                 leave()
+
+    @app.get("/v1/snoo/map/busy")
+    def busy_state():
+        """受けている数・最後に返してからの秒・最後の返事（move なら Pi は今走って撮っている）。"""
+        with busy_lock:
+            age = time.time() - busy["last_reply"] if busy["last_reply"] else None
+            return {"in_flight": busy["in_flight"], "since_reply_s": age, "last": busy["last"]}
 
     def handle(meta, images, t0: float) -> dict:
         try:
@@ -1109,8 +1127,10 @@ def create_app(
             if battery is not None and 0 < battery < LOW_BATTERY_V:
                 log.info("%s/%03d: 電池が %.2f V なのでやめる", session.name, sid, battery)
                 return {"action": "done", "reason": "low_battery"}
-            if len(station_ids(session)) >= MAX_STATIONS:
-                log.info("%s/%03d: %d か所を超えたのでやめる", session.name, sid, MAX_STATIONS)
+            if len(station_ids(session)) >= SESSION_MAX_STATIONS:
+                log.info(
+                    "%s/%03d: %d か所を超えたのでやめる", session.name, sid, SESSION_MAX_STATIONS
+                )
                 return {"action": "done", "reason": "step_limit"}
             try:
                 action = plan_station(session, sid, reconstruct, marks)

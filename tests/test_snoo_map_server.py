@@ -295,9 +295,12 @@ def test_low_battery_stops_without_vggt(tmp_path):
     assert (tmp_path / "explore_20261029_201500" / "000" / "meta.json").exists()
 
 
-def test_step_limit_after_max_stations(tmp_path):
-    from app.snoo_mapper import MAX_STATIONS
+def test_step_limit_after_max_stations(tmp_path, monkeypatch):
+    import app.snoo_map_server as server
 
+    # 1 セッションの上限は SESSION_MAX_STATIONS（止まらずに探り続けるので 2000）。小さくして確かめる
+    MAX_STATIONS = 5
+    monkeypatch.setattr(server, "SESSION_MAX_STATIONS", MAX_STATIONS)
     c = _client(tmp_path, no_reconstruct)
     session = tmp_path / "explore_20261029_201500"
     for i in range(MAX_STATIONS - 1):
@@ -669,3 +672,12 @@ def test_no_frontier_still_finishes():
     from app.snoo_map_server import FINISHED
 
     assert "no_frontier" in FINISHED
+
+
+def test_busy_reports_the_last_reply_for_live_deploys(tmp_path):
+    c = _client(tmp_path)
+    b = c.get("/v1/snoo/map/busy").json()
+    assert b == {"in_flight": 0, "since_reply_s": None, "last": None}
+    _post(c, _meta(0))
+    b = c.get("/v1/snoo/map/busy").json()
+    assert b["in_flight"] == 0 and b["last"] == "move" and 0 <= b["since_reply_s"] < 5
