@@ -463,18 +463,3 @@ def test_clip_pieces_keeps_the_front_edge_off_a_wall_near_the_start():
     assert front < 0.27 - 0.025  # 壁のセルの手前の縁より前に出ない
 
 
-def test_cap_turn_cuts_a_step_where_the_heading_change_reaches_the_limit():
-    import math
-
-    from app.roommap import cap_turn, curvature
-
-    steer = 28.0
-    k = abs(curvature(steer))
-    out = cap_turn([(steer, 0.40)], math.radians(25))
-    assert len(out) == 1 and out[0][1] == pytest.approx(math.radians(25) / k)
-    # まっすぐは切らない。曲がる → まっすぐなら、曲がる所で使い切ったら後ろを捨てる
-    assert cap_turn([(0.0, 0.40)], math.radians(25)) == [(0.0, 0.40)]
-    two = cap_turn([(steer, 0.40), (0.0, 0.30)], math.radians(25))
-    assert len(two) == 1
-    small = cap_turn([(10.0, 0.05), (0.0, 0.30)], math.radians(25))
-    assert small == [(10.0, 0.05), (0.0, 0.30)]

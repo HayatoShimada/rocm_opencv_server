@@ -337,25 +337,6 @@ def curvature(steer_deg: float) -> float:
     return -math.tan(math.radians(steer_deg)) / WHEELBASE_M
 
 
-def cap_turn(pieces: list[tuple[float, float]], max_turn_rad: float) -> list[tuple[float, float]]:
-    """区間を、車の向きが変わる量の合計が max_turn_rad までになるところで切る（ハンドル°、m）。
-
-    カメラの横の視野は 54° しかなく、首を振っても 110° ほど。1 歩で向きが 40〜50° 変わると、前の
-    ステーションで見た景色と重なる所が少なく、VGGT の位置合わせが崩れやすい（30 日の実走で、
-    崩れた 11 か所の直前の 1 歩は、うまくいった所の倍ほど曲がっていた）。
-    """
-    out, left = [], max_turn_rad
-    for steer, m in pieces:
-        k = abs(curvature(steer))
-        take = m if k * m <= left else left / k
-        if take > 1e-3:
-            out.append((steer, take))
-        left -= k * take
-        if left <= 1e-9 or take < m:
-            break
-    return out
-
-
 def arc(x: float, y: float, yaw: float, steer_deg: float, ds: float) -> tuple[float, float, float]:
     """後ろの車軸の中心を、ハンドル steer_deg のまま ds m 進めた姿勢（ちょうど円弧の上）。
     ds が負なら同じ弧を後ろへ戻る。
