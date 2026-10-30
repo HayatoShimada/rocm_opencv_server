@@ -903,15 +903,24 @@ def load_session_grid(session: Path, upto: int | None = None) -> tuple[Grid, np.
     """セッションの間取り（セッションの座標）と「上」の層と、何から作ったか。
 
     ふつうはステーションごとの obs.npz を足す（地図のサーバーの session_grid と同じ）。
+    位置のグラフ（graph_poses.json。地図のサーバーの SNOO_POSE_GRAPH）があれば、地図のサーバーと
+    同じに、グラフで決め直した位置へ置き直す。
     obs.npz が無い古いセッション（2026-10-29 まで）は、最後の窓の grid.png を room.json の
     window.origin_pose でセッションの座標に移す（窓の外で見た所は入らない）。
     """
+    from app.snoo_posegraph import read_graph_poses, replace_observation
+
     session = Path(session)
+    graph = read_graph_poses(session)
     obs = []
     for d in sorted(session.iterdir()):
         if d.is_dir() and d.name.isdigit() and len(d.name) == 3 and (d / "obs.npz").is_file():
             if upto is None or int(d.name) <= upto:
-                obs.append(Observation.load(d / "obs.npz"))
+                o = Observation.load(d / "obs.npz")
+                new = graph.get(int(d.name))
+                if new is not None and new != o.pose:
+                    o = replace_observation(o, new)
+                obs.append(o)
     if obs:
         grid, high = session_grid(obs)
         return grid, high, f"obs.npz x{len(obs)}"

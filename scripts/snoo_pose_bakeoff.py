@@ -43,8 +43,8 @@ import cv2
 import numpy as np
 
 from app import snoo_posegraph as pg
-from app.roommap import FREE, OCCUPIED, Grid, Pose, take
-from app.snoo_map_server import pi_distance_m, read_poses, read_reverses, step_pieces
+from app.roommap import FREE, OCCUPIED, Grid, Pose
+from app.snoo_map_server import odom_edge_for, read_poses
 from app.snoo_mapper import (
     FrameRef,
     MapParams,
@@ -76,23 +76,10 @@ def meta(session: Path, i: int) -> dict:
 
 
 def odom_edges(session: Path, ids: list[int]) -> list[pg.Edge]:
-    """続く 2 か所の間を走った辺（prev_step。区間を Pi の見積もりの長さで切る）。"""
-    sent = read_reverses(session)
-    out = []
-    for a, b in zip(ids, ids[1:], strict=False):
-        if b != a + 1:
-            continue
-        prev = meta(session, b).get("prev_step")
-        if not isinstance(prev, dict):
-            continue
-        pieces = step_pieces(prev)
-        dist = pi_distance_m(prev)
-        if pieces is None or dist is None:
-            continue
-        rev = prev.get("reverse")
-        rev = a in sent if rev is None else bool(rev)
-        out.append(pg.odom_edge(a, b, take(pieces, dist), rev))
-    return out
+    """続く 2 か所の間を走った辺（prev_step。区間を Pi の見積もりの長さで切る）。
+    地図のサーバーがステーションごとに足すもの（odom_edge_for）と同じ。"""
+    have = set(ids)
+    return [e for b in ids if b - 1 in have and (e := odom_edge_for(session, b)) is not None]
 
 
 def live_windows(session: Path, cache: Path) -> list[pg.Window]:

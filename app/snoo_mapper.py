@@ -884,13 +884,21 @@ def registration_is_bad(st: StationResult, height_m: float | None) -> bool:
 
 
 def stop_reason(
-    grid: Grid, stations: list[StationResult], params: MapParams, heights: list[float | None]
+    grid: Grid,
+    stations: list[StationResult],
+    params: MapParams,
+    heights: list[float | None],
+    trusted: frozenset[str] = frozenset(),
 ) -> dict | None:
-    """探るのをやめる返事（done）か、続けるなら None。決め方（今まで・学んだもの）によらない。"""
+    """探るのをやめる返事（done）か、続けるなら None。決め方（今まで・学んだもの）によらない。
+
+    trusted のステーション（名前）は、この窓で位置合わせが崩れても止めない。地図のサーバーが
+    位置のグラフ（app/snoo_posegraph.py）で、走った辺とほかの窓から位置を決めたもの。
+    """
     if len(stations) >= params.max_stations:
         return {"action": "done", "reason": "step_limit"}
     for st, H in zip(stations, heights, strict=True):
-        if registration_is_bad(st, H):
+        if st.name not in trusted and registration_is_bad(st, H):
             return {"action": "done", "reason": f"bad_registration:{st.name}"}
     if int((grid.state() == FREE).sum()) < MIN_FREE_CELLS:
         return {"action": "done", "reason": "too_little_floor"}
@@ -901,14 +909,19 @@ def stop_reason(
 
 
 def decide(
-    grid: Grid, stations: list[StationResult], params: MapParams, heights: list[float | None]
+    grid: Grid,
+    stations: list[StationResult],
+    params: MapParams,
+    heights: list[float | None],
+    trusted: frozenset[str] = frozenset(),
 ) -> tuple[dict, Plan | None]:
     """最後のステーションから次の 1 歩を決める。危なそうなら止める（done）。
 
     params.policy（重みのファイル）があれば、候補の 1 歩を学んだ点数で選ぶ
     （app/snoo_explore_policy.py。安全の確かめと 1 歩の作り方は同じ）。
+    trusted は stop_reason と同じ（位置のグラフで位置が決まったステーションの名前）。
     """
-    stop = stop_reason(grid, stations, params, heights)
+    stop = stop_reason(grid, stations, params, heights, trusted)
     if stop is not None:
         return stop, None
     pose = stations[-1].pose

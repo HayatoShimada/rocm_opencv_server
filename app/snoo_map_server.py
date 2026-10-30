@@ -53,6 +53,11 @@ VGGT は 48 コマで 9 秒ほどかかる（RX 7900 XTX）。実データ（23 
 <station>/obs.npz に 1 回だけ残し、次の 1 歩は全部のステーションの分を足した間取りで決める
 （窓の外で見た所も忘れない）。room.json・topdown.png もセッションの座標で書く
 （window.origin_pose は (0, 0, 0)、VGGT の窓の原点は window.vggt_origin_pose）。
+SNOO_POSE_GRAPH=1（既定）なら、ステーションの位置は位置のグラフ（app/snoo_posegraph.py）で
+決める。ステーションごとに、窓の中の全部の組の辺と前のステーションから走った辺を
+graph_edges.jsonl に足し、全部を解き直して graph_poses.json と poses.json に書く。前に残した
+obs.npz は、読むときにグラフの位置へ置き直す。窓で位置合わせが崩れても、グラフで位置が
+決まれば戻らずにそのまま探る（見たものは足さない）。グラフで落ちたら今までの決め方で続ける。
 
 認証が無いので、SNOO_MAP_ALLOW に書いた送り元（Pi の LAN と tailscale の IP）以外には 403 を返す
 （app/snoo.py の検出サーバーと同じやり方）。GPU は猫の検出（Docker の snoo）と分け合うので、
@@ -80,7 +85,8 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from app import snoo_mapper
+from app import atomic, snoo_mapper
+from app import snoo_posegraph as pg
 from app.roommap import (
     FIT_TOL_M,
     LONG_STEP_M,
@@ -397,12 +403,22 @@ def obs_path(session: Path, station_id: int) -> Path:
     return station_dir(session, station_id) / "obs.npz"
 
 
-def read_observations(session: Path, upto: int) -> list[Observation]:
-    """upto までのステーションで見たもの（置き場の obs.npz）。無いステーションは飛ばす。"""
+def read_observations(
+    session: Path, upto: int, poses: dict[int, Pose] | None = None
+) -> list[Observation]:
+    """upto までのステーションで見たもの（置き場の obs.npz）。無いステーションは飛ばす。
+
+    poses（位置のグラフで決め直した位置）があれば、そこに位置のあるステーションの見たものを
+    置き直す（obs.npz は置いたときの位置と一緒に残してあるので、new ∘ old⁻¹ で動かすだけ。
+    新しく残す物は無い）。
+    """
     out = []
     for i in station_ids(session):
         if i <= upto and obs_path(session, i).is_file():
-            out.append(Observation.load(obs_path(session, i)))
+            o = Observation.load(obs_path(session, i))
+            if poses is not None and i in poses and poses[i] != o.pose:
+                o = pg.replace_observation(o, poses[i])
+            out.append(o)
     return out
 
 
@@ -572,6 +588,186 @@ def gpu_busy():
             path.unlink(missing_ok=True)
 
 
+# --- 位置のグラフ（app/snoo_posegraph.py） ---
+
+# ステーションの位置を、窓の答えと走った 1 歩を重ねた位置のグラフで決めるか。
+# 窓の原点に足すだけ（今までの決め方）では、1 回の VGGT が崩れるとそのステーションの位置が無くなり、
+# 窓の原点のずれも後へ積もる。保存した explore_20261030_190244（75 か所）で比べると、位置のある
+# ステーションが 66 → 75 か所、走った 1 歩との差（中央値・90 %）が 15.0・49.9 → 6.8・14.6 cm、
+# 壁の重なりが 0.75 → 0.90 になった（scripts/snoo_pose_bakeoff.py の pg_live）。
+# SNOO_POSE_GRAPH=0 で今までの決め方に戻す
+POSE_GRAPH = os.getenv("SNOO_POSE_GRAPH", "1") == "1"
+GRAPH_EDGES = "graph_edges.jsonl"
+GRAPH_POSES = pg.GRAPH_POSES
+# グラフで落ちたことを書いたセッション（同じセッションでは 1 回だけ書く）
+_graph_failed: set[str] = set()
+
+
+@dataclass
+class GraphPoses:
+    """位置のグラフを解いた答え。poses は fixed からたどれる（位置の決まった）ステーションだけ。"""
+
+    poses: dict[int, Pose]
+    # 自分の窓で位置合わせが崩れたステーション（見たものを地図に足さない）
+    bad: set[int]
+    info: dict
+
+
+def graph_failed(session: Path, what: str) -> None:
+    """グラフで落ちたことを、セッションごとに 1 回だけ書く（落ちても今までの決め方で続ける）。"""
+    if session.name not in _graph_failed:
+        _graph_failed.add(session.name)
+        log.exception(
+            "%s: 位置のグラフ（%s）で落ちたので、今までの決め方で続ける", session.name, what
+        )
+
+
+def odom_edge_for(session: Path, station_id: int) -> pg.Edge | None:
+    """1 つ前のステーションから station_id まで走った辺（prev_step の区間を、Pi が見積もった
+    長さで切ったもの）。前のステーションが無い・prev_step が無い・長さが分からなければ None。
+    prev_step に reverse が無ければ（古い Pi）、そのとき後ろへ戻れと返したかで決める。
+    """
+    a = station_id - 1
+    if a < 0 or not (station_dir(session, a) / "meta.json").is_file():
+        return None
+    prev = read_meta(station_dir(session, station_id)).get("prev_step")
+    if not isinstance(prev, dict):
+        return None
+    pieces, dist = step_pieces(prev), pi_distance_m(prev)
+    if pieces is None or dist is None:
+        return None
+    reverse = prev.get("reverse")
+    reverse = a in read_reverses(session) if reverse is None else bool(reverse)
+    return pg.odom_edge(a, station_id, take(pieces, dist), reverse)
+
+
+def read_graph_edges(session: Path) -> list[dict]:
+    p = session / GRAPH_EDGES
+    if not p.is_file():
+        return []
+    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+
+
+def write_graph_edges(session: Path, station_id: int, edges: list[pg.Edge]) -> list[dict]:
+    """station_id の辺を graph_edges.jsonl に足す（送り直しなら、前の分を置き換える）。
+    辺は 1 か所 7 本ほどと小さいので、毎回全部を書き直す（書きかけを読ませない）。
+    """
+    rows = [d for d in read_graph_edges(session) if d.get("station") != station_id]
+    rows += [pg.edge_to_dict(e, station_id) for e in edges]
+    atomic.write_text(session / GRAPH_EDGES, "".join(json.dumps(d) + "\n" for d in rows))
+    return rows
+
+
+def read_graph_state(session: Path) -> dict:
+    p = session / GRAPH_POSES
+    return json.loads(p.read_text()) if p.is_file() else {}
+
+
+def solve_graph(
+    session: Path,
+    station_id: int,
+    window: list[int],
+    results: list,
+    heights: list[float | None],
+    known: dict[int, Pose],
+) -> GraphPoses:
+    """このステーションの窓の辺と走った辺を足し、全部の辺で位置を解き直す。
+
+    results は窓の座標のステーションの位置（build_map の答えを to_session で直す前のもの）。
+    known は今までの決め方の位置（セッションの座標）。グラフは最初のステーションを止めて解き、
+    その位置を known の位置に合わせる（最初のステーションの位置は、最初の窓の VGGT のコマの
+    向きで決まっていて (0, 0, 0) ではない。合わせないと、グラフを使うかで座標がずれる）。
+    前の答え（graph_poses.json）から始めるので、1 か所ごとに解き直しても速く、答えも揺れない。
+    """
+    w = pg.Window(f"live:{station_id:03d}", list(window), list(results), list(heights))
+    edges = pg.window_edges(w)
+    odom = odom_edge_for(session, station_id)
+    if odom is not None:
+        edges.append(odom)
+    rows = write_graph_edges(session, station_id, edges)
+    state = read_graph_state(session)
+    bad = {int(i) for i in state.get("bad", [])} - {station_id}
+    last = results[-1]
+    if not last.frames or registration_is_bad(last, heights[-1]):
+        bad.add(station_id)
+    all_edges = [pg.edge_from_dict(d) for d in rows]
+    if state.get("fixed") is not None and state.get("base"):
+        fixed, base = int(state["fixed"]), Pose(*map(float, state["base"]))
+    else:
+        # ふつうは最初のステーション。セッションの途中でグラフを使い始めた（サーバーを入れ替えた）
+        # ときは、辺に出てくる位置の分かったステーションのうち最初のものを止める
+        # （最初のステーションには辺が無く、ほかがどれもつながらないため）
+        fixed = station_ids(session)[0]
+        linked = sorted(i for e in all_edges for i in (e.a, e.b) if i in known)
+        if all_edges and fixed not in {i for e in all_edges for i in (e.a, e.b)} and linked:
+            fixed = linked[0]
+        base = known.get(fixed, Pose(0.0, 0.0, 0.0))
+    back = pg.inverse(base)
+    sol = None
+    solved = {fixed: Pose(0.0, 0.0, 0.0)}  # グラフの座標（fixed が原点）
+    if all_edges:
+        ids = sorted({e.a for e in all_edges} | {e.b for e in all_edges} | {fixed})
+        start = {}
+        if state.get("fixed") == fixed:
+            start = {int(k): to_frame(back, Pose(*map(float, v)))
+                     for k, v in state.get("poses", {}).items()}  # fmt: skip
+        init = pg.chain_init(ids, all_edges, fixed, start=start)
+        sol = pg.optimize(all_edges, fixed, init=init)
+        solved = sol.poses
+    ok = pg.connected(sol.edges, fixed) if sol else {fixed}
+    every = {i: to_frame(base, p) for i, p in solved.items()}
+    poses = {i: p for i, p in every.items() if i in ok}
+    outliers = [
+        {"a": e.a, "b": e.b, "kind": e.kind, "source": e.source, "chi": round(e.chi, 1)}
+        for e in (sol.edges if sol else []) if e.outlier
+    ]  # fmt: skip
+    info = {
+        "fixed": fixed,
+        "edges": len(all_edges),
+        "outliers": len(outliers),
+        "cost": None if sol is None else round(sol.cost, 4),
+        "localized": len(poses),
+        "station_localized": station_id in poses,
+        # 走った辺だけで決めた（このステーションの窓の辺がどれも無いか外れた）
+        "station_odom_only": station_id in poses and (sol is None or station_id not in sol.seen),
+    }
+    data = {
+        **info,
+        "base": [base.x, base.y, base.yaw],
+        # セッションの座標（poses.json と同じ）。localized に無いものは仮の位置
+        "poses": {str(i): [p.x, p.y, p.yaw] for i, p in sorted(every.items())},
+        "localized": sorted(poses),
+        "bad": sorted(bad),
+        "outlier_edges": outliers,
+    }
+    atomic.write_text(session / GRAPH_POSES, json.dumps(data, indent=1))
+    return GraphPoses(poses, bad, info)
+
+
+def graph_poses(
+    session: Path,
+    station_id: int,
+    window: list[int],
+    results: list,
+    heights: list,
+    known: dict[int, Pose],
+) -> GraphPoses | None:
+    """solve_graph。落ちたら None（今までの決め方で続ける。地図のサーバーを 500 にしない）。"""
+    try:
+        return solve_graph(session, station_id, window, results, heights, known)
+    except Exception:
+        graph_failed(session, "解く")
+        return None
+
+
+def bad_stations(session: Path) -> set[int]:
+    """自分の窓で位置合わせが崩れたステーション（graph_poses.json。無ければ空）。"""
+    try:
+        return {int(i) for i in read_graph_state(session).get("bad", [])}
+    except (OSError, ValueError):
+        return set()
+
+
 def plan_station(
     session: Path,
     station_id: int,
@@ -624,20 +820,50 @@ def plan_station(
         stations, refs, rec.extrinsic, rec.points, rec.conf, params, rec.colors,
         anchor=anchor, plan=False,
     )  # fmt: skip
-    for i, s, h, o in zip(window, r.stations, params.camera_height_m, r.observations, strict=True):
+    for i, s, h in zip(window, r.stations, params.camera_height_m, strict=True):
         # 一度求めた位置は変えない（変えると、それを原点にした後の窓と座標がずれる）
         if i not in poses and s.frames and not registration_is_bad(s, h):
             poses[i] = to_session(anchor, s.pose)
-        # 見たものも 1 回だけ残す（ふつうは最後のステーション。前の版で受けたステーションも）
-        if i in poses and o is not None and not obs_path(session, i).is_file():
+    graph = None
+    if POSE_GRAPH:
+        # 窓の座標のままのステーションの位置（to_session で直す前）で、窓の辺を作る
+        t_graph = time.perf_counter()
+        graph = graph_poses(session, station_id, window, r.stations, params.camera_height_m, poses)
+        marks["graph"] = time.perf_counter() - t_graph
+    # 自分の窓で崩れたステーションは、後の窓で位置が合っても見たものを足さない（点が当てにならない）
+    bad = graph.bad if graph is not None else bad_stations(session) if POSE_GRAPH else set()
+    for i, o in zip(window, r.observations, strict=True):
+        # 見たものも 1 回だけ残す（ふつうは最後のステーション。前の版で受けたステーションも）。
+        # 置いた位置も一緒に残る（Observation.pose）。グラフが位置を直したら、読むときに置き直す
+        if i in poses and o is not None and i not in bad and not obs_path(session, i).is_file():
             o.save(obs_path(session, i))
+    if graph is not None:
+        # グラフで位置の決まったステーションは、グラフの位置にする（窓で崩れたものも、
+        # 走った辺とほかの窓から決まる）。決まらないもの（つながらない）は今までの位置のまま
+        poses.update(graph.poses)
     write_poses(session, poses)
 
     # 窓の結果をセッションの座標に直し、セッションの間取りで次の 1 歩を決める
-    r.stations = [dataclasses.replace(s, pose=to_session(anchor, s.pose)) for s in r.stations]
+    localized = set(graph.poses) if graph is not None else set()
+    r.stations = [
+        dataclasses.replace(s, pose=poses[i] if i in localized else to_session(anchor, s.pose))
+        for i, s in zip(window, r.stations, strict=True)
+    ]
+    # 窓で崩れても、グラフで位置の決まったステーションでは止めない（戻らずにそのまま探る）
+    trusted = frozenset(s.name for i, s in zip(window, r.stations, strict=True) if i in localized)
+    if graph is not None:
+        r.pose_graph = {**graph.info, "trusted": sorted(trusted)}
     r.points = xy_to_frame(anchor, r.points) if len(r.points) else r.points
     if r.floor.inliers:
-        r.grid, r.high = session_grid(read_observations(session, station_id))
+        observations = None
+        if graph is not None:
+            try:  # グラフが直した位置へ、前に見たものを置き直す（地図ごと動く）
+                observations = read_observations(session, station_id, graph.poses)
+            except Exception:
+                graph_failed(session, "見たものを置き直す")
+        if observations is None:
+            observations = read_observations(session, station_id)
+        r.grid, r.high = session_grid(observations)
         if params.driven_free:
             mark_steps_driven(r.grid, session, station_id, poses)
         if USE_SLAM:  # 走りながらの SLAM で見た所も足す（app/snoo_slam.py が書く）
@@ -646,7 +872,10 @@ def plan_station(
             t_home = time.perf_counter()
             r.grid, r.home = use_home(home_root, session, station_id, r.grid, r.high)
             marks["home"] = time.perf_counter() - t_home
-        r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
+        if trusted:
+            r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m, trusted)
+        else:
+            r.action, r.plan = decide(r.grid, r.stations, params, params.camera_height_m)
         r.step_path = []
         if r.plan is not None:
             pieces = r.plan.segments or [(r.plan.steer_deg, r.plan.step_m)]
@@ -1118,6 +1347,8 @@ def write_results(
     plan["slam"] = getattr(r, "slam", None)  # 走りながらの SLAM を間取りに足したか
     if getattr(r, "home", None) is not None:  # 家の地図に合わせたか（SNOO_HOME_MAP=1）
         plan["home"] = r.home
+    if getattr(r, "pose_graph", None) is not None:  # 位置のグラフで決めたか（SNOO_POSE_GRAPH=1）
+        plan["pose_graph"] = r.pose_graph
     (tmp / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
     for f in tmp.iterdir():
         f.replace(session / f.name)

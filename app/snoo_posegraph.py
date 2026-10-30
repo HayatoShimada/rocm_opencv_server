@@ -21,7 +21,9 @@
 崩れたステーション（ほかの辺と合わない窓の辺）は、辺ごと外れ値として外す。ステーションごと
 落とさないので、走った辺と別の窓の辺で位置が残る。
 
-numpy・scipy だけ（GPU は使わない）。地図のサーバーにはまだつないでいない。
+numpy・scipy だけ（GPU は使わない）。地図のサーバー（app/snoo_map_server.py）は、
+SNOO_POSE_GRAPH=1（既定）のとき、ステーションごとに窓の辺と走った辺を
+<セッション>/graph_edges.jsonl に足して解き直し、その位置を使う。
 """
 
 from __future__ import annotations
@@ -305,14 +307,19 @@ class _Problem:
         ).tocsr()
 
 
-def chain_init(ids: list[int], edges: list[Edge], fixed: int) -> dict[int, Pose]:
+def chain_init(
+    ids: list[int], edges: list[Edge], fixed: int, start: dict[int, Pose] | None = None
+) -> dict[int, Pose]:
     """辺をたどって最初の位置を置く。走った辺（番号の順）を先に、残りは確からしい辺から。
     走った辺が途切れた先（prev_step の無いステーションの後）は窓の辺でつなぐ。どの辺でも
     つながらないものは、その塊の最初のステーションを原点に置いて、そこからたどる。
+    start（前に解いた位置）があれば、それを置いたところから、まだ無いものだけをたどる
+    （地図のサーバーは 1 か所ごとに解き直すので、前の答えから始めると速く、答えも揺れない）。
     """
     odom = sorted((e for e in edges if e.kind == "odom"), key=lambda e: e.a)
     order = odom + sorted((e for e in edges if e.kind != "odom"), key=lambda e: e.sigma_m)
-    poses = {fixed: Pose(0.0, 0.0, 0.0)}
+    poses = {i: p for i, p in (start or {}).items() if i in set(ids)}
+    poses[fixed] = Pose(0.0, 0.0, 0.0)
     while True:
         changed = True
         while changed:
@@ -387,6 +394,70 @@ def optimize(
             break
     seen = {i for e in live if e.kind != "odom" and not e.outlier for i in (e.a, e.b)}
     return Solution(poses, live, seen, cost, it)
+
+
+def connected(edges: list[Edge], fixed: int) -> set[int]:
+    """fixed から、外れ値でない辺でたどれるステーション。ほかは位置が決まっていない
+    （chain_init が仮に原点へ置いただけ）。
+    """
+    nb: dict[int, set[int]] = {}
+    for e in edges:
+        if not e.outlier:
+            nb.setdefault(e.a, set()).add(e.b)
+            nb.setdefault(e.b, set()).add(e.a)
+    seen, todo = {fixed}, [fixed]
+    while todo:
+        for j in nb.get(todo.pop(), ()):
+            if j not in seen:
+                seen.add(j)
+                todo.append(j)
+    return seen
+
+
+# --- 辺を残す（地図のサーバーの graph_edges.jsonl） ---
+
+
+def edge_to_dict(e: Edge, station: int) -> dict:
+    """1 本の辺を JSON の 1 行にする。station はその辺を足したステーション
+    （同じステーションが送り直されたら、その辺を置き換える）。"""
+    return {
+        "station": station, "a": e.a, "b": e.b, "kind": e.kind, "source": e.source,
+        "z": [e.z.x, e.z.y, e.z.yaw], "sigma_m": e.sigma_m, "sigma_rad": e.sigma_rad,
+    }  # fmt: skip
+
+
+def edge_from_dict(d: dict) -> Edge:
+    x, y, yaw = d["z"]
+    return Edge(
+        int(d["a"]), int(d["b"]), Pose(float(x), float(y), float(yaw)),
+        float(d["sigma_m"]), float(d["sigma_rad"]), str(d["kind"]), str(d.get("source", "")),
+    )  # fmt: skip
+
+
+GRAPH_POSES = "graph_poses.json"
+
+
+def read_graph_poses(session: Path) -> dict[int, Pose]:
+    """地図のサーバーが書いた graph_poses.json の、位置が決まったステーション（localized）の位置。
+    無ければ空（グラフを使わなかったセッション）。"""
+    p = Path(session) / GRAPH_POSES
+    if not p.is_file():
+        return {}
+    d = json.loads(p.read_text())
+    ok = set(d.get("localized", []))
+    return {int(k): Pose(*map(float, v)) for k, v in d["poses"].items() if int(k) in ok}
+
+
+def replace_observation(o: Observation, new: Pose) -> Observation:
+    """old（o.pose）に置いて作った見たものを、new に置き直す（new ∘ old⁻¹ でセルを動かす）。
+    点を残していないのでセルの中心を動かす。セルの抜けや重なりが少し出るが、新しく残す物は無い。
+    """
+    T = to_frame(new, inverse(o.pose))
+
+    def move(xy: np.ndarray) -> np.ndarray:
+        return xy_to_frame(T, xy) if len(xy) else xy
+
+    return Observation(move(o.free), move(o.occupied), move(o.high), new, o.sonar_m)
 
 
 # --- 地図 ---

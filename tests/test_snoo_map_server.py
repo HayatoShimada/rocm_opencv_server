@@ -110,7 +110,18 @@ def _post(c, meta, images=None):
     return c.post("/v1/snoo/map/station", data=data, files=files)
 
 
-def test_two_stations_return_the_next_step(tmp_path):
+@pytest.fixture
+def window_poses(monkeypatch):
+    """位置のグラフ（SNOO_POSE_GRAPH）を使わず、窓の VGGT の位置だけで決める（今までの決め方）。
+    ここのテストの prev_step はわざと本当の 1 歩と違えてあり、グラフは走った辺も重ねるので、
+    窓の位置そのものを見るテストではグラフを止める（グラフは test_snoo_map_server_graph.py）。
+    """
+    import app.snoo_map_server as server
+
+    monkeypatch.setattr(server, "POSE_GRAPH", False)
+
+
+def test_two_stations_return_the_next_step(tmp_path, window_poses):
     c = _client(tmp_path)
     r = _post(c, _meta(0))
     assert r.status_code == 200, r.text
@@ -354,7 +365,9 @@ def _stuck_session(tmp_path, supports):
     return _post(c, _meta(1, prev_step=PREV, supports=supports)).json()
 
 
-def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, stuck, monkeypatch):
+def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(
+    tmp_path, stuck, monkeypatch, window_poses
+):
     # 切り返しが使えないときに、来た道を戻ることを見る
     monkeypatch.setattr("app.snoo_mapper.turning_reverse", lambda *a, **k: [])
     a = _stuck_session(tmp_path, ["reverse", "segments"])
@@ -371,7 +384,7 @@ def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(tmp_path, s
     assert plan["reply"]["reverse"] is True
 
 
-def test_reverse_without_segments_is_one_arc(tmp_path, stuck, monkeypatch):
+def test_reverse_without_segments_is_one_arc(tmp_path, stuck, monkeypatch, window_poses):
     # 切り返しが使えないときに、来た道を戻ることを見る
     monkeypatch.setattr("app.snoo_mapper.turning_reverse", lambda *a, **k: [])
     a = _stuck_session(tmp_path, ["reverse"])
