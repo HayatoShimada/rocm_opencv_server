@@ -627,6 +627,14 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     raw = r.action
     action = dict(raw)
     pose = r.stations[-1].pose
+    stalls = stalled_steps(session, station_id)
+    if stalls >= STALL_DONE:
+        # 前へ出せない（Pi が 1 cm も走らなかった）が続いたら、待たせ続けずに終える
+        action = {"action": "done", "reason": "stalled"}
+    elif stalls and action.get("action") == "move" and not action.get("reverse"):
+        # 前の前へ行く 1 歩を Pi が 1 cm も走らなかった（超音波・clear_cm で止まった）。同じ所から
+        # でたらめな前への 1 歩を出し続けても走らないので、下がる 1 歩にする（下がれなければ終える）
+        action = {"action": "done", "reason": "unreachable"}
     action, pieces = or_reverse(action, r.grid, pose, history(session, station_id, poses), params)
     if pieces:  # 戻る弧を上から見た絵に描き、戻った先を target にする
         r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
@@ -653,6 +661,40 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     (station_dir(session, station_id) / "reply.json").write_text(json.dumps(action))
     marks["write"] = time.perf_counter() - t
     return action
+
+
+# --- 前へ出せないのを見る ---
+
+# 前へ行く 1 歩を 1 cm も走らなかったら「出せなかった」とする
+STALL_CM = 1.0
+# 直近 STALL_WINDOW か所で、出せなかったのが STALL_DONE 回になったら終える
+STALL_WINDOW = 6
+STALL_DONE = 3
+
+
+def _stalled(prev: dict | None) -> bool:
+    """前へ行く 1 歩を、Pi が 1 cm も走らずに止めたか。"""
+    if not isinstance(prev, dict) or prev.get("reverse"):
+        return False
+    if not prev.get("stop_reason"):
+        return False
+    try:
+        return float(prev.get("est_distance_cm") or 0.0) < STALL_CM
+    except (TypeError, ValueError):
+        return False
+
+
+def stalled_steps(session: Path, station_id: int) -> int:
+    """直近の前へ出せなかった数。最後（このステーションの prev_step）が出せていれば 0。
+
+    超音波が当てにならない（-1 が続く）と、Pi は前へ 1 cm も走らずに止まる。17:57 の探索では
+    20 か所のうち 16 か所がこれで、同じ所からでたらめな 1 歩を出し続けていた。
+    """
+    ids = [i for i in station_ids(session) if i <= station_id][-STALL_WINDOW:]
+    flags = [_stalled(read_meta(station_dir(session, i)).get("prev_step")) for i in ids]
+    if not flags or not flags[-1]:
+        return 0
+    return sum(flags)
 
 
 # --- 行き場が無いときに来た道を戻る ---

@@ -519,3 +519,55 @@ def test_read_meta_rereads_when_the_station_is_resent(tmp_path):
     st = (d / "meta.json").stat()
     _os.utime(d / "meta.json", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
     assert read_meta(d)["battery_v"] == 7.25
+
+
+def _stuck(steer=10.0):
+    """前へ行く 1 歩を、Pi が 1 cm も走らずに止めた prev_step（超音波が -1 のまま）。"""
+    return {"steer_deg": steer, "speed": 12.0, "reverse": False,
+            "segments": [{"steer_deg": steer, "distance_cm": 0.0}], "seconds": 0.0,
+            "est_distance_cm": 0.0, "stop_reason": "ultrasonic"}  # fmt: skip
+
+
+def test_a_stalled_forward_step_is_not_answered_with_another_forward_step(tmp_path):
+    c = _client(tmp_path)
+    can = ["reverse", "segments", "long_step"]
+    assert _post(c, _meta(0, supports=can)).json()["action"] == "move"
+    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
+    # 下がるか（下がれなければ）終える。前へのでたらめな 1 歩は出さない
+    assert a["action"] == "done" or a.get("reverse") is True
+
+
+def test_repeated_stalls_end_the_exploration(tmp_path, monkeypatch):
+    import app.snoo_map_server as server
+
+    # 作り物の部屋はステーション 2 つ分なので、終える回数を 1 にして確かめる
+    monkeypatch.setattr(server, "STALL_DONE", 1)
+    c = _client(tmp_path)
+    can = ["reverse", "segments", "long_step"]
+    _post(c, _meta(0, supports=can))
+    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
+    assert a == {"action": "done", "reason": "stalled"}
+
+
+def test_stalled_steps_counts_recent_stalls_only_while_still_stalled(tmp_path):
+    from app.snoo_map_server import STALL_WINDOW, stalled_steps
+
+    session = tmp_path / "explore_20261030_175740"
+    prevs = [None, _stuck(), {**_stuck(), "est_distance_cm": 20.0}, _stuck(), _stuck()]
+    for i, prev in enumerate(prevs):
+        d = session / f"{i:03d}"
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(json.dumps({"station_id": i, "prev_step": prev}))
+    assert stalled_steps(session, 2) == 0  # 最後が走れていれば 0
+    assert stalled_steps(session, 4) == 3  # 走れた 1 歩をはさんでも、窓の中の数を数える
+    assert STALL_WINDOW >= 3
+
+
+def test_a_step_that_moved_is_not_a_stall():
+    from app.snoo_map_server import _stalled
+
+    assert not _stalled({**_stuck(), "est_distance_cm": 12.0})
+    assert not _stalled({**_stuck(), "reverse": True})
+    assert not _stalled({**_stuck(), "stop_reason": None})  # 言われた長さを走りきった
+    assert not _stalled(None)
+    assert _stalled(_stuck())
