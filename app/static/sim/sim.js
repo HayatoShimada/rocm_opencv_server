@@ -4,7 +4,8 @@
   "use strict";
   const C = window.SnooController;
   const $ = (id) => document.getElementById(id);
-  const PAD_POSTURE = { a: "sit", x: "lie", lb: "sleep", y: "alert", rb: "walk",
+  // A：車のマッピングを始める、B：車を止める。猫の姿勢は X・Y・LB・RB・START と数字のキー
+  const PAD_POSTURE = { x: "sit", rb: "lie", lb: "sleep", y: "alert", start: "walk",
     1: "sit", 2: "lie", 3: "sleep", 4: "alert", 5: "walk" };
   const NAMES = { walk: "歩く", sit: "座る", lie: "伏せる", sleep: "寝る", alert: "見る",
     run: "走る", stand: "立つ", groom: "毛づくろい", sniff: "嗅ぐ" };
@@ -28,13 +29,25 @@
     keepalive_s: 1.0,
     send: (s) => cat(s),
     stop: () => cat({ lx: 0, ly: 0, rx: 0, ry: 0 }),
-    onButton: (name) => { if (PAD_POSTURE[name]) setPosture(PAD_POSTURE[name]); },
+    onButton: (name) => {
+      if (name === "a") robot(true);
+      else if (name === "b") robot(false);
+      else if (PAD_POSTURE[name]) setPosture(PAD_POSTURE[name]);
+    },
   });
   ctl.keepalive = false;
   ctl.onInput((s, o) => {
     $("inputs").textContent = `入力 ${o.source || "—"}  前 ${s.ly.toFixed(2)}  回る ${(-s.lx).toFixed(2)}`
       + (o.pad ? "  ゲームパッド" : "");
   });
+
+  async function robot(mapping) {
+    const r = await C.postJSON("/sim/robot", { mapping });
+    const m = $("mapping");
+    if (m && r && !r.error) m.textContent = r.mapping ? "マッピング中（B で止める）" : "待機（A でマッピング）";
+  }
+  const mb = $("mapping");
+  if (mb) mb.addEventListener("click", () => robot(mb.textContent.startsWith("待機")));
 
   function setPosture(p) { cat({ lx: 0, ly: 0, rx: 0, ry: 0 }, p); }
   document.querySelectorAll(".postures button").forEach((b) => {

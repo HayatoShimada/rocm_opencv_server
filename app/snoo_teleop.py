@@ -57,7 +57,7 @@ OPERATOR_S = 2.0
 # Pi がこの秒のうちに問い合わせていれば、Pi はつながっている
 PI_SEEN_S = 1.0
 # 画面から頼めるモード（Pi が supports に ui_mode を書いたときだけ Pi が受ける）
-UI_MODES = ("teleop", "idle")
+UI_MODES = ("teleop", "idle", "explore", "map")  # A ボタンでマッピング（explore）を始める
 # 頼んだモードは、この秒を過ぎたら Pi に渡さない（前に押したボタンで、後からモードが変わらない）
 MODE_REQUEST_TTL_S = 5.0
 LIMITS = ("", "deadman", "poll", "guard", "battery", "sonar", "clear", "mode", "stopped")

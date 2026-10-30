@@ -64,7 +64,7 @@ def test_mapping_and_caps():
 def test_out_of_range_input_is_refused(env):
     c, _ = env
     assert c.post(PREFIX, json={"seq": 1, "speed": 1.5}).status_code == 422
-    assert c.post(PREFIX, json={"seq": 1, "mode": "explore"}).status_code == 400
+    assert c.post(PREFIX, json={"seq": 1, "mode": "dance"}).status_code == 400
 
 
 def test_pi_gets_the_latest_command_with_its_age(env):

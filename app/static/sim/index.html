@@ -16,6 +16,7 @@
   .postures { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
   .postures button { padding: 10px 4px; }
   .big-reason { font-size: 15px; font-weight: 600; }
+  #mapping { width: 100%; padding: 14px; font-size: 17px; font-weight: 700; margin: 6px 0; }
   /* 3 つの絵が 1 画面に入るよう、カメラの高さを抑える（横は黒い帯になる） */
   #fpv-frame { max-height: 52vh; }
   .views .frame { max-height: 36vh; }
@@ -45,6 +46,7 @@
       <div class="frame top"><img id="top" alt=""><span class="tag">上から見た地図</span></div>
       <div class="frame wide"><img id="v3d" alt=""><span class="tag">3D</span></div>
     </div>
+    <button id="mapping" class="big">待機（A でマッピング）</button>
     <div id="sticks"></div>
   </section>
 
