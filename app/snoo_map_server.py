@@ -82,11 +82,14 @@ from app.roommap import (
     TURN_RADIUS_M,
     WHEELBASE_M,
     Pose,
+    blocked_cells,
     camera_of,
+    clip_pieces,
     consume,
     drive_poses,
     fit_driven,
     mark_driven,
+    moves_are_clear,
     random_step,
     take,
     turning_reverse,
@@ -657,6 +660,10 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         # 位置の分かっている前のステーションの所で撮り直す
         action = reverse_action(back, params.segments)
         action["retrace"] = True
+    override = take_override(root_of(session), session.name, r.grid, pose, params)
+    if override is not None:
+        # エージェント（画像を見て決める AI）が予約した 1 歩。地図で確かめて通ったものだけ
+        action = override
     action, pieces = or_reverse(action, r.grid, pose, history(session, station_id, poses), params)
     if action is not planned and action == {"action": "done", "reason": "unreachable"}:
         # 下がれなかった。1〜2 回止まっただけで終えると早すぎる（18:55 の探索は 11 か所目で
@@ -692,6 +699,73 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     write_results(session, r, window, anchor, raw, marks, action)
     (station_dir(session, station_id) / "reply.json").write_text(json.dumps(action))
     marks["write"] = time.perf_counter() - t
+    return action
+
+
+# --- エージェントが予約した次の 1 歩 ---
+
+# 予約が古ければ使わない（見た画像のときから車が動いている）
+OVERRIDE_TTL_S = 90.0
+OVERRIDE_MAX_CM = 40.0
+
+
+def root_of(session: Path) -> Path:
+    return session.parent
+
+
+def override_path(root: Path) -> Path:
+    return root.parent / "snoo_agent" / "override.json"
+
+
+def take_override(root: Path, session: str, grid, pose: Pose, params: MapParams) -> dict | None:
+    """エージェントが POST /v1/snoo/agent/next で予約した 1 歩を、このステーションの返事にする。
+
+    予約は 1 回使えば消す。古い（OVERRIDE_TTL_S）・別のセッション・長すぎる・地図で通らない
+    （前へは clip_pieces と moves_are_clear、後ろへは moves_are_clear）ものは使わず、理由を
+    override_result.jsonl に残して、いつもの決め方に任せる。
+    """
+    path = override_path(root)
+    try:
+        o = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    path.unlink(missing_ok=True)
+    why = None
+    steer, cm, back = o.get("steer_deg"), o.get("distance_cm"), bool(o.get("reverse"))
+    if time.time() - float(o.get("t", 0)) > OVERRIDE_TTL_S:
+        why = "古い"
+    elif o.get("session") not in (None, session):
+        why = "別のセッション"
+    elif not _finite(steer) or not _finite(cm) or not 0 < cm <= OVERRIDE_MAX_CM:
+        why = "長さかハンドルがおかしい"
+    elif abs(steer) > MAX_STEER_DEG + 0.5:
+        why = "ハンドルが大きすぎる"
+    elif grid is None:
+        why = "地図が無い"
+    else:
+        piece = [(float(steer), float(cm) / 100)]
+        if not back:
+            blocked = blocked_cells(grid, grid.state(), pose)
+            run = sum(m for _, m in clip_pieces(grid, blocked, pose, piece))
+            if run < piece[0][1] - 0.005:
+                why = f"前に {run * 100:.0f} cm しか空いていない"
+        if why is None and not moves_are_clear(grid, grid.state(), pose, [(*piece[0], back)]):
+            why = "車の真ん中が障害物・見ていない所に入る"
+    log_path = path.parent / "override_result.jsonl"
+    row = {"t": time.time(), "session": session, "override": o, "used": why is None, "why": why}
+    with log_path.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if why is not None:
+        log.info("エージェントの 1 歩を使わない（%s）: %s", why, o)
+        return None
+    if back:
+        action = reverse_action(piece, params.segments)
+    else:
+        action = random_action(piece[0], pose, params)
+        action.pop("random", None)
+    action["agent"] = True
+    if o.get("note"):
+        action["note"] = str(o["note"])[:200]
     return action
 
 
