@@ -322,7 +322,8 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=4.0, help="今までの分も含めた時間の上限")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument(
-        "--cat", choices=("random", "behavior", "mix"), default=os.environ.get("SNOO_TRAIN_CAT", "random"),
+        "--cat", choices=("random", "behavior", "mix"),
+        default=os.environ.get("SNOO_TRAIN_CAT", "random"),
         help="相手の猫。behavior は本物に似せて車に反応する猫（座ったまま動かないことも多い）",
     )  # fmt: skip
     parser.add_argument("--episodes", type=int, default=72, help="1 回に回す家の数")
