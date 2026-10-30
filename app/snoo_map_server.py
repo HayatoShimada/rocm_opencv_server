@@ -24,6 +24,8 @@ VGGT は main の .venv にだけ入れてある（git から入れた。uv.lock
     Pi は今までどおり超音波・clear_cm・動かないときに止まる
   - supports が無い Pi への返事は今までと同じ
 - GET /v1/snoo/map/<session_id>/topdown.png・room.json・plan.json：いちばん新しい結果（人が見る用）
+- /v1/snoo/agent/...：AI のエージェントがロボットを見て・印を付けて・動かすための API
+  （app/snoo_agent_api.py・docs/agent_robot.md）。読み込めなくても地図のサーバーは動く
 - GET /twin：車と部屋をブラウザで見る画面（app/snoo_twin.py）。地図・ステーション・次の 1 歩・
   撮った画像と、検出サーバーの今のフレーム（SNOO_MAP_LIVE_DIR）を 1〜2 秒ごとに読み直して出す。
   このマシンのブラウザなら http://127.0.0.1:8720/twin で開ける。tailnet や LAN の別の機械から
@@ -1029,7 +1031,19 @@ def create_app(
         return FileResponse(path, media_type=OUTPUTS[name], headers={"Cache-Control": "no-store"})
 
     add_twin(app, root, Path(live_dir) if live_dir else None)
+    add_agent(app, root, Path(live_dir) if live_dir else None)
     return app
+
+
+def add_agent(app: FastAPI, root: Path, live_dir: Path | None) -> None:
+    """エージェントの API（app/snoo_agent_api.py、/v1/snoo/agent/）を足す。読み込めない・作れない
+    ときはログに書くだけにして、Pi のステーションを受ける地図のサーバーはそのまま動かす。"""
+    try:
+        from app.snoo_agent_api import create_router
+
+        app.include_router(create_router(root, live_dir))
+    except Exception:
+        log.exception("エージェントの API を足せなかった（地図のサーバーはそのまま動かす）")
 
 
 def main() -> None:

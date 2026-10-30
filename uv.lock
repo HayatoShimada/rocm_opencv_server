@@ -790,6 +790,16 @@ wheels = [
 ]
 
 [[package]]
+name = "pyopenjtalk"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/58/74/ccd31c696f047ba381f9b11a504bf1199756c3f30f3de64e3eeb83e10b4a/pyopenjtalk-0.4.1.tar.gz", hash = "sha256:d5ada46f7fc2b52c1c79c273eb9668ff6ad7ab276a8db9d8be119ef93440f0dc", size = 1397999, upload-time = "2025-04-08T06:27:46.528Z" }
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1023,6 +1033,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+agent = [
+    { name = "pyopenjtalk" },
+]
 clef-local = [
     { name = "accelerate" },
     { name = "huggingface-hub" },
@@ -1055,6 +1068,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+agent = [{ name = "pyopenjtalk", specifier = ">=0.4.1" }]
 clef-local = [
     { name = "accelerate", specifier = ">=1.10" },
     { name = "huggingface-hub", specifier = ">=1.0" },
