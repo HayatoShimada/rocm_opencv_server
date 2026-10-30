@@ -711,3 +711,58 @@ def test_a_bad_agent_step_is_not_used(tmp_path):
     assert not a.get("agent")
     log = [json.loads(x) for x in (path.parent / "override_result.jsonl").read_text().splitlines()]
     assert log[-1]["used"] is False and log[-1]["why"]
+
+
+# --- 家の地図（SNOO_HOME_MAP） ---
+
+STEP = {"steer_deg": 0, "speed": 12, "seconds": 1.2}
+
+
+def test_home_map_off_changes_nothing(tmp_path, monkeypatch):
+    """SNOO_HOME_MAP が無ければ、家の地図を読まず・書かず、返事も今までと同じ。"""
+    import app.snoo_map_server as _server
+
+    monkeypatch.setattr(_server, "HOME_MAP", False)
+    monkeypatch.setattr(_server, "HOME_DIR", str(tmp_path / "home"))
+    c = _client(tmp_path / "sessions")
+    replies = [_post(c, _meta(0)).json(), _post(c, _meta(1, prev_step=STEP)).json()]
+    session = tmp_path / "sessions" / "explore_20261029_201500"
+    assert not (session / "home.json").exists() and not (tmp_path / "home").exists()
+    assert c.get("/v1/snoo/map/home.json").status_code == 404
+    assert c.get("/v1/snoo/map/home.png").status_code == 404
+    plan = json.loads((session / "plan.json").read_text())
+    assert "home" not in plan and "home" not in plan["timing_s"]
+    # 家の地図を使っても、家が空なら 1 つ目のセッションが家になり、返事は同じ
+    monkeypatch.setattr(_server, "HOME_MAP", True)
+    c2 = _client(tmp_path / "sessions2")
+    again = [_post(c2, _meta(0)).json(), _post(c2, _meta(1, prev_step=STEP)).json()]
+    assert again == replies
+    assert (tmp_path / "home" / "home.json").is_file()
+
+
+def test_home_map_on_registers_sessions_and_writes_home_json(tmp_path, monkeypatch):
+    import app.snoo_map_server as _server
+
+    monkeypatch.setattr(_server, "HOME_MAP", True)
+    monkeypatch.setattr(_server, "HOME_DIR", str(tmp_path / "home"))
+    c = _client(tmp_path / "sessions")
+    for sid in ("explore_20261029_201500", "explore_20261029_203000"):
+        assert _post(c, _meta(0, session=sid)).status_code == 200
+        r = _post(c, _meta(1, session=sid, prev_step=STEP))
+        assert r.status_code == 200, r.text
+    root = tmp_path / "sessions"
+    first = json.loads((root / "explore_20261029_201500" / "home.json").read_text())
+    assert first["registered"] and first["reason"] == "anchor"
+    # 2 つ目は同じ所から走った（作り物の部屋は同じ）ので、家の座標でもほぼ (0, 0, 0)
+    second = json.loads((root / "explore_20261029_203000" / "home.json").read_text())
+    assert second["registered"], second
+    assert abs(second["pose"]["x"]) < 0.05 and abs(second["pose"]["y"]) < 0.05
+    assert abs(second["pose"]["yaw_deg"]) < 3
+    home = c.get("/v1/snoo/map/home.json")
+    assert home.status_code == 200
+    assert [s["id"] for s in home.json()["sessions"]] == [
+        "explore_20261029_201500", "explore_20261029_203000"]  # fmt: skip
+    png = c.get("/v1/snoo/map/home.png")
+    assert png.status_code == 200 and png.headers["content-type"] == "image/png"
+    plan = c.get("/v1/snoo/map/explore_20261029_203000/plan.json").json()
+    assert plan["home"]["registered"] and "home" in plan["timing_s"]
