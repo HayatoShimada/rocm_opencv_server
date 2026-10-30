@@ -95,6 +95,12 @@ class Stopped(Exception):
     """reset・終えるときに、回しているシミュレーターを抜ける。"""
 
 
+class RobotCmd(BaseModel):
+    """A ボタン：車のマッピングを始める（true）・止める（false）。"""
+
+    mapping: bool
+
+
 class LiveSim(Sim):
     """Sim の時計（Sim.t）を実機の時計に合わせて回す。advance のたびに眠り、その間はロックを放す
     （画面の絵と state は、そのときに読む）。Pi が猫を見て止まる（watch）のもここでまねる。"""
@@ -109,6 +115,8 @@ class LiveSim(Sim):
         self._t0 = 0.0
         self.watching = False
         self.watches = 0
+        # A でマッピングを始めるまで、車はその場で待つ（猫だけ動く）。B で止める
+        self.mapping = False
         self.snoo_dist_cm: float | None = None
         super().__init__(room, *args, **kw)
 
@@ -140,6 +148,15 @@ class LiveSim(Sim):
             self._pace()
             if self.phase in ("scan", "drive", "reverse") and self._snoo_near():
                 self._watch()
+
+    def think(self) -> dict:
+        """次の 1 歩を決める前に、マッピングが止められていれば、その場で待つ（猫は動く）。"""
+        phase = self.phase
+        while not self.mapping:
+            self.phase = "paused"
+            self.advance(0.5)  # 車は止まっている（撮った後・決める前）。猫と時計だけ進む
+        self.phase = phase
+        return super().think()
 
     # --- 猫を見る（Pi のまね） ---
 
@@ -450,6 +467,7 @@ class Live:
                 },
                 "reaction": {
                     "watching": sim.watching,
+                    "mapping": sim.mapping,
                     "watches": sim.watches,
                     "snoo_seen": sim.detection is not None,
                     "snoo_dist_cm": None if dist is None else round(dist, 0),
@@ -603,6 +621,12 @@ def create_app(live: Live, allow: list | None = None, autostart: bool = True) ->
     @app.get("/sim/state")
     def state():
         return JSONResponse(live.state(), headers=NO_STORE)
+
+    @app.post("/sim/robot")
+    def robot(c: RobotCmd):
+        """A ボタン：車のマッピング（探る）を始める・止める。"""
+        live.sim.mapping = bool(c.mapping)
+        return {"mapping": live.sim.mapping}
 
     @app.post("/sim/reset")
     def reset(body: ResetBody | None = None):

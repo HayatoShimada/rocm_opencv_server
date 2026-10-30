@@ -121,7 +121,10 @@
     send: (s) => send(s),
     stop,
     onButton: async (name) => {
-      if (name === "a") horn();
+      // A：マッピング（explore）を始める。B：止めて待機に戻す。X：鳴らす。Y：首を正面へ
+      if (name === "a") startMapping();
+      if (name === "b") stopMode();
+      if (name === "x") horn();
       if (name === "y") center();
     },
   });
@@ -131,6 +134,15 @@
     else setPill("pill-pad", "", "ゲームパッド無し");
   });
 
+  async function startMapping() {
+    await send({ lx: 0, ly: 0, rx: 0, ry: 0 }, "explore");
+    toast("マッピング（explore）を始めるよう頼んだ（Pi が対応していれば入る。USR 4 回と同じ）");
+  }
+  async function stopMode() {
+    await stop("idle");
+    await send({ lx: 0, ly: 0, rx: 0, ry: 0 }, "idle");
+    toast("止めて待機に戻るよう頼んだ");
+  }
   async function horn() {
     const r = await C.postJSON(A + "/say", { text: "プップー", queue: true });
     if (r === null) toast("鳴らせない（つながらない）");

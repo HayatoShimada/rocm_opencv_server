@@ -168,6 +168,8 @@ def test_sim_live_runs_and_takes_cat_commands(live):
     c.post("/sim/cat", json={"forward": 0, "turn": 0, "posture": "sleep"})
     _wait(c, lambda s: s["cat"]["posture"] == "sleep")
     # 車は撮って次の 1 歩を決める（地図のサーバーと同じ決め方）
+    # 車は A（POST /sim/robot）でマッピングを始めるまで、撮ったところで待つ
+    assert c.post("/sim/robot", json={"mapping": True}).json() == {"mapping": True}
     st = _wait(c, lambda s: s["stations"] >= 1 and s["action"], timeout=40.0)
     assert st["action_text"] and st["phase_text"]
     assert "reaction" in st and st["coverage"] >= 0
