@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: train-explore eval-explore phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay
+.PHONY: train-explore eval-explore phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -15,6 +15,7 @@ help:
 	@echo "make replay SESSION=<id>  保存したセッションの最後の 1 歩を GPU なしで決め直す"
 	@echo "make train-explore    作った家で次の 1 歩の選び方を学ぶ（続きから。SIGTERM で止まる）"
 	@echo "make eval-explore     学んだ選び方を、学んでいない家で今の決め方と比べる"
+	@echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]  家の地図を作る"
 
 test-fast:
 	$(PYTHON) -m pytest -q -m "not slow" -p no:cacheprovider $(ARGS)
@@ -70,3 +71,9 @@ run-report:
 replay:
 	@test -n "$(SESSION)" || { echo "make replay SESSION=<セッションの名前か置き場>"; exit 2; }
 	$(PYTHON) -m scripts.snoo_replay $(SESSION) $(if $(STATION),--station $(STATION)) $(ARGS)
+
+# 残っているセッションから家の地図（app/snoo_home.py）を作り直す。GPU は使わない。
+# 走っている探索のセッションは入れない（ARGS="--exclude <セッション>" か、名前を並べる）
+home-build:
+	@test -n "$(OUT)" || { echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]"; exit 2; }
+	$(PYTHON) -m scripts.snoo_home_build --out $(OUT) $(ARGS)
