@@ -4,6 +4,7 @@
 
 import json
 import math
+import time
 from functools import cache
 
 import cv2
@@ -681,3 +682,32 @@ def test_busy_reports_the_last_reply_for_live_deploys(tmp_path):
     _post(c, _meta(0))
     b = c.get("/v1/snoo/map/busy").json()
     assert b["in_flight"] == 0 and b["last"] == "move" and 0 <= b["since_reply_s"] < 5
+
+
+def test_an_agent_step_reserved_for_the_next_station_is_used_once(tmp_path):
+    from app.snoo_map_server import override_path
+
+    c = _client(tmp_path)
+    assert _post(c, _meta(0)).json()["action"] == "move"
+    path = override_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"steer_deg": 0.0, "distance_cm": 10.0, "t": time.time(),
+                                "note": "左のソファの下を見たい"}))  # fmt: skip
+    a = _post(c, _meta(1)).json()
+    assert a["agent"] is True and a["distance_cm"] == 10.0 and not path.exists()
+    log = [json.loads(x) for x in (path.parent / "override_result.jsonl").read_text().splitlines()]
+    assert log[-1]["used"] is True
+
+
+def test_a_bad_agent_step_is_not_used(tmp_path):
+    from app.snoo_map_server import override_path
+
+    c = _client(tmp_path)
+    _post(c, _meta(0))
+    path = override_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"steer_deg": 0.0, "distance_cm": 80.0, "t": time.time()}))
+    a = _post(c, _meta(1)).json()
+    assert not a.get("agent")
+    log = [json.loads(x) for x in (path.parent / "override_result.jsonl").read_text().splitlines()]
+    assert log[-1]["used"] is False and log[-1]["why"]

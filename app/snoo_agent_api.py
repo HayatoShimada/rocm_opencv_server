@@ -1102,6 +1102,30 @@ def create_router(
         checks += check_move(grid, pose, float(steer), float(d), bool(c.reverse))
         return params, checks
 
+    @router.post("/next")
+    def next_step(body: dict):
+        """探索中の次のステーションの返事を、この 1 歩にする（地図のサーバーが確かめて使う）。
+
+        {steer_deg, distance_cm, reverse?, note?, session?}。予約は 1 つだけ（上書き）、
+        90 秒で古くなる。
+        使ったか・使わなかった理由は GET next/result で見る。"""
+        from app.snoo_map_server import override_path
+
+        o = {k: body.get(k) for k in ("steer_deg", "distance_cm", "reverse", "note", "session")}
+        o["t"] = time.time()
+        path = override_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic.write_text(path, json.dumps(o, ensure_ascii=False))
+        return {"reserved": True, **o}
+
+    @router.get("/next/result")
+    def next_result(n: int = 5):
+        from app.snoo_map_server import override_path
+
+        path = override_path(root).parent / "override_result.jsonl"
+        rows = path.read_text().splitlines()[-n:] if path.is_file() else []
+        return [json.loads(x) for x in rows]
+
     @router.post("/command")
     def command(c: Command):
         now = clock()
