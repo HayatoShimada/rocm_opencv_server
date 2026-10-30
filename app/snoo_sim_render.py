@@ -667,6 +667,59 @@ class SimRenderer:
         return out
 
 
+class FpvRenderer(SimRenderer):
+    """車のカメラから見た 1 コマ（1920x1080）。左にカメラ（実機と同じ 640x480 を 2.25 倍）、
+    右に上から見た地図と数字。"""
+
+    def frame(self, title: str = "") -> np.ndarray:
+        sim = self.sim
+        out = np.zeros((H, W, 3), np.uint8)
+        out[:] = C2["bg"]
+        out[0:1080, 0:1440] = cv2.resize(
+            self.car_view(), (1440, 1080), interpolation=cv2.INTER_CUBIC
+        )
+        out[0:400, 1440:1920] = cv2.resize(
+            self.topdown.draw(sim), (480, 400), interpolation=cv2.INTER_AREA
+        )
+        cv2.line(out, (1440, 0), (1440, H), (90, 90, 90), 2)
+        cv2.line(out, (1440, 400), (W, 400), (90, 90, 90), 2)
+        s = sim.summary()
+        a = sim.action or {}
+        nxt = a.get("action", "-")
+        if a.get("action") == "move":
+            kind = (
+                "reverse"
+                if a.get("reverse")
+                else "random"
+                if a.get("random")
+                else a.get("kind", "")
+            )
+            nxt = f"move {kind} {a['distance_cm']:.0f} cm steer {a['steer_deg']:+.0f}"
+        _text(
+            out,
+            [
+                title or f"car camera  {sim.room.name}"[:34],
+                f"t {sim.t:5.0f} s   cycle {sim.cycle}",
+                f"phase {sim.phase}",
+                f"known floor {s.known_m2:.1f} m2",
+                f"driven {s.distance_m:.2f} m",
+                f"bumps {s.bumps}  reverses {s.reverses}",
+                "next:",
+                f"  {nxt}"[:36],
+            ],
+            1460,
+            440,
+            0.7,
+            40,
+        )
+        _legend_small = [
+            "orange band: clear_cm corridor",
+            "box: snoo detection",
+        ]
+        _text(out, _legend_small, 1460, 1000, 0.55, 26)
+        return out
+
+
 class VideoWriter:
     """ffmpeg に BGR のコマを流して MP4（H.264）にする。"""
 
