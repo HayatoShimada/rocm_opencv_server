@@ -79,13 +79,17 @@ from app.roommap import (
     FIT_TOL_M,
     LONG_STEP_M,
     MAX_STEP_M,
+    TURN_RADIUS_M,
+    WHEELBASE_M,
     Pose,
     camera_of,
     consume,
     drive_poses,
     fit_driven,
     mark_driven,
+    random_step,
     take,
+    turning_reverse,
 )
 from app.snoo import _allowed, parse_allow
 from app.snoo_mapper import (
@@ -111,6 +115,7 @@ from app.snoo_mapper import (
     mask_cats,
     or_reverse,
     pose_dict,
+    random_action,
     registration_is_bad,
     retrace_step,
     reverse_action,
@@ -580,6 +585,7 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         force_random=clustered(poses, station_id),
         reverse="reverse" in can,
         max_step_m=LONG_STEP_M if {"long_step", "segments"} <= can else MAX_STEP_M,
+        max_stations=SESSION_MAX_STATIONS,
         seed=station_id,
     )
     refs = select_frames(stations, MAX_FRAMES, old_frames=OLD_FRAMES)
@@ -657,6 +663,12 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
         # 下がれなかった。1〜2 回止まっただけで終えると早すぎる（18:55 の探索は 11 か所目で
         # 終えた）。決めた 1 歩をそのまま試し、続けて止まれば STALL_DONE で終える
         action = planned
+    if action["action"] == "done" and KEEP_EXPLORING and action.get("reason") not in FINISHED:
+        # 止まらずに探り続けて、地図を全部埋める（ユーザーの目標）。終えるのは調べ終えたときだけ
+        alt = keep_going(r.grid, pose, params, station_id)
+        if alt is not None:
+            alt["why"] = str(action.get("reason", "")).split(":")[0]
+            action = alt
     if pieces:  # 戻る弧を上から見た絵に描き、戻った先を target にする
         r.step_path = [camera_of(p) for _, p in drive_poses(pose, pieces, reverse=True)]
         action["target"] = pose_dict(r.step_path[-1])
@@ -681,6 +693,48 @@ def plan_station(session: Path, station_id: int, reconstruct: Reconstruct, marks
     write_results(session, r, window, anchor, raw, marks, action)
     (station_dir(session, station_id) / "reply.json").write_text(json.dumps(action))
     marks["write"] = time.perf_counter() - t
+    return action
+
+
+# --- 止まらずに探り続ける ---
+
+# 終えてよい理由（調べ終えた）。ほかの理由（行けない・止まったまま・位置合わせ・上限）では終えず、
+# 切り返し・でたらめな 1 歩で場所と向きを変えて撮り直す。SNOO_KEEP_EXPLORING=0 で前の決まりに戻す
+KEEP_EXPLORING = os.environ.get("SNOO_KEEP_EXPLORING", "1") != "0"
+FINISHED = ("no_frontier",)
+# 地図のサーバーの 1 セッションのステーションの上限（MapParams の既定 50 では 10 分ほどで終える）
+SESSION_MAX_STATIONS = int(os.environ.get("SNOO_MAX_STATIONS", "2000"))
+# 地図で確かめられないときの、見ないで走る短い切り返し（m）。後ろは見えないので短く
+BLIND_TURN_M = 0.10
+MAX_STEER_DEG = round(math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M)), 1)
+
+
+def keep_going(grid, pose: Pose, params: MapParams, station_id: int) -> dict | None:
+    """終える代わりの 1 歩。でたらめな前への 1 歩 → 切り返し → 見ないで短く切り返す、の順。
+
+    どれも Pi の guard・clear_cm・超音波（近い値が続いたとき）で止まる。ハンドルの向きは
+    ステーションごとに左右を替え、同じ所で同じ向きに回り続けないようにする。
+    """
+    rng = np.random.default_rng(station_id)
+    if grid is not None:
+        step = random_step(grid, pose, rng)
+        if step is not None:
+            action = random_action(step, pose, params)
+            action["keep_going"] = True
+            return action
+        if params.reverse:
+            for length in (0.30, 0.15):
+                pieces = turning_reverse(grid, pose, length=length)
+                if pieces:
+                    action = reverse_action(pieces, params.segments)
+                    action["keep_going"] = True
+                    return action
+    if not params.reverse:
+        return None
+    side = 1.0 if station_id % 2 == 0 else -1.0
+    action = reverse_action([(side * MAX_STEER_DEG, BLIND_TURN_M)], params.segments)
+    action["keep_going"] = True
+    action["blind"] = True
     return action
 
 

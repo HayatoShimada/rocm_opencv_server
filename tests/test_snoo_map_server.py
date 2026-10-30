@@ -374,7 +374,11 @@ def test_reverse_without_segments_is_one_arc(tmp_path, stuck, monkeypatch):
     assert a["reverse"] is True and a["distance_cm"] == 30.0 and "segments" not in a
 
 
-def test_no_reverse_for_a_pi_that_does_not_support_it(tmp_path, stuck):
+def test_no_reverse_for_a_pi_that_does_not_support_it(tmp_path, stuck, monkeypatch):
+    import app.snoo_map_server as _server
+
+    # 前の決まり（止まらずに探り続けない）での返事を見る
+    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
     done = {"action": "done", "reason": "unreachable"}
     assert _stuck_session(tmp_path / "a", None) == done
     assert _stuck_session(tmp_path / "b", ["segments"]) == done
@@ -467,6 +471,10 @@ def test_each_station_keeps_its_points_and_reply_and_can_be_replayed(tmp_path):
 
 
 def test_no_floor_returns_done_instead_of_500(tmp_path, monkeypatch):
+    import app.snoo_map_server as _server
+
+    # 前の決まり（止まらずに探り続けない）での返事を見る
+    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
     import app.snoo_mapper as mapper
 
     monkeypatch.setattr(mapper, "fit_floor", lambda *a, **k: None)
@@ -538,6 +546,10 @@ def test_a_stalled_forward_step_is_not_answered_with_another_forward_step(tmp_pa
 
 
 def test_repeated_stalls_end_the_exploration(tmp_path, monkeypatch):
+    import app.snoo_map_server as _server
+
+    # 前の決まり（止まらずに探り続けない）での返事を見る
+    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
     import app.snoo_map_server as server
 
     # 作り物の部屋はステーション 2 つ分なので、終える回数を 1 にして確かめる
@@ -625,3 +637,35 @@ def test_one_stall_without_a_way_back_keeps_the_planned_step(tmp_path, monkeypat
     assert _post(c, _meta(0, supports=can)).json()["action"] == "move"
     a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
     assert a["action"] == "move" and not a.get("reverse")
+
+
+def test_keep_exploring_replaces_a_stop_with_a_step(tmp_path, monkeypatch):
+    """止まらずに探り続ける：止まったまま・行けない・上限では終えず、
+    場所と向きを変える 1 歩にする。"""
+    import app.snoo_map_server as server
+
+    monkeypatch.setattr(server, "STALL_DONE", 1)
+    c = _client(tmp_path)
+    can = ["reverse", "segments", "long_step"]
+    _post(c, _meta(0, supports=can))
+    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
+    assert a["action"] == "move" and a["keep_going"] is True and a["why"] == "stalled"
+
+
+def test_keep_going_falls_back_to_a_short_blind_turn_without_a_map():
+    from app.roommap import Pose
+    from app.snoo_map_server import BLIND_TURN_M, keep_going
+    from app.snoo_mapper import MapParams
+
+    # 地図が無い（床が見つからなかった）とき
+    a = keep_going(None, Pose(0.0, 0.0, 0.0), MapParams(reverse=True, segments=True), 3)
+    assert a["reverse"] is True and a["blind"] is True
+    assert a["distance_cm"] == round(BLIND_TURN_M * 100, 1)
+    # 下がれない Pi で地図も無ければ、見ないで前へは出さない
+    assert keep_going(None, Pose(0.0, 0.0, 0.0), MapParams(reverse=False), 3) is None
+
+
+def test_no_frontier_still_finishes():
+    from app.snoo_map_server import FINISHED
+
+    assert "no_frontier" in FINISHED
