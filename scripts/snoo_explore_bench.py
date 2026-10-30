@@ -16,6 +16,8 @@ m2_at_5min は 5 分の時点の広さ、m2_per_min は covered_m2 を --minutes
 （早く止まっても --minutes で割る。止まらずに探り続けるほうが良い）、m2_per_m は走った 1 m あたり。
 --param name=value で MapParams を変えて試せる（例 --param max_step_m=0.6）。
 --window N は地図のサーバーの窓（N か所だけで間取りを作る）をまねる。
+--snoo behavior で、猫を録画から作った BehaviorSnoo（app/snoo_behavior.py）にする（既定は
+random の RandomWalkSnoo）。snoo_bumps は猫にぶつかった数（bumps に含まれる）。
 """
 
 import argparse
@@ -30,6 +32,7 @@ from app.snoo_sim import CAM_H_M, REAL_PACE, Sim, room_from_map, synthetic_room
 SEEDS = tuple(range(16))
 FIELDS = (
     "stations", "t_s", "distance_m", "m2_at_5min", "covered_m2", "m2_per_min", "m2_per_m", "bumps",
+    "snoo_bumps",
 )  # fmt: skip
 
 
@@ -57,7 +60,7 @@ def run_one(room, seed: int, args, params: MapParams) -> dict:
         pace = dataclasses.replace(pace, tilts=tuple(args.tilts))
     sim = Sim(
         room, rays=args.rays, params=params, seed=seed, sonar_map=True, pace=pace,
-        window=args.window,
+        window=args.window, snoo=args.snoo,
     )  # fmt: skip
     t0 = time.perf_counter()
     s = sim.explore(args.cycles, backtrack=1, time_budget_s=args.minutes * 60)
@@ -69,6 +72,12 @@ def run_one(room, seed: int, args, params: MapParams) -> dict:
     out["m2_at_5min"] = max([c for t, c in sim.timeline if t <= 300] or [0.0])
     out["timeline"] = sim.timeline
     out["bump_log"] = sim.bump_log
+    out["snoo_bumps"] = sum(bool(b["snoo"]) for b in sim.bump_log)
+    reactions = getattr(sim.snoo, "reactions", None)
+    if reactions is not None:
+        out["snoo_reactions"] = {
+            k: sum(r["kind"] == k for r in reactions) for k in {r["kind"] for r in reactions}
+        }
     return out
 
 
@@ -87,6 +96,7 @@ def main() -> None:
     parser.add_argument("--tilts", type=float, nargs="+", help="首振りのチルト（既定 -15 0）")
     parser.add_argument("--window", type=int, help="地図のサーバーの窓（ステーションの数）")
     parser.add_argument("--rays", type=lambda t: tuple(map(int, t.split("x"))), default=(160, 120))
+    parser.add_argument("--snoo", default="random", choices=("random", "behavior"))
     parser.add_argument("--param", action="append", default=[], help="MapParams の name=value")
     parser.add_argument("--out", type=Path, help="結果の JSON")
     args = parser.parse_args()
@@ -104,7 +114,18 @@ def main() -> None:
             rows.append(row)
             print(
                 json.dumps(
-                    {k: row[k] for k in ("room", "seed", *FIELDS, "reason", "kinds", "bump_log")}
+                    {
+                        k: row.get(k)
+                        for k in (
+                            "room",
+                            "seed",
+                            *FIELDS,
+                            "reason",
+                            "kinds",
+                            "bump_log",
+                            "snoo_reactions",
+                        )
+                    }
                 ),
                 flush=True,
             )

@@ -572,6 +572,9 @@ class SnooPose:
     y: float
     yaw: float
     moving: bool = False
+    # 姿勢（app/snoo_behavior.py の BehaviorSnoo が決める。walk・run・stand・sit・lie・sleep・
+    # groom・sniff）。猫の体の見た目を変えるのに使う。RandomWalkSnoo はいつも walk
+    posture: str = "walk"
 
 
 class SnooModel(Protocol):
@@ -670,6 +673,20 @@ class RandomWalkSnoo:
             self.heading = yaw + float(self.rng.choice([-1, 1])) * float(self.rng.uniform(1, 2.5))
             self.pose = SnooPose(p.x, p.y, yaw, True)
         return self.pose
+
+
+def make_snoo(room: Room, start: SnooPose, kind: str = "random", seed: int = 1) -> SnooModel:
+    """名前から snoo を作る。random（RandomWalkSnoo）か behavior（app/snoo_behavior.py）。"""
+    rng = np.random.default_rng(seed)
+    if kind == "random":
+        return RandomWalkSnoo(room, start, rng)
+    if kind == "behavior":
+        from app.snoo_behavior import BehaviorSnoo
+
+        # 壁・家具・部屋の外は RandomWalkSnoo と同じに見る（車は BehaviorSnoo が自分で避ける）
+        probe = RandomWalkSnoo(room, start, np.random.default_rng(0))
+        return BehaviorSnoo(start, probe.free_at, rng, pose_cls=SnooPose)
+    raise ValueError(f"snoo の種類が分からない: {kind}")
 
 
 def snoo_aabb(p: SnooPose) -> np.ndarray:
@@ -813,7 +830,7 @@ class Sim:
     def __init__(
         self,
         room: Room,
-        snoo: SnooModel | None = None,
+        snoo: SnooModel | str | None = None,
         rays: tuple[int, int] = (320, 240),
         params: MapParams | None = None,
         seed: int = 0,
@@ -847,10 +864,11 @@ class Sim:
         self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・turn・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
-        if snoo is None:
+        if snoo is None or isinstance(snoo, str):
+            # 既定は RandomWalkSnoo（前の試験・ベンチと同じ）。"behavior" は録画から作った猫
             x0, y0, x1, y1 = room.bounds
             spot = find_free_spot(room, (x0 + 0.65 * (x1 - x0), y0 + 0.3 * (y1 - y0)), self.rng)
-            snoo = RandomWalkSnoo(room, spot, np.random.default_rng(seed + 1))
+            snoo = make_snoo(room, spot, snoo or "random", seed + 1)
         self.snoo = snoo
         self.car_aabbs = low_aabbs(room, CAR_HEIGHT_M)
         self.grid = Grid()

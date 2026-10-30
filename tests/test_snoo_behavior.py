@@ -15,6 +15,8 @@ from app.snoo_behavior import (
     grid_free,
     load_model,
 )
+from app.snoo_gridsim import GridSim
+from app.snoo_homes import make_home
 
 
 def _open_room(x0=0.0, y0=0.0, x1=4.0, y1=4.0, r=0.15):
@@ -162,3 +164,13 @@ def test_behavior_agent_only_moves_forward_in_time():
     a.at(10.0)
     assert a.t == 10.0
 
+
+def test_grid_sim_with_the_behavior_cat_is_deterministic_and_reacts():
+    a = GridSim(make_home(5, agent_t_s=400), snoo="behavior")
+    b = GridSim(make_home(5, agent_t_s=400), snoo="behavior")
+    ea, eb = a.run(240), b.run(240)
+    assert ea.timeline == eb.timeline and ea.agent_bumps == eb.agent_bumps
+    cat = next(x for x in a.agents if x.name == "snoo")
+    assert isinstance(cat, BehaviorAgent) and cat.t > 200
+    with pytest.raises(ValueError):
+        GridSim(make_home(5, agent_t_s=10), snoo="tiger")
