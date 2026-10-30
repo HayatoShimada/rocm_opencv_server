@@ -138,7 +138,7 @@ class GridSim:
         self.pace = pace
         self.view_m = view_m
         self.params = params or MapParams(
-            camera_height_m=CAM_H_M, segments=True, reverse=True, max_stations=400, policy=None
+            camera_height_m=CAM_H_M, segments=True, reverse=True, max_stations=400
         )
         self.agents = list(home.agents) if agents else []
         if agents and snoo == "behavior":

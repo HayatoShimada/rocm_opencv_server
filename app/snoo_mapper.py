@@ -131,9 +131,6 @@ class MapParams:
     # 同じ所に固まっていれば、必ずでたらめな 1 歩にする（地図のサーバーが決める）
     force_random: bool = False
     seed: int = 0
-    # 学んだ選び方（app/snoo_explore_policy.py）の重みのファイル。None なら今までの決め方。
-    # 既定は環境変数 SNOO_EXPLORE_POLICY（無ければ使わない）
-    policy: str | None = field(default_factory=lambda: os.getenv("SNOO_EXPLORE_POLICY") or None)
 
 
 @dataclass
@@ -910,18 +907,12 @@ def decide(
 ) -> tuple[dict, Plan | None]:
     """最後のステーションから次の 1 歩を決める。危なそうなら止める（done）。
 
-    params.policy（重みのファイル）があれば、候補の 1 歩を学んだ点数で選ぶ
-    （app/snoo_explore_policy.py。安全の確かめと 1 歩の作り方は同じ）。
     trusted は stop_reason と同じ（位置のグラフで位置が決まったステーションの名前）。
     """
     stop = stop_reason(grid, stations, params, heights, trusted)
     if stop is not None:
         return stop, None
     pose = stations[-1].pose
-    if params.policy:
-        from app.snoo_explore_policy import policy_decide
-
-        return policy_decide(grid, stations, params)
     rng = np.random.default_rng(params.seed)
     plan = None
     if not params.force_random and rng.random() >= params.random_p:

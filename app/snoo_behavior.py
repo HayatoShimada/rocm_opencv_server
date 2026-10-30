@@ -1,7 +1,7 @@
 """本物の snoo に似せたシミュレーターの猫（BehaviorSnoo）。録画から取った動きの数で動かす。
 
 RandomWalkSnoo（app/snoo_sim.py）は止まる・歩くを繰り返し、車には 0.5 m で離れるだけだった。
-それでは探り方（app/snoo_explore_policy.py）を学んでも、猫にぶつかる数が減らない。
+それでは探り方を学んでも、猫にぶつかる数が減らない。
 ここでは scripts/snoo_behavior_fit.py が録画（scripts/snoo_behavior_extract.py）から作った
 数（MODEL。app/snoo_behavior_model.json）で、次のように動かす。
 

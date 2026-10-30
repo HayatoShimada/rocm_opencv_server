@@ -35,7 +35,7 @@ case "${1:-status}" in
   train)
     systemctl --user stop snoo-ondemand snoo-slam snoo-map
     "${COMPOSE[@]}" stop snoo >/dev/null 2>&1
-    echo "学習のターン：検出・地図・SLAM・見張りを止めた（画像の API の server は止めない）。make train-explore で学習を始める（続きから）"
+    echo "学習のターン：検出・地図・SLAM・見張りを止めた（画像の API の server は止めない）。GPU を使う学習を始めてよい"
     ;;
   robot)
     stop_training || exit 1
