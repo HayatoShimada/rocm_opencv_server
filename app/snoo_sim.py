@@ -13,8 +13,9 @@
 - 地図の更新：VGGT の代わりに、カメラの画素ごとの光線を部屋に当て（mj_multiRay）、
   当たった点の高さで床・障害物・「上」の層に分けて app/roommap.Grid に足す。
   分け方と次の 1 歩の決め方は app/snoo_mapper.py と同じ（decide をそのまま使う）。
-- snoo：v1 は箱と球の猫が、止まる・歩くを繰り返す（RandomWalkSnoo）。
-  step(dt, robot) の形を守れば、あとで DeepLabCut の関節から動かすものに差し替えられる。
+- snoo：関節のある猫（app/snoo_body.py）。姿勢（SnooPose.posture）の形を、本物の snoo の
+  写真に DeepLabCut をかけて合わせた角度（app/snoo_postures.json）で作り、歩くときは脚を振る。
+  動き方は RandomWalkSnoo（止まる・歩くを繰り返す）。step(dt, robot) の形を守れば差し替えられる。
 
 描くのは app/snoo_sim_render.py。ここは描かない（GL が無くても試験できるように）。
 
@@ -60,6 +61,7 @@ from app.roommap import (
     mark_driven,
     mark_sonar,
 )
+from app.snoo_body import FUR_RGBA, JOINT_NAMES, SnooAnimator, body_xml
 from app.snoo_mapper import (
     CLUSTER_STATIONS,
     RECENT_STATIONS,
@@ -135,7 +137,8 @@ RES_M = Grid().res
 GROUP_ROOM, GROUP_SNOO, GROUP_CAR, GROUP_DIM = 0, 1, 2, 4
 RAY_GROUPS = np.array([1, 1, 0, 0, 0, 0], np.uint8)
 
-# snoo の大きさ（m）。体の中心の床が原点、x が頭の向き。長さ 約 48 cm（しっぽまで）、高さ 約 27 cm
+# snoo が歩くときに場所を取る大きさ（m）。体の中心の床が原点、x が頭の向き。
+# 長さ 約 48 cm（しっぽの付け根まで）、高さ 約 27 cm。画面の箱は、姿勢ごとの体の形から作る
 SNOO_FRONT_M = 0.22
 SNOO_REAR_M = -0.26
 SNOO_HALF_W_M = 0.07
@@ -423,29 +426,6 @@ def _car_xml() -> str:
 </body>"""
 
 
-def _snoo_xml() -> str:
-    """箱と球の猫（体・頭・耳・脚・しっぽ）。毛の色と組は default の snoo の class で付ける。"""
-    dark = "0.12 0.1 0.08 1"
-    legs = "".join(
-        f'<geom type="capsule" fromto="{_f(x, y, 0.12, x, y, 0.018)}" size="0.018"/>'
-        for x in (0.07, -0.08)
-        for y in (0.04, -0.04)
-    )
-    return f"""
-<body name="snoo" pos="1 -0.5 0" childclass="snoo">
-  <freejoint name="snoo"/>
-  <geom name="snoo_body" type="capsule" fromto="-0.09 0 0.15 0.08 0 0.155" size="0.07"/>
-  <geom name="snoo_head" type="sphere" pos="0.15 0 0.2" size="0.055"/>
-  <geom type="sphere" pos="0.195 0 0.185" size="0.026"/>
-  <geom type="ellipsoid" pos="0.155 0.03 0.25" size="0.012 0.018 0.026"/>
-  <geom type="ellipsoid" pos="0.155 -0.03 0.25" size="0.012 0.018 0.026"/>
-  <geom type="sphere" pos="0.198 0.022 0.212" size="0.008" rgba="{dark}"/>
-  <geom type="sphere" pos="0.198 -0.022 0.212" size="0.008" rgba="{dark}"/>
-  {legs}
-  <geom name="snoo_tail" type="capsule" fromto="-0.14 0 0.16 -0.24 0 0.25" size="0.018"/>
-</body>"""
-
-
 def build_mjcf(room: Room) -> str:
     """部屋・車・snoo の MJCF。物理は解かない（接触も重力も切る）。"""
     x0, y0, x1, y1 = room.bounds
@@ -486,7 +466,7 @@ def build_mjcf(room: Room) -> str:
   <default>
     <geom contype="0" conaffinity="0"/>
     <default class="car"><geom group="{GROUP_CAR}"/></default>
-    <default class="snoo"><geom group="{GROUP_SNOO}" rgba="0.78 0.56 0.34 1"/></default>
+    <default class="snoo"><geom group="{GROUP_SNOO}" rgba="{_f(*FUR_RGBA)}"/></default>
   </default>
   <worldbody>
     <light name="top" pos="{_f(cx, cy, 3.5)}" dir="0 0 -1" diffuse="0.55 0.55 0.55"
@@ -495,7 +475,7 @@ def build_mjcf(room: Room) -> str:
     <geom name="floor" type="plane" size="0 0 0.05" material="floor" group="{GROUP_ROOM}"/>
     {"".join(geoms)}
     {_car_xml()}
-    {_snoo_xml()}
+    {body_xml()}
   </worldbody>
 </mujoco>"""
 
@@ -580,8 +560,8 @@ class SnooPose:
 class SnooModel(Protocol):
     """snoo の動き。dt 秒進めて、新しい姿勢を返す。robot は車のカメラの姿勢。
 
-    v1 は RandomWalkSnoo。DeepLabCut で取った関節の動き（feature/snoo-sim の app/cat_pose.py）
-    から作るものも、この形にすれば差し替えられる。
+    v1 は RandomWalkSnoo。姿勢の名前を pose.posture（walk・sit・lie・sleep・alert）に
+    入れれば、その形で描く（無ければ walk。app/snoo_body.SnooAnimator）。
     """
 
     pose: SnooPose
@@ -870,6 +850,9 @@ class Sim:
             spot = find_free_spot(room, (x0 + 0.65 * (x1 - x0), y0 + 0.3 * (y1 - y0)), self.rng)
             snoo = make_snoo(room, spot, snoo or "random", seed + 1)
         self.snoo = snoo
+        # snoo の関節の角度（姿勢と歩く振り）。描くためで、地図の決め方には関わらない
+        self.snoo_anim = SnooAnimator()
+        self.snoo_anim.update(0.0, snoo.pose)
         self.car_aabbs = low_aabbs(room, CAR_HEIGHT_M)
         self.grid = Grid()
         if room.floor_ok is not None and room.floor_ok.shape != self.grid.logodds.shape:
@@ -899,6 +882,17 @@ class Sim:
             for n in ("car", "snoo", "pan", "tilt", "steer_fl", "steer_fr")
             + tuple(f"wheel_{a}{b}" for a in "rf" for b in "lr")
         }
+        self.snoo_qadr = np.array([self.model.joint(n).qposadr[0] for n in JOINT_NAMES])
+        snoo_geoms = np.flatnonzero(self.model.geom_group == GROUP_SNOO)
+        self.snoo_geoms = snoo_geoms
+        # 見えるかを調べる体の中の点：腰・胴・胸・頭と、4 本の足先・しっぽの真ん中
+        inner = ("snoo_hips", "snoo_body", "snoo_chest", "snoo_head")
+        self.snoo_inner = [self.model.geom(n).id for n in inner] + [
+            g
+            for g in snoo_geoms
+            if self.model.body(self.model.geom_bodyid[g]).name
+            in ("snoo_fl_lower", "snoo_br_lower", "snoo_tail2")
+        ]
         self.cam_id = self.model.camera("car_cam").id
         self.sync()
 
@@ -910,6 +904,7 @@ class Sim:
         q[j["car"] : j["car"] + 7] = [c.x, c.y, 0, math.cos(c.yaw / 2), 0, 0, math.sin(c.yaw / 2)]
         s = self.snoo.pose
         q[j["snoo"] : j["snoo"] + 7] = [s.x, s.y, 0, math.cos(s.yaw / 2), 0, 0, math.sin(s.yaw / 2)]
+        q[self.snoo_qadr] = self.snoo_anim.qpos
         q[j["pan"]] = math.radians(c.pan_deg)
         q[j["tilt"]] = math.radians(c.tilt_deg)
         q[j["steer_fl"]] = q[j["steer_fr"]] = -math.radians(c.steer_deg)
@@ -1004,27 +999,33 @@ class Sim:
         return best if best <= SONAR_RANGE_M else None
 
     def snoo_points(self) -> np.ndarray:
-        """snoo の箱の角と体の中の点（部屋の座標）。見えるかと、画面の箱を決めるのに使う。"""
+        """snoo の外形の箱の 8 つの角と、体の中の点（部屋の座標）。見えるかと、画面の箱を決める。
+
+        箱は、いまの姿勢の geom を囲む、snoo の向きにそろえた箱（床から）。座れば高く短く、
+        寝れば低くなる。sync（mj_kinematics）のあとに呼ぶ。
+        """
+        m, d = self.model, self.data
         p = self.snoo.pose
-        xs, ys, zs = (
-            (SNOO_REAR_M, SNOO_FRONT_M),
-            (-SNOO_HALF_W_M, SNOO_HALF_W_M),
-            (0.0, SNOO_HEIGHT_M),
-        )
-        local = [(x, y, z) for x in xs for y in ys for z in zs]
-        local += [
-            (0.0, 0, 0.15),
-            (0.15, 0, 0.2),
-            (-0.05, 0, 0.15),
-            (0.07, 0, 0.05),
-            (-0.08, 0, 0.05),
-            (-0.2, 0, 0.21),
-        ]
         c, s = math.cos(p.yaw), math.sin(p.yaw)
-        L = np.array(local)
-        return np.stack(
-            [p.x + c * L[:, 0] - s * L[:, 1], p.y + s * L[:, 0] + c * L[:, 1], L[:, 2]], 1
+        g = self.snoo_geoms
+        # geom ごとの、geom の向きの箱（geom_aabb）の 8 つの角を部屋の座標に
+        center, half = m.geom_aabb[g, :3], m.geom_aabb[g, 3:]
+        signs = np.array([[a, b, e] for a in (-1, 1) for b in (-1, 1) for e in (-1, 1)])
+        local = center[:, None, :] + signs[None] * half[:, None, :]  # (G, 8, 3)
+        R = d.geom_xmat[g].reshape(-1, 3, 3)
+        world = np.einsum("gij,gkj->gki", R, local) + d.geom_xpos[g][:, None, :]
+        world = world.reshape(-1, 3)
+        # snoo の向きの座標（前 fx・左 fy）で囲む
+        fx = c * (world[:, 0] - p.x) + s * (world[:, 1] - p.y)
+        fy = -s * (world[:, 0] - p.x) + c * (world[:, 1] - p.y)
+        xs = (fx.min(), fx.max())
+        ys = (fy.min(), fy.max())
+        zs = (0.0, float(world[:, 2].max()))
+        box = np.array([(x, y, z) for x in xs for y in ys for z in zs])
+        corners = np.stack(
+            [p.x + c * box[:, 0] - s * box[:, 1], p.y + s * box[:, 0] + c * box[:, 1], box[:, 2]], 1
         )
+        return np.concatenate([corners, d.geom_xpos[self.snoo_inner]])
 
     def detect_snoo(self) -> tuple[float, float, float, float, float] | None:
         """車のカメラに snoo が映っていれば、検出の箱 (u0, v0, u1, v1, 見えた割合)。
@@ -1179,6 +1180,7 @@ class Sim:
         """時間を進める（snoo が動く）。"""
         self.t += dt
         self.snoo.step(dt, self.car.camera_pose())
+        self.snoo_anim.update(dt, self.snoo.pose)
         self.snoo_trail.append(self.snoo.pose)
         if len(self.snoo_trail) > 400:
             self.snoo_trail = self.snoo_trail[-400:]
