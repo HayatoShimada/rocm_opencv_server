@@ -78,6 +78,9 @@ MIN_FREE_CELLS = 30
 # 1 か所で首を振ったときのカメラの中心のずれの上限。首振りの軸のずれは数 cm なので、
 # これより大きければ VGGT の位置合わせが崩れている
 MAX_STATION_SPREAD_M = 0.10
+# ステーションの中で外れたコマとみなす、カメラの中心の中央値からの距離と、残す割合の下限
+OUTLIER_M = 0.06
+OUTLIER_KEEP = 0.6
 
 _NAME = re.compile(r"pan([+-]\d+)_tilt([+-]\d+)")
 
@@ -468,12 +471,29 @@ def _rotate_about(v: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
     return v * c + np.cross(axis, v) * s + axis * (axis @ v) * (1 - c)
 
 
-def heading_frame(refs: list[FrameRef], station: int) -> int:
+def heading_frame(refs: list[FrameRef], station: int, only: list[int] | None = None) -> int:
     """そのステーションで車の向きを出すのに使うコマ。
-    tilt 0 に近い段の、パンがいちばん 0 に近いもの。
+    tilt 0 に近い段の、パンがいちばん 0 に近いもの（only があれば、その中から）。
     """
-    idx = [i for i, r in enumerate(refs) if r.station == station]
+    idx = only if only else [i for i, r in enumerate(refs) if r.station == station]
     return min(idx, key=lambda i: (round(abs(refs[i].tilt_deg)), abs(refs[i].pan_deg)))
+
+
+def station_inliers(cams: np.ndarray) -> np.ndarray:
+    """首を振っただけのステーションのコマのうち、カメラの中心がまとまっているもの（bool）。
+
+    首を振るだけならカメラはほぼ動かない（1〜2 cm）。VGGT が 1〜2 コマだけ大きく外すことがあり
+    （18:49 の探索の 004 は 16 cm）、それだけでステーション全体を位置合わせの失敗として探索を
+    終えていた。真ん中（中央値）から OUTLIER_M より離れたコマを外し、残りが OUTLIER_KEEP 以上
+    あれば、残りで位置とばらつきを出す。足りなければ全部を返す（ばらつきで失敗と分かる）。
+    """
+    if len(cams) < 3:
+        return np.ones(len(cams), bool)
+    d = np.linalg.norm(cams - np.median(cams, 0), axis=1)
+    keep = d <= OUTLIER_M
+    if keep.sum() < max(3, math.ceil(OUTLIER_KEEP * len(cams))):
+        return np.ones(len(cams), bool)
+    return keep
 
 
 def camera_heading(extrinsic: np.ndarray, floor: Floor, pan_deg: float) -> np.ndarray:
@@ -743,9 +763,11 @@ def build_map(
     rng = np.random.default_rng(0)
     for s, st in enumerate(stations):
         idx = [i for i, r in enumerate(refs) if r.station == s]
+        # 外れたコマ（VGGT が位置を外した）は、位置・向き・地図の点に使わない
+        idx = [i for i, ok in zip(idx, station_inliers(cams_w[idx]), strict=True) if ok]
         c = cams_w[idx]
         center = c.mean(0)
-        k = heading_frame(refs, s)
+        k = heading_frame(refs, s, idx)
         hd = world.direction(camera_heading(extrinsic[k], floor, refs[k].pan_deg))
         pose = Pose(float(center[0]), float(center[1]), math.atan2(hd[1], hd[0]))
         res = StationResult(
