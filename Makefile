@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: train-explore eval-explore phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build
+.PHONY: train-explore eval-explore phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -16,6 +16,7 @@ help:
 	@echo "make train-explore    作った家で次の 1 歩の選び方を学ぶ（続きから。SIGTERM で止まる）"
 	@echo "make eval-explore     学んだ選び方を、学んでいない家で今の決め方と比べる"
 	@echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]  家の地図を作る"
+	@echo "make sim-live [ARGS=\"--room home:3\"]  猫を手で動かすシミュレーター（http://127.0.0.1:8731/sim）"
 
 test-fast:
 	$(PYTHON) -m pytest -q -m "not slow" -p no:cacheprovider $(ARGS)
@@ -77,3 +78,8 @@ replay:
 home-build:
 	@test -n "$(OUT)" || { echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]"; exit 2; }
 	$(PYTHON) -m scripts.snoo_home_build --out $(OUT) $(ARGS)
+
+# MuJoCo のシミュレーターを実機の速さで回し、猫をゲームパッドで動かして車の反応を見る
+# （scripts/snoo_sim_live.py。ポート 8731、SNOO_SIM_PORT で変える）。絵は EGL で描き、GPU の計算は使わない
+sim-live:
+	$(PYTHON) -m scripts.snoo_sim_live $(ARGS)

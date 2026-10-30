@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!-- MuJoCo のシミュレーターで、猫（snoo）を手で動かして車の反応を見る画面（scripts/snoo_sim_live.py）。
+     入力と送る周りは /drive と同じ /controller/controller.js。外の CDN もビルドも使わない。 -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0e1114">
+<title>snoo シミュレーター</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/controller/controller.css">
+<style>
+  .views { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .views .frame.wide { aspect-ratio: 16 / 9; }
+  .views .frame.top { aspect-ratio: 8 / 7; }
+  .postures { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  .postures button { padding: 10px 4px; }
+  .big-reason { font-size: 15px; font-weight: 600; }
+  /* 3 つの絵が 1 画面に入るよう、カメラの高さを抑える（横は黒い帯になる） */
+  #fpv-frame { max-height: 52vh; }
+  .views .frame { max-height: 36vh; }
+  @media (max-width: 760px) { .views { grid-template-columns: 1fr 1fr; gap: 6px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>snoo <span>シミュレーター</span></h1>
+  <span class="pill" id="pill-cat"><i></i><span>猫：—</span></span>
+  <span class="pill" id="pill-run"><i></i><span>—</span></span>
+  <div class="spacer"></div>
+  <select id="room" title="部屋"></select>
+  <input id="seed" type="number" min="0" value="0" title="くじ"
+    style="width:5em;background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px">
+  <button id="reset">作り直す</button>
+</header>
+
+<main class="ctl">
+  <section class="view">
+    <div class="frame" id="fpv-frame">
+      <img id="fpv" alt="">
+      <span class="tag bottom">車のカメラ（640x480、横 54°）</span>
+      <div class="empty" id="fpv-empty">描いている…</div>
+    </div>
+    <div class="views">
+      <div class="frame top"><img id="top" alt=""><span class="tag">上から見た地図</span></div>
+      <div class="frame wide"><img id="v3d" alt=""><span class="tag">3D</span></div>
+    </div>
+    <div id="sticks"></div>
+  </section>
+
+  <aside class="side">
+    <section class="card">
+      <h2>車がしていること</h2>
+      <div class="big-reason" id="phase">—</div>
+      <div class="reason" id="action" style="margin-top:4px">—</div>
+      <div class="reason" id="reaction" style="margin-top:6px;color:var(--warn)">—</div>
+    </section>
+    <section class="card">
+      <h2>猫の姿勢</h2>
+      <div class="postures">
+        <button data-p="walk">歩く<br><small>5・RB</small></button>
+        <button data-p="sit">座る<br><small>1・A</small></button>
+        <button data-p="lie">伏せる<br><small>2・X</small></button>
+        <button data-p="sleep">寝る<br><small>3・LB</small></button>
+        <button data-p="alert">見る<br><small>4・Y</small></button>
+      </div>
+      <div class="buttons" style="margin-top:8px">
+        <button id="hold" title="手を離しても 5 秒で自分で動く猫に戻さない">猫を持ち続ける：切</button>
+      </div>
+      <div class="inputs" id="inputs" style="margin-top:6px"></div>
+    </section>
+    <section class="card">
+      <h2>数</h2>
+      <dl class="kv" id="kv"></dl>
+    </section>
+    <section class="card desk help">
+      <h2>使い方</h2>
+      左のスティック（キーボードは <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>）で猫を歩かせる。
+      上が前、左右で回る。姿勢はボタンか <kbd>1</kbd>〜<kbd>5</kbd>。B か <kbd>Space</kbd> で止める。
+      手を離して 5 秒経つと、猫は自分で動く（録画から作った動き）。<br>
+      車は地図のサーバーと同じ決め方で探り続け、snoo が 150 cm より近くに見えると止まって見守る
+      （実機の Pi と同じ）。時間は実機と同じ速さ（1 か所の首振り 14 秒、地図の返事 11 秒）。
+    </section>
+  </aside>
+</main>
+
+<script src="/controller/controller.js"></script>
+<script src="/sim/static/sim.js"></script>
+</body>
+</html>

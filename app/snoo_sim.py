@@ -30,6 +30,7 @@ import dataclasses
 import json
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -669,6 +670,199 @@ def make_snoo(room: Room, start: SnooPose, kind: str = "random", seed: int = 1) 
     raise ValueError(f"snoo の種類が分からない: {kind}")
 
 
+# 手で動かす snoo（scripts/snoo_sim_live.py の /sim）。速さは本物の猫の早歩きくらいまで
+CAT_MAX_SPEED_M_S = 0.6
+CAT_MAX_TURN_RAD_S = 2.5
+CAT_BACK_SCALE = 0.3  # 猫は後ずさりが遅い
+# これだけ指令が来なければ、自分で動く猫（fallback）に任せる
+CAT_TIMEOUT_S = 5.0
+CAT_POSTURES = ("walk", "sit", "lie", "sleep", "alert")
+# 車の真ん中からこれより近くへは、手で動かしても寄らない（車の外形と猫の体が重ならないように）
+CAT_ROBOT_GAP_M = 0.3
+CAT_SUB_DT_S = 0.05
+
+
+def _place(model, pose: SnooPose) -> None:
+    """自分で動く猫を、手で動かした猫の今の所に置き直す（任せるときに飛ばないように）。"""
+    model.pose = pose
+    for k in ("x", "y", "yaw"):
+        if hasattr(model, k):
+            setattr(model, k, float(getattr(pose, k)))
+    if hasattr(model, "heading"):
+        model.heading = pose.yaw
+
+
+class ControlledSnoo:
+    """人がゲームパッドで動かす猫（SnooModel の形）。前へ・回る（どちらも -1..1）と姿勢を受ける。
+
+    動けるかは RandomWalkSnoo と同じ見方（箱・部屋の外・見ていない床）で確かめ、家具を通り抜けない。
+    ぶつかるときは、x か y の片方だけでも進めれば壁に沿って滑る。車には CAT_ROBOT_GAP_M より
+    近づかない（離れる向きには動ける）。timeout_s のあいだ指令が来なければ、fallback
+    （BehaviorSnoo・RandomWalkSnoo）に任せる。時間は step の dt で数える（Sim の時計）。
+    指令は別のスレッド（HTTP）から来るので、ロックで受け渡す。
+    """
+
+    def __init__(
+        self,
+        room: Room,
+        start: SnooPose,
+        fallback: SnooModel | None = None,
+        timeout_s: float = CAT_TIMEOUT_S,
+        max_speed: float = CAT_MAX_SPEED_M_S,
+        max_turn: float = CAT_MAX_TURN_RAD_S,
+    ):
+        self.pose = start
+        self.probe = RandomWalkSnoo(room, start, np.random.default_rng(0))
+        self.fallback = fallback
+        self.timeout_s = timeout_s
+        self.max_speed = max_speed
+        self.max_turn = max_turn
+        self.t = 0.0
+        self.forward = 0.0
+        self.turn = 0.0
+        self.posture = start.posture if start.posture in CAT_POSTURES else "walk"
+        self.cmd_t: float | None = None  # 最後に指令を受けた時刻（Sim の時計）
+        self.blocked = False  # 最後の歩でぶつかって進めなかった
+        self.lock = threading.Lock()
+
+    def command(self, forward: float, turn: float, posture: str | None = None) -> None:
+        """forward は前が +、turn は左回りが +（yaw と同じ）。posture は CAT_POSTURES のどれか。"""
+        if posture is not None and posture not in CAT_POSTURES:
+            raise ValueError(f"posture は {', '.join(CAT_POSTURES)} のどれか")
+        with self.lock:
+            if self.cmd_t is None or self.t - self.cmd_t > self.timeout_s:
+                # 任せていた猫から受け取る（姿勢もそのまま続ける）
+                p = self.pose.posture
+                self.posture = p if p in CAT_POSTURES else "walk"
+            self.forward = max(-1.0, min(1.0, float(forward)))
+            self.turn = max(-1.0, min(1.0, float(turn)))
+            if posture is not None:
+                self.posture = posture
+            self.cmd_t = self.t
+
+    @property
+    def controlled(self) -> bool:
+        return self.cmd_t is not None and self.t - self.cmd_t <= self.timeout_s
+
+    def since_command_s(self) -> float | None:
+        return None if self.cmd_t is None else self.t - self.cmd_t
+
+    def _ok(self, x: float, y: float, frm: tuple[float, float], robot) -> bool:
+        if not self.probe.free_at(x, y):
+            return False
+        if robot is None:
+            return True
+        d = math.dist((x, y), robot)
+        return d >= CAT_ROBOT_GAP_M or d > math.dist(frm, robot)
+
+    def step(self, dt: float, robot: Pose | None) -> SnooPose:
+        with self.lock:
+            self.t += dt
+            controlled = self.controlled
+            fwd, turn, posture = self.forward, self.turn, self.posture
+        if not controlled:
+            if self.fallback is None:
+                p = self.pose
+                self.pose = SnooPose(p.x, p.y, p.yaw, False, p.posture)
+            else:
+                _place(self.fallback, self.pose)
+                self.pose = self.fallback.step(dt, robot)
+            return self.pose
+        self.probe.robot_xy = None
+        car = None
+        if robot is not None:
+            car = (robot.x - 0.08 * math.cos(robot.yaw), robot.y - 0.08 * math.sin(robot.yaw))
+        if abs(fwd) > 0.05 or abs(turn) > 0.05:
+            posture = "walk"  # 座っていても、動かせば立って歩く
+            with self.lock:
+                self.posture = posture
+        p = self.pose
+        x, y, yaw = p.x, p.y, p.yaw
+        n = max(1, int(math.ceil(dt / CAT_SUB_DT_S - 1e-9)))
+        h = dt / n
+        moved, self.blocked = False, False
+        speed = self.max_speed * (fwd if fwd >= 0 else fwd * CAT_BACK_SCALE)
+        for _ in range(n):
+            yaw = (yaw + turn * self.max_turn * h + math.pi) % (2 * math.pi) - math.pi
+            ds = speed * h
+            if abs(ds) < 1e-9:
+                continue
+            nx, ny = x + ds * math.cos(yaw), y + ds * math.sin(yaw)
+            # まっすぐ → x だけ → y だけ（壁に沿って滑る）。動かない候補は数えない
+            for cx, cy in ((nx, ny), (nx, y), (x, ny)):
+                if math.dist((cx, cy), (x, y)) < 1e-6:
+                    continue
+                if self._ok(cx, cy, (x, y), car):
+                    x, y, moved = cx, cy, True
+                    break
+            else:
+                self.blocked = True
+        self.pose = SnooPose(x, y, yaw, moved or abs(turn) > 0.05, posture)
+        return self.pose
+
+
+def room_from_home(home, wall_h_m: float = 0.8) -> Room:
+    """作った家（app/snoo_homes.Home）から MuJoCo の部屋を作る。
+
+    家の格子は原点が家の角（0 の近く）なので、家（CLOSED でないセル）の真ん中が (0, 0) に来るよう
+    ずらす（Sim の地図は app/roommap.Grid の既定、原点を中心に 12 m 四方）。家の外のセルは使わない。
+    - LOW（壁・家具）：セルの高さごとに箱にまとめる。壁は wall_h_m で切る（上から見やすいように。
+      車のカメラは 8 cm の高さなので変わらない）
+    - HIGH（天板・座面）：置いた物の下の端（z0）に薄い板
+    - CLOSED（閉まった部屋・家の外の欠け）：wall_h_m の箱で埋める
+    """
+    from app.snoo_homes import CLOSED, LOW
+
+    res = home.res
+    if abs(res - RES_M) > 1e-9:
+        raise ValueError("家の格子の大きさが app/roommap.Grid と違う")
+    inside = np.argwhere(home.kind != CLOSED)
+    i0, j0 = np.maximum(inside.min(0) - 1, 0)
+    i1, j1 = np.minimum(inside.max(0) + 2, home.n)
+    size = Grid().n * Grid().res
+    if max(i1 - i0, j1 - j0) * res > size - 2 * res:
+        raise ValueError("家が地図（app/roommap.Grid の既定、12 m 四方）より大きい")
+    # セルの境目が地図の格子とそろうよう、ずらす量はセルの整数倍にする
+    offx = -round((home.origin + (i0 + i1) / 2 * res) / res) * res
+    offy = -round((home.origin + (j0 + j1) / 2 * res) / res) * res
+
+    def rect_xy(r):
+        a, b, c, d = r
+        return (
+            home.origin + offx + (i0 + a) * res,
+            home.origin + offy + (j0 + c) * res,
+            home.origin + offx + (i0 + b) * res,
+            home.origin + offy + (j0 + d) * res,
+        )
+
+    kind = home.kind[i0:i1, j0:j1]
+    blocks: list[Block] = []
+    low = kind == LOW
+    hq = np.round(np.minimum(home.height[i0:i1, j0:j1], wall_h_m) / 0.05) * 0.05
+    for k, top in enumerate(np.unique(hq[low])):
+        for m, r in enumerate(merge_cells(low & (hq == top))):
+            x0, y0, x1, y1 = rect_xy(r)
+            rgba = (0.86, 0.84, 0.80, 1.0) if top >= wall_h_m - 1e-6 else (0.55, 0.45, 0.35, 1.0)
+            blocks.append(_box(x0, y0, x1, y1, 0, max(float(top), 0.05), rgba, f"low{k}_{m}"))
+    for m, r in enumerate(merge_cells(kind == CLOSED)):
+        x0, y0, x1, y1 = rect_xy(r)
+        blocks.append(_box(x0, y0, x1, y1, 0, wall_h_m, (0.30, 0.30, 0.32, 1.0), f"closed{m}"))
+    for m, it in enumerate(i for i in home.items if i.layer == "high"):
+        x0, y0, x1, y1 = it.rect
+        z0 = max(float(it.z0), 0.15)
+        blocks.append(
+            _box(x0 + offx, y0 + offy, x1 + offx, y1 + offy, z0, z0 + 0.03,
+                 (0.4, 0.55, 0.8, 0.9), f"hi{m}")
+        )  # fmt: skip
+    s = home.start
+    return Room(
+        blocks,
+        rect_xy((0, i1 - i0, 0, j1 - j0)),
+        start=Pose(s.x + offx, s.y + offy, s.yaw),
+        name=f"home{home.seed}",
+    )
+
+
 def snoo_aabb(p: SnooPose) -> np.ndarray:
     """snoo（しっぽまで）を床に落とした向きの付いた長方形を囲む、軸にそろえた長方形 (1, 4)。"""
     local = np.array(
@@ -842,6 +1036,8 @@ class Sim:
         # 走った 1 歩ごとの (走り出したカメラの真下, 走った区間, 後ろへか)。地図に足す
         self.drives: list[tuple[Pose, list[tuple[float, float]], bool]] = []
         self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・turn・done）の数
+        # 地図のサーバーと同じく、終える代わりに探り続ける（keep_going）。既定は前と同じに終える
+        self.keep_exploring = False
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
         if snoo is None or isinstance(snoo, str):
@@ -1220,6 +1416,15 @@ class Sim:
         self.action, self.plan = decide(self.grid, self.stations, params, heights)
         pose = self.stations[-1].pose
         self.action, _ = or_reverse(self.action, self.grid, pose, self.history(), params)
+        if self.keep_exploring and self.action.get("action") != "move":
+            # 地図のサーバー（plan_station）と同じ 1 歩：でたらめな前へ → 切り返し →
+            # 見ないで切り返す
+            from app.snoo_map_server import keep_going
+
+            alt = keep_going(self.grid, pose, params, len(self.stations) - 1)
+            if alt is not None:
+                alt["why"] = str(self.action.get("reason", "")).split(":")[0]
+                self.action = alt
         a = self.action
         kind = "reverse" if a.get("reverse") else "random" if a.get("random") else "nbv"
         kind = "turn" if a.get("turn") else kind

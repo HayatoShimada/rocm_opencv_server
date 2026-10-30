@@ -1,0 +1,91 @@
+/* 操縦の画面（/drive・/sim）が共に使う見た目。色は /twin（app/static/twin/twin.css）と合わせる */
+:root {
+  --bg: #0e1114;
+  --card: #161a1f;
+  --line: #262c34;
+  --text: #d5dbe2;
+  --muted: #8692a0;
+  --ok: #3fb950;
+  --warn: #f2b84b;
+  --bad: #e5534b;
+  --accent: #39c5cf;
+  --mono: ui-monospace, "SFMono-Regular", "DejaVu Sans Mono", monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, "Noto Sans JP", "Noto Sans CJK JP", sans-serif;
+  -webkit-tap-highlight-color: transparent; }
+body { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+
+header { display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+h1 { margin: 0; font-size: 16px; font-weight: 650; }
+h1 span { color: var(--muted); font-weight: 400; }
+h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .04em; }
+.spacer { flex: 1; }
+button, select { background: var(--card); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; font: inherit; cursor: pointer; touch-action: manipulation; }
+button:hover { border-color: #3a434f; }
+button:active { transform: translateY(1px); }
+button.on { border-color: var(--accent); color: var(--accent); }
+
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 99px;
+  border: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: nowrap; }
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.ok { color: var(--ok); } .pill.ok i { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.pill.warn { color: var(--warn); } .pill.warn i { background: var(--warn); }
+.pill.bad { color: var(--bad); } .pill.bad i { background: var(--bad); }
+
+main.ctl { flex: 1; display: grid; gap: 10px; padding: 10px;
+  grid-template-columns: minmax(0, 1fr) 320px; grid-template-areas: "view side"; }
+.view { grid-area: view; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.side { grid-area: side; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+  min-width: 0; }
+.frame { position: relative; background: #000; border-radius: 8px; overflow: hidden;
+  aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center; }
+.frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.frame .tag.bottom { top: auto; bottom: 6px; }
+.frame .empty { position: absolute; color: var(--muted); font-size: 13px; padding: 12px; text-align: center; }
+.frame .tag { position: absolute; left: 8px; top: 6px; font: 11px var(--mono); color: #fff;
+  background: rgba(0, 0, 0, .55); padding: 1px 6px; border-radius: 4px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+.row > * { flex: 1; min-width: 0; }
+
+dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: 13px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+
+.stop { width: 100%; padding: 18px 10px; font-size: 22px; font-weight: 800; letter-spacing: .1em;
+  color: #fff; background: #b62324; border: 2px solid #f85149; border-radius: 12px; }
+.stop:hover { background: #da3633; border-color: #ff7b72; }
+.buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+.buttons button { flex: 1 1 auto; }
+.help { color: var(--muted); font-size: 12px; }
+.help kbd { font: 11px var(--mono); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.reason { font-size: 13px; line-height: 1.5; }
+.inputs { font: 11px var(--mono); color: var(--muted); }
+
+/* 指のスティック（controller.js が作る） */
+.sc-sticks { display: none; justify-content: space-between; gap: 16px; padding: 6px 4px;
+  user-select: none; -webkit-user-select: none; }
+.sc-stick { position: relative; touch-action: none; display: flex; flex-direction: column;
+  align-items: center; gap: 4px; }
+.sc-base { width: 150px; height: 150px; border-radius: 50%; border: 2px solid var(--line);
+  background: radial-gradient(circle, #1f252c 0, #12161a 70%); display: flex; align-items: center;
+  justify-content: center; }
+.sc-knob { width: 62px; height: 62px; border-radius: 50%; background: #2d353f; border: 2px solid #46515e;
+  transition: transform .05s linear; }
+.sc-stick.on .sc-knob { background: var(--accent); border-color: #7ee0e7; transition: none; }
+.sc-label { color: var(--muted); font-size: 12px; }
+
+/* スマホ（指で触る・狭い）：スティックを出して、1 列に並べる */
+@media (pointer: coarse), (max-width: 760px) {
+  .sc-sticks { display: flex; }
+}
+@media (max-width: 760px) {
+  main.ctl { grid-template-columns: 1fr; grid-template-areas: "view" "side"; padding: 6px; gap: 6px; }
+  header { padding: 6px 8px; gap: 8px; }
+  .side .card.desk { display: none; }
+}
+body.show-sticks .sc-sticks { display: flex; }
