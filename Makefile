@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: bench-plan phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
+.PHONY: bench-plan phase-offline phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -16,6 +16,8 @@ help:
 	@echo "make bench-plan       作った家（白い壁の部屋も）で次の 1 歩の決め方を測る（CPU 3 本）"
 	@echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]  家の地図を作る"
 	@echo "make sim-live [ARGS=\"--room home:3\"]  猫を手で動かすシミュレーター（http://127.0.0.1:8731/sim）"
+	@echo "make phase-offline    検出・地図・SLAM・見張りを止め、GPU を 1 つの比べる仕事に使う"
+	@echo "make phase-robot      見張りを起こす（実機のターン）。make phase で今どちらか"
 
 test-fast:
 	$(PYTHON) -m pytest -q -m "not slow" -p no:cacheprovider $(ARGS)
@@ -44,8 +46,9 @@ status:
 bench-plan:
 	$(PYTHON) -m scripts.snoo_plan_bench --workers 3 --out out/bench/plan.json $(ARGS)
 
-phase-train:
-	scripts/snoo_phase.sh train
+# GPU を握るプロセスを 1 つにするための切り替え（scripts/snoo_phase.sh）。学習のターンは #73 で無くなった
+phase-offline:
+	scripts/snoo_phase.sh offline
 
 phase-robot:
 	scripts/snoo_phase.sh robot

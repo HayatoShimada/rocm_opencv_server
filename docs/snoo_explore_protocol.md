@@ -90,3 +90,17 @@ Pi（snoo_trucar）が止まって首を振って撮った分（station）を `P
 - `confidence.png`：確信度（0 = 見ていない、1〜255 = 0〜1）。見た回数と近さ（遠いほど弱い）から
 - `texture.png`：手ざわり（写真の勾配。0〜255 = 0〜1）。0.35 以上を目印にする
 - /twin の「確信度」「目印」で重ねて見られる
+
+## Pi 側で決まっていること（snoo_trucar の docs/PROTOCOL.md と合わせる）
+
+- Pi は supports に `["reverse", "segments", "long_step", "gear_segments"]` を書く（snoo_trucar#26 以降）
+- Pi は区切りを 5 つ（`MAX_SEGMENTS`）まで、速さを `explore_speed` まで、前への合計を `explore_server_step_cm`
+  （80 cm）、後ろへの合計を `explore_reverse_max_cm`（30 cm）までに抑える。サーバーの上限（前 40 / 60 cm・
+  後ろ 30 cm）のほうが小さいので、ふつうは Pi では削られない
+- 前と後ろを替えるときは 0.3 s 止まる（`GEAR_PAUSE_S`）
+- `reverse_speed` が無い返事（前の版のサーバー）では、後ろも `speed` で走る。サーバーは前 12・後ろ 8
+- `rescan` の返事（`segments: []`・長さ 0）は、Pi では長さ 0 の 1 区切りになり、走らずに次の station を撮る
+- `retrace` は Pi では見ない（区切りの列をそのまま走るだけ）
+- 止まった理由（`prev_step.stop_reason`）：`done`（走りきった）・`clear`（前へ走る区切りで clear_cm が近い）・`clear_unknown`（clear_cm が
+  null か古いのが 0.3 s 続いた）・`clear_skip`（clear_cm が画角の外のまま 20 cm 走った）・`stuck`（画像が動かない。
+  どちらの向きでも）。`ultrasonic` は前の版の Pi だけ。guard・電池・USR でも止まる（探索の外の止め方）
