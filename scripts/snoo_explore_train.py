@@ -338,7 +338,8 @@ def load(out: Path) -> tuple[dict, dict] | None:
 def main() -> None:
     global _LOG
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--algo", choices=("ppo", "cmaes"), default="cmaes")
+    ap.add_argument("--algo", choices=("ppo", "cmaes"), default="ppo",
+                    help="既定は 2026-10-31 に確かめの家で良かった PPO")  # fmt: skip
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--minutes", type=float, default=40.0, help="今までの分も含めた時間の上限")
     ap.add_argument("--workers", type=int, default=MAX_WORKERS, help="3 本まで")
