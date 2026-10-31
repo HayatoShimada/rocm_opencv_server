@@ -48,7 +48,6 @@ from app.roommap import (
     FREE_HIT,
     OCCUPIED,
     OCCUPIED_HIT,
-    REVERSE_MAX_M,
     SONAR_HALF_DEG,
     SONAR_RANGE_M,
     UNKNOWN,
@@ -58,21 +57,19 @@ from app.roommap import (
     Plan,
     Pose,
     arc,
-    consume,
     mark_driven,
     mark_sonar,
 )
+from app.snoo_belief import Confidence
 from app.snoo_body import JOINT_NAMES, SnooAnimator, assets_xml, body_xml, default_xml
 from app.snoo_mapper import (
-    CLUSTER_STATIONS,
     RECENT_STATIONS,
-    History,
+    REVERSE_SPEED,
     MapParams,
     StationResult,
+    action_moves,
     choose_window,
-    clustered,
     decide,
-    or_reverse,
 )
 
 # GL の選び方は mujoco を読み込む前に決める（画面の無いマシンでも描けるよう EGL にする）
@@ -125,8 +122,6 @@ DRIVE_TILT_DEG = -15.0
 # 通り道（clear_cm）の帯：車の幅の両脇に足す余裕と、先を見る長さ（app/clearance.py と同じ）
 CORRIDOR_MARGIN_M = 0.02
 CLEAR_MAX_M = 1.0
-# 行き場が無いときに来た道を戻る長さ（地図のサーバーの reverse と同じ）
-BACKTRACK_M = REVERSE_MAX_M
 # 走っている間、前がこれより近くまでふさがったら止まる（Pi が clear_cm を見て止まる代わり）
 STOP_CLEAR_M = 0.05
 
@@ -1024,11 +1019,6 @@ class Sim:
         self.params = params or MapParams(camera_height_m=CAM_H_M)
         # 前の超音波をステーションごとに格子に足す（地図のサーバーと同じ）
         self.sonar_map = sonar_map
-        # 前へ走った道（走った順の区間 (ハンドル°, m)）。行き場が無いときに戻るのに使う
-        self.driven: list[tuple[float, float]] = []
-        self.backs = 0  # 続けて後ろへ戻った回数
-        self.arrived_reverse: list[bool] = []  # ステーションごとの、後ろへ戻って着いたか
-        self._reversed = False
         self.obs: list[StationObs] = []
         self.bump_log: list[dict] = []  # ぶつかったときの時刻・後ろへか・1 歩の種類
         # 撮り終えるごとの (Sim.t, 本当の床のうち床と分かった m²)
@@ -1036,9 +1026,7 @@ class Sim:
         self._truth: np.ndarray | None = None
         # 走った 1 歩ごとの (走り出したカメラの真下, 走った区間, 後ろへか)。地図に足す
         self.drives: list[tuple[Pose, list[tuple[float, float]], bool]] = []
-        self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（nbv・random・reverse・turn・done）の数
-        # 地図のサーバーと同じく、終える代わりに探り続ける（keep_going）。既定は前と同じに終える
-        self.keep_exploring = False
+        self.kinds: dict[str, int] = {}  # 決めた 1 歩の種類（forward・reverse・gear・done）の数
         self.rng = np.random.default_rng(seed)
         self.car = CarState.from_camera(room.start)
         if snoo is None or isinstance(snoo, str):
@@ -1302,8 +1290,6 @@ class Sim:
         self.obs.append(StationObs(cells[0], cells[1], cells[2], self.sonar_m, pose))
         st = StationResult(f"sim{len(self.stations):03d}", pose, CAM_H_M, 0.0, frames)
         self.stations.append(st)
-        self.arrived_reverse.append(self._reversed)
-        self._reversed = False
         self.rebuild_map()
         if self._truth is None:
             self._truth = self.truth_floor()
@@ -1321,6 +1307,7 @@ class Sim:
             ids = choose_window(ids, ids[-1], poses, self.window)
         g = Grid(size_m=self.grid.n * self.grid.res, res=self.grid.res)
         g.origin = self.grid.origin
+        g.confidence = Confidence(g.n)
         high = np.zeros_like(g.logodds, np.int32)
         for i in ids:
             o = self.obs[i]
@@ -1330,11 +1317,13 @@ class Sim:
                     np.clip(g.logodds, -4, 4, out=g.logodds)
             if len(o.high):
                 high[o.high[:, 0], o.high[:, 1]] += 1
+            g.confidence.add_cells(g, o.free, o.occupied, o.pose)
             if self.sonar_map:
                 mark_sonar(g, o.pose, o.sonar_m)
+                g.confidence.add_sonar(g, o.pose, o.sonar_m)
         if self.params.driven_free:
             for start, pieces, reverse in self.drives:
-                mark_driven(g, start, pieces, reverse)
+                mark_driven(g, start, pieces, reverse)  # 走った所は確信度も 1
         self.grid, self.high = g, high
 
     def truth_floor(self) -> np.ndarray:
@@ -1400,51 +1389,31 @@ class Sim:
         self.car.pan_deg, self.car.tilt_deg = 0.0, 0.0
         self.commit_station()
 
-    def history(self) -> History:
-        """地図のサーバーが置き場から作るのと同じ、前のステーションまでの走り方。"""
-        return History(list(self.driven), self.backs, sum(self.arrived_reverse[-RECENT_STATIONS:]))
-
     def think(self) -> dict:
-        """次の 1 歩を、地図のサーバー（app/snoo_map_server.plan_station）と同じに決める。
-        app/snoo_mapper.decide で決め、行き場が無ければ（unreachable）、Pi が reverse を
-        受けられるとき（params.reverse）は reverse_step で後ろへ下がる。でたらめな 1 歩の
-        くじ（seed）はステーションの番号、固まったか（clustered）は直前のステーションで見る。
-        """
+        """次の 1 歩を、地図のサーバー（app/snoo_map_server.plan_station）と同じに決める
+        （app/snoo_mapper.decide。くじはステーションの番号、直近の位置で動けていないかを見る）。"""
         self.phase = "plan"
         heights = [CAM_H_M] * len(self.stations)
-        recent = [s.pose for s in self.stations[-CLUSTER_STATIONS - 1 : -1]]
-        params = dataclasses.replace(
-            self.params, seed=len(self.stations) - 1, force_random=clustered(recent)
-        )
-        self.action, self.plan = decide(self.grid, self.stations, params, heights)
-        pose = self.stations[-1].pose
-        self.action, _ = or_reverse(self.action, self.grid, pose, self.history(), params)
-        if self.keep_exploring and self.action.get("action") != "move":
-            # 地図のサーバー（plan_station）と同じ 1 歩：でたらめな前へ → 切り返し →
-            # 見ないで切り返す
-            from app.snoo_map_server import keep_going
-
-            alt = keep_going(self.grid, pose, params, len(self.stations) - 1)
-            if alt is not None:
-                alt["why"] = str(self.action.get("reason", "")).split(":")[0]
-                self.action = alt
+        params = dataclasses.replace(self.params, seed=len(self.stations) - 1)
+        recent = [s.pose for s in self.stations[-RECENT_STATIONS:]]
+        self.action, self.plan = decide(self.grid, self.stations, params, heights, recent=recent)
         a = self.action
-        kind = "reverse" if a.get("reverse") else "random" if a.get("random") else "nbv"
-        kind = "turn" if a.get("turn") else kind
-        kind = kind if a.get("action") == "move" else "done"
+        kind = "done"
+        if a.get("action") == "move":
+            backs = {b for _, _, b in action_moves(a)}
+            kind = "gear" if len(backs) == 2 else "reverse" if backs == {True} else "forward"
         self.kinds[kind] = self.kinds.get(kind, 0) + 1
         self.step_arc = []
-        if self.action.get("action") == "move":
+        if a.get("action") == "move":
             c = self.car
-            sign = -1.0 if self.action.get("reverse") else 1.0
             x, y, yaw = c.x, c.y, c.yaw
             self.step_arc = [(x, y, yaw)]
-            for steer, cm in self.pieces(self.action):
-                n = max(2, int(cm / 2))
+            for steer, m, back in action_moves(a):
+                n = max(2, int(m * 50))
                 for _ in range(n):
-                    x, y, yaw = arc(x, y, yaw, steer, sign * cm / 100 / n)
+                    x, y, yaw = arc(x, y, yaw, steer, (-m if back else m) / n)
                     self.step_arc.append((x, y, yaw))
-        self.car.steer_deg = float(self.action.get("steer_deg", 0.0))
+        self.car.steer_deg = float(a.get("steer_deg", 0.0))
         self.car.tilt_deg = DRIVE_TILT_DEG
         self.sync()
         return self.action
@@ -1487,14 +1456,7 @@ class Sim:
             if rect_hits(footprint(nx, ny, nyaw), obst):
                 result = "bump"
                 self.bumps += 1
-                a = self.action
-                kind = (
-                    "turn"
-                    if a.get("turn")
-                    else "reverse"
-                    if a.get("reverse")
-                    else ("random" if a.get("random") else "nbv")
-                )
+                kind = "reverse" if reverse else "forward"
                 cat = rect_hits(footprint(nx, ny, nyaw), snoo_aabb(self.snoo.pose))
                 self.bump_log.append(
                     {"t": round(self.t, 1), "reverse": reverse, "kind": kind, "snoo": cat}
@@ -1530,13 +1492,14 @@ class Sim:
         """撮る → 地図を直す → 1 歩走る、を cycles 回（やめる理由が出たら・time_budget_s 秒
         （Sim.t）を過ぎたらそこまで）。
 
-        次の 1 歩の決め方は地図のサーバーと同じ（think）。backtrack > 0 なら Pi が reverse を
-        受けられることにする（params.reverse。行き場が無いとき、切り返しか来た道を戻る）。
-        params.segments なら、1 歩を「曲がる → まっすぐ」の区間で走る。
+        次の 1 歩の決め方は地図のサーバーと同じ（think）。backtrack > 0 なら Pi が reverse と
+        gear_segments を受けられることにする（1 歩の区切りごとに前・後ろを変えられる）。
         地図を作り直す間（pace.server_s 秒、plan_frames があれば 0.5 秒 × plan_frames）も猫は動く。
         """
         if backtrack:
-            self.params = dataclasses.replace(self.params, reverse=True)
+            self.params = dataclasses.replace(
+                self.params, reverse=True, segments=True, gear_segments=True
+            )
         wait_s = self.pace.server_s if plan_frames is None else 0.5 * plan_frames
         reason = "cycles"
         for k in range(cycles):
@@ -1556,22 +1519,20 @@ class Sim:
             if action.get("action") != "move":
                 reason = str(action.get("reason", "done"))
                 break
-            reverse = bool(action.get("reverse"))
-            for steer, cm in self.pieces(action):
+            fwd = float(action.get("speed", 12))
+            back_speed = float(action.get("reverse_speed", REVERSE_SPEED))
+            any_back = False
+            for steer, m, back in action_moves(action):
                 start, before = self.car.camera_pose(), self.distance_m
-                result = self.drive(steer, action["speed"], cm, on_frame, reverse=reverse)
+                speed = back_speed if back else fwd
+                result = self.drive(steer, speed, m * 100, on_frame, reverse=back)
                 moved = self.distance_m - before
                 if moved > 1e-6:
-                    self.drives.append((start, [(steer, moved)], reverse))
-                if reverse:
-                    self.driven = consume(self.driven, moved)
-                elif moved > 1e-6:
-                    self.driven.append((steer, moved))
+                    self.drives.append((start, [(steer, moved)], back))
+                any_back |= back
                 if result != "ok":
                     break
-            self.backs = self.backs + 1 if reverse else 0
-            self.reverses += reverse
-            self._reversed = reverse
+            self.reverses += any_back
         self.phase = "done"
         return self.summary(reason)
 

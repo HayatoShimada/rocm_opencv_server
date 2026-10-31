@@ -15,17 +15,13 @@ from app.roommap import (
     Grid,
     Pose,
     camera_of,
-    consume,
     drive_poses,
     dubins,
-    fit_driven,
     frontiers,
     inflate,
     mark_sonar,
     next_best_view,
-    retrace,
     sample_path,
-    take,
     turn_then_straight,
     view_gain,
 )
@@ -147,48 +143,38 @@ def test_first_step_goes_straight_for_a_straight_path():
     assert step == pytest.approx(0.4)
 
 
-def test_sonar_marks_the_arc_as_obstacle_and_the_cone_before_it_as_floor():
+def test_sonar_is_weak_evidence_of_an_obstacle_on_the_arc_only():
+    """超音波は地図の弱い証拠だけ：1 回では障害物にならず、床にもしない。"""
+    from app.roommap import SONAR_HIT
+
     g = Grid(size_m=8.0)
     mark_sonar(g, Pose(0.0, 0.0, 0.0), 0.52)
-    s = g.state()
     front = SONAR_AHEAD_M + 0.52
-    assert s[g.cell(front, 0.0)] == OCCUPIED
-    # 弧は円すいの幅いっぱい（±15°）
-    assert s[g.cell(SONAR_AHEAD_M + 0.52 * math.cos(math.radians(14)), 0.12)] == OCCUPIED
-    assert s[g.cell(0.30, 0.0)] == FREE  # 手前は床
-    assert s[g.cell(front - 0.06, 0.0)] != FREE  # 読みの手前の余裕は床にしない
-    assert s[g.cell(0.30, 0.25)] == UNKNOWN  # 円すいの外
-    assert s[g.cell(-0.30, 0.0)] == UNKNOWN  # 後ろ
-    assert s[g.cell(front + 0.15, 0.0)] == UNKNOWN  # 障害物の向こう
-
-
-def test_sonar_follows_the_station_pose():
+    assert g.logodds[g.cell(front, 0.0)] == pytest.approx(SONAR_HIT)
+    assert g.state()[g.cell(front, 0.0)] == UNKNOWN  # 1 回では障害物にしない
+    assert g.logodds[g.cell(SONAR_AHEAD_M + 0.52 * math.cos(math.radians(14)), 0.12)] > 0
+    assert g.logodds[g.cell(0.30, 0.0)] == 0  # 手前を床にしない
+    for _ in range(2):
+        mark_sonar(g, Pose(0.0, 0.0, 0.0), 0.52)
+    assert g.state()[g.cell(front, 0.0)] == OCCUPIED  # 何度も同じ所なら障害物
+    # 向きはステーションに合わせる
     g = Grid(size_m=8.0)
-    mark_sonar(g, Pose(1.0, -1.0, math.pi / 2), 0.42)  # +y を向いている
-    s = g.state()
-    assert s[g.cell(1.0, -1.0 + SONAR_AHEAD_M + 0.42)] == OCCUPIED
-    assert s[g.cell(1.0, -0.7)] == FREE
-    assert s[g.cell(1.3, -1.0)] == UNKNOWN
+    mark_sonar(g, Pose(1.0, -1.0, math.pi / 2), 0.42)
+    assert g.logodds[g.cell(1.0, -1.0 + SONAR_AHEAD_M + 0.42)] > 0
 
 
-def test_sonar_beyond_its_range_only_marks_floor_and_none_does_nothing():
+def test_sonar_drops_none_minus_one_far_and_tiny_readings():
     g = Grid(size_m=8.0)
-    mark_sonar(g, Pose(0.0, 0.0, 0.0), None)
+    for v in (None, -0.01, 0.0, 0.01, 2.5, 3.5, float("nan")):
+        mark_sonar(g, Pose(0.0, 0.0, 0.0), v)
     assert not g.logodds.any()
-    mark_sonar(g, Pose(0.0, 0.0, 0.0), 3.5)
-    s = g.state()
-    assert not (s == OCCUPIED).any()
-    assert s[g.cell(2.5, 0.0)] == FREE
-    assert s[g.cell(3.2, 0.0)] == UNKNOWN
 
 
-def test_sonar_floor_does_not_erase_an_obstacle_the_camera_saw():
-    """超音波は 4.5 cm の高さを見るので、それより低い物を床と言って消さない。"""
+def test_sonar_does_not_override_the_camera_floor():
     g = Grid(size_m=8.0)
-    g.mark_occupied(np.array([0.30]), np.array([0.0]))
-    for _ in range(5):
-        mark_sonar(g, Pose(0.0, 0.0, 0.0), 1.0)
-    assert g.state()[g.cell(0.30, 0.0)] == OCCUPIED
+    g.mark_free(np.array([0.60]), np.array([0.0]))
+    mark_sonar(g, Pose(0.0, 0.0, 0.0), 0.60 - SONAR_AHEAD_M)
+    assert g.state()[g.cell(0.60, 0.0)] == FREE
 
 
 def _open_floor(size_m: float = 6.0) -> tuple[Grid, np.ndarray]:
@@ -251,96 +237,6 @@ def test_next_best_view_with_segments_keeps_the_first_segment_on_top():
     assert old.segments == [] and old.target == plan.target
 
 
-def test_fit_driven_finds_how_far_the_car_went_along_the_segments():
-    pieces = [(28.3, 0.10), (0.0, 0.30)]
-    start = Pose(0.2, -0.1, 0.5)
-    for went in (0.06, 0.25, 0.55):  # 1 つ目の途中・2 つ目の途中・頼んだより長く
-        end = camera_of(drive_poses(start, take(pieces, went))[-1][1])
-        s, err = fit_driven(start, end, pieces)
-        assert s == pytest.approx(went, abs=0.011) and err < 0.01
-    # 後ろへ走ったときも測れる
-    end = camera_of(drive_poses(start, [(20.0, 0.2)], reverse=True)[-1][1])
-    s, err = fit_driven(start, end, [(20.0, 0.0)], reverse=True)
-    assert s == pytest.approx(0.2, abs=0.011) and err < 0.01
-
-
-def test_retrace_goes_back_over_the_last_arcs_in_reverse_order():
-    trail = [(-20.0, 0.30), (25.0, 0.05), (28.3, 0.12), (0.0, 0.10)]
-    assert retrace(trail, 0.30) == [
-        (0.0, pytest.approx(0.10)),
-        (28.3, pytest.approx(0.12)),
-        (25.0, pytest.approx(0.05)),
-    ]
-    assert retrace(trail, 0.30, max_pieces=1) == [(0.0, pytest.approx(0.10))]
-    assert retrace([(28.3, 0.48)], 0.30) == [(28.3, pytest.approx(0.30))]
-    assert retrace([], 0.30) == []
-    # 戻った分を除くと、その前の道を戻る
-    assert consume(trail, 0.15) == [(-20.0, 0.30), (25.0, 0.05), (28.3, pytest.approx(0.07))]
-    # 同じハンドルの区間はまとめる
-    assert retrace([(10.0, 0.1), (10.0, 0.1)], 0.3) == [(10.0, pytest.approx(0.2))]
-
-
-def test_reversing_with_the_same_steer_retraces_the_arc():
-    start = Pose(0.0, 0.0, 0.0)
-    pieces = [(28.3, 0.15), (0.0, 0.2)]
-    end = camera_of(drive_poses(start, pieces)[-1][1])
-    back = camera_of(drive_poses(end, retrace(pieces, 1.0), reverse=True)[-1][1])
-    assert (back.x, back.y, back.yaw) == pytest.approx((start.x, start.y, start.yaw), abs=1e-6)
-
-
-def test_random_step_stays_on_the_seen_floor():
-    from app.roommap import blocked_cells, random_step
-
-    g = _room()
-    rng = np.random.default_rng(3)
-    blocked = blocked_cells(g, g.state(), Pose(0, 0, 0))
-    for _ in range(5):
-        steer, run = random_step(g, Pose(0, 0, 0), rng)
-        assert abs(steer) <= 30.0 and 0.2 <= run <= 0.4
-        k = -math.tan(math.radians(steer)) / 0.14
-        end = sample_path(
-            Pose(0, 0, 0), "S" if abs(k) < 1e-3 else ("L" if k > 0 else "R"),
-            (run,) if abs(k) < 1e-3 else (run * abs(k),), r=1.0 if abs(k) < 1e-3 else 1 / abs(k),
-        )[-1]  # fmt: skip
-        assert not blocked[g.cell(end.x, end.y)]
-
-
-def test_random_step_is_none_when_boxed_in():
-    from app.roommap import random_step
-
-    g = Grid(size_m=2.0)
-    g.mark_free(np.array([0.0]), np.array([0.0]))  # 足元だけ床
-    # 15 cm 先をぐるりと障害物で囲む（足元の 20 cm 四方は走れる扱いなので、それより内側に）
-    a, r = np.meshgrid(np.linspace(0, 2 * np.pi, 300), np.linspace(0.12, 0.18, 4))
-    g.mark_occupied((r * np.cos(a)).ravel(), (r * np.sin(a)).ravel())
-    assert random_step(g, Pose(0, 0, 0), np.random.default_rng(0)) is None
-
-
-def test_turning_reverse_changes_heading_and_avoids_obstacles():
-    from app.roommap import turning_reverse
-
-    g, _ = _open_floor()
-    pieces = turning_reverse(g, Pose(0, 0, 0))
-    assert len(pieces) == 1 and pieces[0][1] == pytest.approx(0.30)
-    end = camera_of(drive_poses(Pose(0, 0, 0), pieces, reverse=True)[-1][1])
-    assert abs(end.yaw) > math.radians(40)  # 向きが変わる
-    # 真後ろ以外すべて障害物なら下がらない
-    wall = Grid(size_m=6.0)
-    xs = np.arange(-1.0, 1.0, 0.02)
-    gx, gy = np.meshgrid(xs, xs)
-    wall.mark_occupied(gx.ravel(), gy.ravel())
-    wall.mark_free(np.array([0.0]), np.array([0.0]))
-    assert turning_reverse(wall, Pose(0.6, 0.6, 0)) == []
-
-
-def test_turning_reverse_may_enter_unseen_floor_only_at_the_start():
-    from app.roommap import turning_reverse
-
-    g = Grid(size_m=6.0)  # 何も見ていない
-    assert turning_reverse(g, Pose(0, 0, 0), unseen_ok_m=0.15) == []  # 30 cm は無理
-    assert turning_reverse(g, Pose(0, 0, 0), length=0.12, unseen_ok_m=0.15)  # 12 cm ならよい
-
-
 def test_car_next_to_furniture_can_still_leave_away_from_it():
     """左前 14 cm に障害物があっても、居る所はふさがらず、離れる向きへは行ける
     （3 回目の実走の最後は、ここで周りが全部ふさがって unreachable だった）。
@@ -390,27 +286,9 @@ def test_long_step_only_on_a_straight_segment_over_seen_floor():
     assert MAX_STEP_M <= sum(m for _, m in short) < LONG_STEP_M
 
 
-def test_plan_turn_faces_a_target_behind_with_a_turning_reverse():
-    from app.roommap import bearing, drive_moves, plan_turn
-
-    g, _ = _open_floor()
-    behind = Pose(-1.0, 0.3, 0.0)
-    turn = plan_turn(g, Pose(0, 0, 0), behind)
-    assert turn is not None and all(back for *_, back in turn.moves)
-    assert abs(bearing(turn.end, behind)) < abs(bearing(Pose(0, 0, 0), behind)) - 0.5
-    end = camera_of(drive_moves(Pose(0, 0, 0), turn.moves)[-1][1])
-    assert (end.x, end.y) == pytest.approx((turn.end.x, turn.end.y))
-    # 壁に囲まれていれば向きを変えない
-    wall = Grid(size_m=6.0)
-    xs = np.arange(-1.0, 1.0, 0.02)
-    gx, gy = np.meshgrid(xs, xs)
-    wall.mark_occupied(gx.ravel(), gy.ravel())
-    assert plan_turn(wall, Pose(0.6, 0.6, 0), behind) is None
-
-
-def test_random_and_first_steps_keep_the_real_car_off_obstacles():
+def test_first_step_keeps_the_real_car_off_obstacles():
     """Pi は後ろの車軸を中心に曲がる。カメラの真下から引いた弧では車体が障害物に入っていた。"""
-    from app.roommap import blocked_cells, first_step, random_step
+    from app.roommap import blocked_cells, first_step
 
     g, _ = _open_floor()
     for _ in range(3):
@@ -425,10 +303,6 @@ def test_random_and_first_steps_keep_the_real_car_off_obstacles():
                 return True
         return False
 
-    rng = np.random.default_rng(0)
-    for _ in range(30):
-        step = random_step(g, pose, rng)
-        assert step is not None and not hits(*step)
     path = sample_path(pose, "L", (math.pi / 2,), r=0.26)  # 左へいっぱいに曲がる道
     steer, run = first_step(g, blocked, pose, path, 0.4)
     assert run == 0 or not hits(steer, run)
@@ -461,5 +335,3 @@ def test_clip_pieces_keeps_the_front_edge_off_a_wall_near_the_start():
     run = sum(m for _, m in pieces)
     front = rear_axle(pose).x + run + CAR_FRONT_M  # 走った後の前の端
     assert front < 0.27 - 0.025  # 壁のセルの手前の縁より前に出ない
-
-

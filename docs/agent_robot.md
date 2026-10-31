@@ -230,8 +230,9 @@ agent の指令（move・look・scan）を止め、止めた所で待つ。繋�
 agent の move は explore の 1 歩と同じ止め方をすべて当て、さらに次で止める。止めた理由を `stop_reason` に書く。
 
 - 走った長さが `distance_cm` に届いた（`done`）
-- 前へ: 超音波が `explore_step_stop_cm`（30 cm）より近い（`ultrasonic`）・`clear_cm` が `explore_clear_stop_cm`
-  （25 cm）より近い（`clear`）・null が 0.3 s 続いた（`clear_unknown`）
+- 前へ: `clear_cm` が `explore_clear_stop_cm`（25 cm）より近い（`clear`）・null が 0.3 s 続いた
+  （`clear_unknown`）。超音波では止まらない（当てにならないので、地図の弱い証拠にだけ使う。
+  docs/snoo_explore_protocol.md）
 - 画像が動かない（`stuck`）
 - guard が OK でない（`guard`）・snoo が近い（`snoo_near`）
 - 電池が低い（`battery`）

@@ -213,8 +213,8 @@ def test_select_frames_keeps_the_latest_station_whole_and_thins_the_older_ones()
     assert len([r for r in refs if r.station == 3]) == 10  # 最後は全部
 
 
-def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
-    """VGGT が見落とした物（白い壁など）を、超音波で格子に足す。"""
+def test_ultrasonic_is_only_weak_evidence_on_the_map(result):
+    """超音波は地図の弱い証拠だけ（測れた近い値の弧に少し足す）。カメラの床には勝たない。"""
     stations, refs, ext, points, conf = _scene()
     params = MapParams(camera_height_m=CAM_H, ultrasonic_cm=[None, 40])
     r = build_map(stations, refs, ext, points, conf, params)
@@ -222,10 +222,8 @@ def test_ultrasonic_marks_an_obstacle_the_camera_did_not_see(result):
     last = r.stations[-1].pose
     d = 0.05 + 0.40  # 超音波（カメラの 5 cm 前）から 40 cm
     ahead = g.cell(last.x + d * math.cos(last.yaw), last.y + d * math.sin(last.yaw))
-    # 作り物の部屋ではカメラがそこに床を 2 回見ているので、障害物 1 回と足して「分からない」になる。
-    # それでも床ではないので、車はそこへ行かない
-    assert state[ahead] != FREE
-    assert result.grid.state()[ahead] == FREE  # 超音波が無ければ床
+    assert g.logodds[ahead] > result.grid.logodds[ahead]  # 少しだけ障害物の側へ
+    assert state[ahead] == FREE  # カメラが 2 回見た床は床のまま
     with pytest.raises(ValueError):
         build_map(stations, refs, ext, points, conf, MapParams(CAM_H, ultrasonic_cm=[1.0]))
 
@@ -275,25 +273,6 @@ def test_observations_add_up_to_the_same_grid_and_move_with_the_anchor(tmp_path)
     o, p = moved.observations[1], r.observations[1]
     assert (o.pose.x, o.pose.y) == pytest.approx((1.0 - p.pose.y, 2.0 + p.pose.x), abs=1e-6)
     assert len(o.free) == pytest.approx(len(p.free), rel=0.05)  # 回してもセルが抜けない
-
-
-def test_decide_turns_instead_of_looping_when_the_target_is_behind():
-    """見ていない所が真後ろだけなら、前へ輪を描かず、切り返す（Pi が reverse を受けるとき）。"""
-    from app.roommap import Grid
-
-    g = Grid(size_m=6.0)
-    xs = np.arange(-0.2, 1.6, 0.025)
-    gx, gy = np.meshgrid(xs, np.arange(-0.8, 0.8, 0.025))
-    g.mark_free(gx.ravel(), gy.ravel())  # 前と足元だけ床。後ろ（x < -0.2）は見ていない
-    wall = np.arange(-0.8, 0.8, 0.02)
-    g.mark_occupied(np.full_like(wall, 1.6), wall)
-    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, 0.8))
-    g.mark_occupied(np.arange(-0.2, 1.6, 0.02), np.full(90, -0.8))
-    st = [StationResult("000", Pose(0.3, 0.0, 0.0), CAM_H, 0.0, 8)]
-    a, plan = decide(g, st, MapParams(segments=True, reverse=True, random_p=0.0), [CAM_H])
-    assert a["action"] == "move" and a.get("turn") and a["reverse"] is True and plan is None
-    a, _ = decide(g, st, MapParams(segments=True, random_p=0.0), [CAM_H])
-    assert not a.get("turn")  # reverse を受けない Pi には今までどおり
 
 
 def _slam_dir(tmp_path, state="ok", rmse=0.03, method="stations"):
@@ -349,22 +328,6 @@ def test_mark_slam_ignores_a_lost_or_misaligned_slam(tmp_path):
     ]
 
 
-def test_retrace_is_cut_when_an_obstacle_appeared_behind():
-    from app.roommap import Grid, Pose
-    from app.snoo_mapper import clear_retrace
-
-    g = Grid(size_m=6.0)
-    xs = np.arange(-1.0, 1.0, 0.025)
-    gx, gy = np.meshgrid(xs, xs)
-    g.mark_free(gx.ravel(), gy.ravel())
-    pieces = [(0.0, 0.30)]  # まっすぐ 30 cm 戻る
-    assert clear_retrace(g, Pose(0.0, 0.0, 0.0), pieces) == pieces
-    for _ in range(4):  # 来た後に、後ろ 35 cm に物が置かれた
-        g.mark_occupied(np.full(10, -0.35), np.linspace(-0.1, 0.1, 10))
-    cut = clear_retrace(g, Pose(0.0, 0.0, 0.0), pieces)
-    assert sum(m for _, m in cut) < 0.30
-
-
 def test_mask_cats_zeroes_points_in_cat_boxes_and_ignores_bad_input():
     from app.snoo_mapper import mask_cats
 
@@ -411,3 +374,173 @@ def test_station_inliers_drops_one_frame_far_from_the_rest():
     assert station_inliers(spread).all()
 
 
+# --- 前へ・後ろへを切り替える 1 歩（app/snoo_maneuver.py） ---
+
+
+def _dead_end(width: float = 0.9):
+    """幅 width の行き止まり（前 45 cm に壁）。後ろ（x < -1）だけが見ていない（境目）。"""
+    from app.roommap import FREE_HIT, OCCUPIED_HIT, Grid
+    from app.snoo_belief import Confidence
+
+    g = Grid(size_m=6.0)
+    g.confidence = Confidence(g.n)
+
+    def fill(x0, x1, y0, y1, v):
+        xs = np.arange(x0, x1, 0.05) + 0.025
+        ys = np.arange(y0, y1, 0.05) + 0.025
+        X, Y = np.meshgrid(xs, ys)
+        g.logodds[g.cell(X.ravel(), Y.ravel())] = v
+
+    h = width / 2
+    fill(-1.0, 0.6, -h, h, 2 * FREE_HIT)
+    fill(0.45, 0.5, -h, h, OCCUPIED_HIT)
+    fill(-1.0, 0.5, h - 0.05, h, OCCUPIED_HIT)
+    fill(-1.0, 0.5, -h, -h + 0.05, OCCUPIED_HIT)
+    sure(g)
+    return g
+
+
+def sure(g):
+    """見た所をどれも確かにする（床は床、障害物は障害物と何度も見た）。"""
+    from app.roommap import OCCUPIED
+
+    occ = g.state() == OCCUPIED
+    g.confidence.miss_free[:] = np.where(occ, 1.0, 0.0)
+    g.confidence.miss_occ[:] = np.where(occ, 0.0, 1.0)
+
+
+def test_gear_segments_turn_around_in_a_dead_end():
+    """前が壁の行き止まりでは、前へ行く 1 歩が無くても、前後を切り替えて出口（後ろ）へ向く。"""
+    from app.roommap import Pose
+
+    g = _dead_end(1.0)
+    st = [StationResult("000", Pose(0.1, 0.0, 0.0), CAM_H, 0.0, 8)]
+    params = MapParams(segments=True, reverse=True, gear_segments=True)
+    a, man = decide(g, st, params, [CAM_H])
+    assert a["action"] == "move" and man is not None
+    segs = a["segments"]
+    assert 1 <= len(segs) <= 5
+    assert all(isinstance(x["reverse"], bool) and "end_pose" in x for x in segs)
+    assert any(x["reverse"] for x in segs)  # 下がる区切りがある
+    assert sum(x["distance_cm"] for x in segs if x["reverse"]) <= 30.05
+    assert a["reverse_speed"] < a["speed"] or a.get("reverse")
+    # 最初の区切りは上にも書く（segments を知らない Pi と同じ形）
+    assert (a["steer_deg"], a["distance_cm"]) == (segs[0]["steer_deg"], segs[0]["distance_cm"])
+
+
+def test_a_pi_without_gear_segments_gets_one_direction_only():
+    from app.roommap import Pose
+
+    g = _dead_end(1.0)
+    st = [StationResult("000", Pose(0.1, 0.0, 0.0), CAM_H, 0.0, 8)]
+    a, _ = decide(g, st, MapParams(segments=True, reverse=True), [CAM_H])
+    assert a["action"] == "move"
+    assert all("reverse" not in x for x in a["segments"]) and len(a["segments"]) <= 3
+    a, _ = decide(g, st, MapParams(segments=False, reverse=False), [CAM_H])
+    if a["action"] == "move":  # 前へ行けなければ unreachable
+        assert not a.get("reverse") and "segments" not in a
+    else:
+        assert a["reason"] == "unreachable"
+
+
+def test_planner_keeps_the_car_footprint_off_obstacles_and_backs_only_over_sure_floor():
+    from app.roommap import OCCUPIED, Pose, drive_moves
+    from app.snoo_maneuver import (
+        BODY_PTS,
+        CONF_REVERSE,
+        Limits,
+        Scene,
+        plan_maneuver,
+    )
+
+    g = _dead_end(0.8)
+    pose = Pose(0.1, 0.0, 0.0)
+    man = plan_maneuver(g, pose, Limits(), seed=3)
+    assert man is not None
+    scene = Scene(g, pose)
+    for _, r, _, _ in drive_moves(pose, man.moves)[1:]:
+        x, y = scene._world(BODY_PTS, r.x, r.y, r.yaw)
+        assert not scene._lookup(scene.state == OCCUPIED, x, y, True).any()
+    # 床を 1 回しか見ていない（確信度が低い）なら、ほとんど下がらない
+    g.confidence.miss_free[:] = 0.6
+    from app.roommap import FREE
+
+    sc = Scene(g, pose)
+    assert sc.conf[sc.state == FREE].max() < CONF_REVERSE
+    man = plan_maneuver(g, pose, Limits(), seed=3)
+    if man is not None:
+        assert sum(m for _, m, b in man.moves if b) <= 0.10 + 1e-6
+
+
+def test_planner_passes_a_gap_wide_enough_for_the_car_but_not_for_the_old_inflation():
+    """椅子の脚の間（25 cm の空き）の向こうに見ていない所があれば、隙間を通る道を選ぶ。
+    前の決め方（障害物を 17 cm 広げる）は、隙間の手前までしか行けない。"""
+    from app.roommap import FREE_HIT, OCCUPIED_HIT, Grid, Pose
+    from app.snoo_belief import Confidence
+    from app.snoo_maneuver import Limits, plan_maneuver
+
+    g = Grid(size_m=6.0)
+    g.confidence = Confidence(g.n)
+    xs = np.arange(-0.6, 0.8, 0.05) + 0.025
+    ys = np.arange(-0.6, 0.6, 0.05) + 0.025
+    X, Y = np.meshgrid(xs, ys)
+    g.logodds[g.cell(X.ravel(), Y.ravel())] = 2 * FREE_HIT
+    # まわりは壁。x = 0.5 の壁の真ん中に 25 cm の空き（y = -0.125..0.125）。その先は見ていない
+    for v in np.arange(-0.6, 0.6, 0.05) + 0.025:
+        g.logodds[g.cell(-0.625, v)] = OCCUPIED_HIT
+        if abs(v) > 0.15:
+            g.logodds[g.cell(0.525, v)] = OCCUPIED_HIT
+    for v in np.arange(-0.6, 0.55, 0.05) + 0.025:
+        g.logodds[g.cell(v, -0.625)] = OCCUPIED_HIT
+        g.logodds[g.cell(v, 0.625)] = OCCUPIED_HIT
+    g.logodds[g.cell(0.575, 0.0)[0] :, :] = 0.0
+    g.logodds[g.cell(0.575, 0.0)] = 2 * FREE_HIT  # 隙間の先の床が少しだけ見えている
+    g.logodds[g.cell(0.575, 0.05)] = 2 * FREE_HIT
+    g.logodds[g.cell(0.575, -0.05)] = 2 * FREE_HIT
+    sure(g)
+    pose = Pose(0.0, 0.0, 0.0)
+    man = plan_maneuver(g, pose, Limits(max_fwd_m=0.6), seed=1)
+    assert man is not None and man.end.x > 0.35 and man.gap
+
+
+def test_stuck_widens_the_search_and_then_stops():
+    from app.roommap import Grid, Pose
+    from app.snoo_mapper import is_stuck
+
+    here = [Pose(0.01 * i, 0.0, 0.0) for i in range(6)]
+    assert is_stuck(here) and not is_stuck(here[:5])
+    assert not is_stuck([Pose(0.1 * i, 0.0, 0.0) for i in range(6)])
+    # 行ける所が無いまま動けていなければ done stuck
+    g = Grid(size_m=4.0)
+    xs = np.arange(-0.3, 0.3, 0.025)
+    X, Y = np.meshgrid(xs, xs)
+    g.mark_free(X.ravel(), Y.ravel())
+    g.mark_free(X.ravel(), Y.ravel())
+    for _ in range(3):
+        ring = np.arange(-0.3, 0.3, 0.02)
+        lo, hi = np.full_like(ring, -0.3), np.full_like(ring, 0.3)
+        g.mark_occupied(np.concatenate([ring, ring, lo, hi]), np.concatenate([lo, hi, ring, ring]))
+    far = np.arange(1.2, 1.6, 0.05) + 0.025
+    FX, FY = np.meshgrid(far, far)
+    g.logodds[g.cell(FX.ravel(), FY.ravel())] = -2  # 遠くに床のかけら（境目）
+    st = [StationResult("000", Pose(0.0, 0.0, 0.0), CAM_H, 0.0, 8)]
+    params = MapParams(segments=True, reverse=True, gear_segments=True)
+    a, _ = decide(g, st, params, [CAM_H], recent=here)
+    assert a["action"] == "done" and a["reason"] in ("stuck", "too_little_floor")
+
+
+def test_no_frontier_is_not_done_while_low_confidence_edges_remain():
+    from app.roommap import Pose
+    from app.snoo_belief import Confidence
+    from app.snoo_mapper import stop_reason
+
+    g = _dead_end(1.0)
+    g.logodds[g.cell(-0.975, 0.0)[0], :] = 0  # 後ろの境目も閉じる
+    g.logodds[: g.cell(-0.95, 0.0)[0], :] = 0
+    g.logodds[g.cell(-1.0, 0.0)[0], g.cell(0, -0.5)[1] : g.cell(0, 0.5)[1]] = 2.0
+    st = [StationResult("000", Pose(0.1, 0.0, 0.0), CAM_H, 0.0, 8)]
+    sure = stop_reason(g, st, MapParams(), [CAM_H])
+    g.confidence = Confidence(g.n)  # 何も確かめていない
+    unsure = stop_reason(g, st, MapParams(), [CAM_H])
+    if sure == {"action": "done", "reason": "no_frontier"}:
+        assert unsure is None

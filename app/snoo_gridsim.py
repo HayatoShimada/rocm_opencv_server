@@ -10,13 +10,17 @@ MuJoCo の Sim（app/snoo_sim.py）は 1 回の探索に数十秒かかり、何
   少し先の床だけを隠し、高い物（壁・家具）はその先を全部隠す。下をくぐれる物（HIGH：机の天板・
   椅子の座面）は床を隠さない（MuJoCo の Sim でも、低いカメラは机の下の床を見通す）
 - 超音波：前の端から ±15° で、床から 4.5 cm より高い物までの距離（コードは見えない）。
-  app/roommap.mark_sonar で足す
+  app/roommap.mark_sonar で弱い証拠として足す
 - 走る：自転車モデル（app/roommap.arc）で 1 cm ずつ。外形（26 x 19 cm）が LOW・CLOSED の
   セルか人・snoo の円に重なればぶつかった（bump）としてその手前で止める。前へ走るときは、
   Pi が clear_cm を見て止まるのをまねて、5 cm 先がふさがれば止める（stop）。走った所は
   app/roommap.mark_driven で床にする
-- 決め方：地図のサーバーと同じ（app/snoo_mapper.decide → or_reverse。Sim.think と同じ）。
-  chooser を渡せば差し替えられる（学ぶとき）
+- 決め方：地図のサーバーと同じ（app/snoo_mapper.decide。Sim.think と同じ）。1 歩は前へ・後ろへの
+  混じった区切りの列。chooser を渡せば差し替えられる
+- 確信度と手ざわり（app/snoo_belief.py）の層も、地図のサーバーと同じに足す。家に手ざわり
+  （app/snoo_homes.home_texture）を渡すと、撮った所から見えた目印（手ざわりの高い壁・家具）が
+  LOST_MIN_LANDMARKS より少ないステーションは位置を見失ったとし、見たものを地図に足さない
+  （地図のサーバーが bad_registration のステーションの見たものを足さないのと同じ）
 - 時間：REAL_PACE（10 コマ × 1.44 秒、地図のサーバー 11 秒、speed 12 で 20 cm/s）
 """
 
@@ -43,22 +47,21 @@ from app.roommap import (
     Grid,
     Pose,
     arc,
-    consume,
+    mark_blocked_ahead,
     mark_driven,
     mark_sonar,
     rear_axle,
 )
+from app.snoo_belief import LANDMARK_TEX, Confidence, Texture
 from app.snoo_homes import CLOSED, LOW, Home
 from app.snoo_mapper import (
-    CLUSTER_STATIONS,
     RECENT_STATIONS,
+    REVERSE_SPEED,
     SPEED,
-    History,
     MapParams,
     StationResult,
-    clustered,
+    action_moves,
     decide,
-    or_reverse,
 )
 
 # app/snoo_sim.py と同じ値（あちらは mujoco を読み込むので、ここでは読まない。試験で同じか確かめる）
@@ -70,6 +73,8 @@ STOP_CLEAR_M = 0.05
 CORRIDOR_MARGIN_M = 0.02
 SONAR_H_M = 0.045
 CAR_HALF_W_M = 0.095
+# 1 回の撮影で見えた目印（手ざわりの高い障害物のセル）がこれより少なければ、位置を見失う
+LOST_MIN_LANDMARKS = 6
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,7 @@ class Episode:
     reason: str
     kinds: dict[str, int]
     timeline: list[tuple[float, float, int]] = field(default_factory=list)
+    lost: int = 0  # 位置を見失った（目印が見えなかった）ステーションの数
 
     def m2_at(self, t_s: float) -> float:
         return max([c for t, c, _ in self.timeline if t <= t_s] or [0.0])
@@ -133,13 +139,17 @@ class GridSim:
         ray_deg: float = 0.5,
         agents: bool = True,
         snoo: str = "random",
+        texture: np.ndarray | None = None,
     ):
         self.home = home
+        # 家のセルごとの手ざわり（app/snoo_homes.home_texture）。None なら見失わない
+        self.texture = texture
         self.pace = pace
         self.view_m = view_m
         self.params = params or MapParams(
-            camera_height_m=CAM_H_M, segments=True, reverse=True, max_stations=400
-        )
+            camera_height_m=CAM_H_M, segments=True, reverse=True, gear_segments=True,
+            max_stations=400,
+        )  # fmt: skip
         self.agents = list(home.agents) if agents else []
         if agents and snoo == "behavior":
             # 前もって作った道のりの snoo を、車に反応する猫に替える（同じ所から始める）
@@ -152,16 +162,16 @@ class GridSim:
         elif snoo not in ("random", "behavior"):
             raise ValueError(f"snoo の種類が分からない: {snoo}")
         self.grid: Grid = home.grid()
+        self.grid.confidence = Confidence(self.grid.n)
+        self.grid.texture = Texture(self.grid.n)
         self.pose = home.start  # カメラの真下
         # 動く物（BehaviorAgent）に見せる、いまの車のカメラの姿勢（走っている間も 1 cm ごとに）
         self.pose_now = home.start
         self.t = 0.0
         self.stations: list[StationResult] = []
-        self.driven: list[tuple[float, float]] = []
-        self.backs = 0
-        self.arrived_reverse: list[bool] = []
-        self._reversed = False
         self.bumps = self.agent_bumps = self.stops = 0
+        self.lost = 0
+        self.last_solid = np.zeros((0, 2), int)
         self.distance_m = 0.0
         self.kinds: dict[str, int] = {}
         self.timeline: list[tuple[float, float, int]] = []
@@ -234,10 +244,13 @@ class GridSim:
         floorish = (kind != LOW) & (kind != CLOSED)
         floor_vis = floorish & open_ & (dd > prev) & (dd >= self.pace.near_m)
         obst_vis = low & open_ & ((dd > prev) | (height > hprev))
+        # 見えた固い物（壁・家具。光線ごとの最初の壁も）：目印が見えたかを数える（見失うか）
+        solid_vis = (full & open_) | obst_vis
         out = []
-        for m in (floor_vis, obst_vis):
+        for m in (floor_vis, obst_vis, solid_vis):
             cells = np.stack([ix[m], iy[m]], 1)
             out.append(np.unique(cells, axis=0) if len(cells) else cells.reshape(0, 2))
+        self.last_solid = out[2]
         return out[0], out[1]
 
     def sonar(self, pose: Pose, t: float) -> float | None:
@@ -261,18 +274,32 @@ class GridSim:
         t_mid = self.t + self.pace.scan_s / 2
         free, occ = self.observe(self.pose, t_mid)
         g = self.grid
-        for cells, v in ((free, FREE_HIT), (occ, OCCUPIED_HIT)):
-            if len(cells):
-                g.logodds[cells[:, 0], cells[:, 1]] += v
-                np.clip(g.logodds, -4, 4, out=g.logodds)
-        # 超音波も足す（ベンチの Sim と同じ sonar_map）
-        mark_sonar(g, self.pose, self.sonar(self.pose, t_mid))
+        lost = False
+        solid = self.last_solid
+        solid = solid[(solid >= 0).all(1) & (solid < self.home.n).all(1)]
+        if self.texture is not None and self.stations:  # 最初の所は原点なので見失わない
+            seen = self.texture[solid[:, 0], solid[:, 1]] if len(solid) else np.zeros(0)
+            lost = int((seen >= LANDMARK_TEX).sum()) < LOST_MIN_LANDMARKS
+        if lost:
+            self.lost += 1  # 位置が分からないので、見たものは足さない
+        else:
+            for cells, v in ((free, FREE_HIT), (occ, OCCUPIED_HIT)):
+                if len(cells):
+                    g.logodds[cells[:, 0], cells[:, 1]] += v
+                    np.clip(g.logodds, -4, 4, out=g.logodds)
+            g.confidence.add_cells(g, free, occ, self.pose)
+            if self.texture is not None and len(solid):
+                # 手ざわりの層は、見えた壁・家具の手ざわり（地図の点の色の勾配の代わり）
+                x, y = g.center(solid[:, 0], solid[:, 1])
+                g.texture.add(g, np.stack([x, y, self.texture[solid[:, 0], solid[:, 1]]], 1))
+            # 超音波は弱い証拠として足す（地図のサーバーと同じ）
+            sonar = self.sonar(self.pose, t_mid)
+            mark_sonar(g, self.pose, sonar)
+            g.confidence.add_sonar(g, self.pose, sonar)
         self.t += self.pace.scan_s
         frames = len(self.pace.pans) * len(self.pace.tilts)
         st = StationResult(f"grid{len(self.stations):03d}", self.pose, CAM_H_M, 0.0, frames)
         self.stations.append(st)
-        self.arrived_reverse.append(self._reversed)
-        self._reversed = False
         self.timeline.append((round(self.t, 1), self.covered_m2(), self.bumps + self.agent_bumps))
         return st
 
@@ -342,18 +369,12 @@ class GridSim:
 
     # --- 決める ---
 
-    def history(self) -> History:
-        return History(list(self.driven), self.backs, sum(self.arrived_reverse[-RECENT_STATIONS:]))
-
     def think(self) -> dict:
-        """地図のサーバーと同じ決め方（app/snoo_sim.Sim.think と同じ）。"""
+        """地図のサーバーと同じ決め方（app/snoo_mapper.decide。Sim.think と同じ）。"""
         heights = [CAM_H_M] * len(self.stations)
-        recent = [s.pose for s in self.stations[-CLUSTER_STATIONS - 1 : -1]]
-        params = dataclasses.replace(
-            self.params, seed=len(self.stations) - 1, force_random=clustered(recent)
-        )
-        action, _ = decide(self.grid, self.stations, params, heights)
-        action, _ = or_reverse(action, self.grid, self.pose, self.history(), params)
+        params = dataclasses.replace(self.params, seed=len(self.stations) - 1)
+        recent = [s.pose for s in self.stations[-RECENT_STATIONS:]]
+        action, _ = decide(self.grid, self.stations, params, heights, recent=recent)
         return action
 
     def run(
@@ -384,22 +405,18 @@ class GridSim:
         return self.episode(reason)
 
     def execute(self, action: dict) -> None:
-        reverse = bool(action.get("reverse"))
-        segs = action.get("segments") or [action]
-        for seg in segs:
-            steer, m = float(seg["steer_deg"]), float(seg["distance_cm"]) / 100
+        """返事の区切りを順に走る。前へ止まった・ぶつかったら、そこで 1 歩を終える。"""
+        fwd = float(action.get("speed", SPEED))
+        back_speed = float(action.get("reverse_speed", REVERSE_SPEED))
+        for steer, m, back in action_moves(action):
             start = self.pose
-            result, moved = self.drive(steer, action.get("speed", SPEED), m, reverse)
+            result, moved = self.drive(steer, back_speed if back else fwd, m, back)
             if moved > 1e-6:
-                mark_driven(self.grid, start, [(steer, moved)], reverse)
-            if reverse:
-                self.driven = consume(self.driven, moved)
-            elif moved > 1e-6:
-                self.driven.append((steer, moved))
+                mark_driven(self.grid, start, [(steer, moved)], back)
             if result != "ok":
+                # 止まった・ぶつかった所の先は、たぶん障害物（地図のサーバーも prev_step から足す）
+                mark_blocked_ahead(self.grid, self.pose, steer, back)
                 break
-        self.backs = self.backs + 1 if reverse else 0
-        self._reversed = reverse
 
     def episode(self, reason: str) -> Episode:
         cov = self.covered_m2()
@@ -407,15 +424,17 @@ class GridSim:
             self.home.seed, round(self.t, 1), len(self.stations), round(cov, 3),
             round(self.reach_m2, 3), round(cov / max(self.reach_m2, 1e-9), 4), self.bumps,
             self.agent_bumps, self.stops, round(self.distance_m, 2), reason, dict(self.kinds),
-            list(self.timeline),
+            list(self.timeline), self.lost,
         )  # fmt: skip
 
 
 def _kind(action: dict) -> str:
     if action.get("action") != "move":
-        return "done"
-    if action.get("turn"):
-        return "turn"
-    if action.get("reverse"):
+        return "done:" + str(action.get("reason", ""))
+    moves = action_moves(action)
+    backs = {b for _, _, b in moves}
+    if backs == {True}:
         return "reverse"
-    return action.get("kind") or ("random" if action.get("random") else "nbv")
+    if backs == {True, False}:
+        return "gear"
+    return "forward"

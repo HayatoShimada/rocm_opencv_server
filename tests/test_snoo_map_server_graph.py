@@ -69,7 +69,7 @@ def test_edges_are_written_once_per_station_and_a_resend_replaces_them(tmp_path)
     assert math.hypot(poses[1].x - g[1].x, poses[1].y - g[1].y) < 0.002
 
 
-def test_odom_edge_falls_back_to_reverse_json(tmp_path):
+def test_odom_edge_falls_back_to_the_reply_or_reverse_json(tmp_path):
     session = tmp_path / "s"
     for i in (0, 1):
         (session / f"{i:03d}").mkdir(parents=True)
@@ -93,7 +93,7 @@ def test_a_bad_last_station_is_placed_by_odometry_and_keeps_exploring(tmp_path):
     assert not str(plan["next"].get("reason", "")).startswith("bad_registration")
     assert a["action"] == "move" and not a.get("retrace")
     # 位置は走った 1 歩（ハンドル -8.9° で 18 cm）から
-    odom = pg.odom_pose(server.take([(-8.9, 0.0)], 0.18))
+    odom = pg.odom_pose([(-8.9, 0.18)])
     assert (a["pose"]["x"], a["pose"]["y"]) == pytest.approx((odom.x, odom.y), abs=0.01)
     assert 1 in read_poses(session)
     # 崩れたステーションの見たものは足さない

@@ -16,13 +16,11 @@ from test_snoo_mapper import PANS, STATIONS, TILTS, _scene
 from app.roommap import Pose
 from app.snoo import parse_allow
 from app.snoo_map_server import (
-    REVERSE_SPEED,
     Recon,
-    backtrack,
     choose_window,
     create_app,
-    driven_trail,
     save_station,
+    steps_driven,
     to_session,
     ultrasonic_cm,
 )
@@ -180,11 +178,22 @@ def test_segments_only_for_a_pi_that_supports_them(tmp_path):
     _post(new, _meta(0, supports=["reverse", "segments"]))
     m = _meta(1, prev_step={"steer_deg": 0, "speed": 12, "seconds": 1.2})
     a = _post(new, {**m, "supports": ["reverse", "segments"]}).json()
-    assert a["action"] == "move" and "reverse" not in a
+    assert a["action"] == "move"
     segs = a["segments"]
-    assert 1 <= len(segs) <= 3 and sum(x["distance_cm"] for x in segs) <= 40.05
+    assert 1 <= len(segs) <= 3
+    assert sum(x["distance_cm"] for x in segs if not a.get("reverse")) <= 40.05
     assert (a["steer_deg"], a["distance_cm"]) == (segs[0]["steer_deg"], segs[0]["distance_cm"])
-    assert a["target"] == a_old["target"]  # 行き先は同じで、走り方だけが違う
+    assert all("reverse" not in x for x in segs)  # gear_segments を書かない Pi には 1 歩 1 方向
+
+    gear = _client(tmp_path / "gear")
+    can = ["reverse", "segments", "long_step", "gear_segments"]
+    _post(gear, _meta(0, supports=can))
+    a = _post(gear, {**m, "supports": can}).json()
+    assert a["action"] == "move" and 1 <= len(a["segments"]) <= 5
+    for x in a["segments"]:
+        assert isinstance(x["reverse"], bool) and set(x["end_pose"]) == {"x", "y", "yaw_deg"}
+        assert x["min_clear_cm"] is None or x["min_clear_cm"] > 0
+    assert a["reverse_speed"] < a["speed"] or a.get("reverse")
 
 
 def test_station_is_saved(tmp_path):
@@ -340,18 +349,7 @@ def test_to_session_turns_and_shifts():
     assert math.degrees(p.yaw) == pytest.approx(-170)
 
 
-# --- 行き場が無いときに来た道を戻る ---
-
-
-@pytest.fixture
-def stuck(monkeypatch):
-    """間取りは作るが、前へ行ける所が無い（unreachable）ことにする。"""
-    import app.snoo_map_server as server
-
-    def decide(*a, **kw):
-        return {"action": "done", "reason": "unreachable"}, None
-
-    monkeypatch.setattr(server, "decide", decide)
+# --- 走った 1 歩（prev_step）を読む ---
 
 
 # 作り物の部屋の 1 か所目 (0, 0, 0°) から 2 か所目 (0.3, 0.1, 20°) へは、ハンドル -8.9° の
@@ -359,58 +357,17 @@ def stuck(monkeypatch):
 PREV = {"steer_deg": -8.9, "speed": 12, "seconds": 0.9, "est_distance_cm": 18.0, "reverse": False}
 
 
-def _stuck_session(tmp_path, supports):
-    c = _client(tmp_path)
-    _post(c, _meta(0, supports=supports))
-    return _post(c, _meta(1, prev_step=PREV, supports=supports)).json()
-
-
-def test_reverse_retraces_the_last_arc_by_the_distance_vggt_measured(
-    tmp_path, stuck, monkeypatch, window_poses
-):
-    # 切り返しが使えないときに、来た道を戻ることを見る
-    monkeypatch.setattr("app.snoo_mapper.turning_reverse", lambda *a, **k: [])
-    a = _stuck_session(tmp_path, ["reverse", "segments"])
-    assert a["action"] == "move" and a["reverse"] is True
-    assert a["steer_deg"] == -8.9 and a["speed"] == REVERSE_SPEED
-    assert a["distance_cm"] == 30.0  # min(30, VGGT で測った 31 cm)。Pi の見積もり 18 cm ではない
-    assert a["segments"] == [{"steer_deg": -8.9, "distance_cm": 30.0}]
-    # 戻った先は 1 か所目の近く
-    assert math.hypot(a["target"]["x"], a["target"]["y"]) < 0.05
-    session = tmp_path / "explore_20261029_201500"
-    assert json.loads((session / "reverse.json").read_text())["1"]["reverse"] is True
-    plan = json.loads((session / "plan.json").read_text())
-    assert plan["next"] == {"action": "done", "reason": "unreachable"}
-    assert plan["reply"]["reverse"] is True
-
-
-def test_reverse_without_segments_is_one_arc(tmp_path, stuck, monkeypatch, window_poses):
-    # 切り返しが使えないときに、来た道を戻ることを見る
-    monkeypatch.setattr("app.snoo_mapper.turning_reverse", lambda *a, **k: [])
-    a = _stuck_session(tmp_path, ["reverse"])
-    assert a["reverse"] is True and a["distance_cm"] == 30.0 and "segments" not in a
-
-
-def test_no_reverse_for_a_pi_that_does_not_support_it(tmp_path, stuck, monkeypatch):
-    import app.snoo_map_server as _server
-
-    # 前の決まり（止まらずに探り続けない）での返事を見る
-    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
-    done = {"action": "done", "reason": "unreachable"}
-    assert _stuck_session(tmp_path / "a", None) == done
-    assert _stuck_session(tmp_path / "b", ["segments"]) == done
-
-
-def _line(tmp_path, steps, sent=None):
-    """x 軸の上を走ったセッション。steps は (x, prev_step) の並び（最初は prev_step 無し）。"""
+def _line(tmp_path, steps, replies=None):
+    """x 軸の上を走ったセッション。steps は (x, prev_step) の並び（最初は prev_step 無し）。
+    replies はステーションの番号と返した返事（reply.json）。"""
     session = tmp_path / "line"
     poses = {}
     for i, (x, prev) in enumerate(steps):
         save_station(session, i, _meta(i, session="line", prev_step=prev), {})
         if x is not None:
             poses[i] = Pose(x, 0.0, 0.0)
-    if sent:
-        (session / "reverse.json").write_text(json.dumps({str(k): {} for k in sent}))
+    for i, reply in (replies or {}).items():
+        (session / f"{i:03d}" / "reply.json").write_text(json.dumps(reply))
     return session, poses
 
 
@@ -421,53 +378,46 @@ def _step(cm, reverse=None, **kw):
     return p
 
 
-def test_reverse_at_most_twice_in_a_row(tmp_path):
-    session, poses = _line(
-        tmp_path,
-        [
-            (0.0, None),
-            (0.4, _step(40, False)),
-            (0.8, _step(40, False)),
-            (0.6, _step(20, True)),  # 1 回目に戻った
-            (0.4, _step(20, True)),  # 2 回目に戻った
-        ],
-    )
-    trail, backs = driven_trail(session, 3, poses)
-    assert backs == 1 and sum(m for _, m in trail) == pytest.approx(0.6, abs=0.011)
-    assert backtrack(session, 3, poses, True) == [(0.0, pytest.approx(0.3, abs=0.011))]
-    assert driven_trail(session, 4, poses)[1] == 2
-    assert backtrack(session, 4, poses, True) == []  # 3 回目は戻らない
-
-
-def test_reverse_distance_is_what_the_car_actually_drove(tmp_path):
-    # VGGT では 12 cm しか進んでいない（Pi は 40 cm と見積もった）→ 12 cm だけ戻る
+def test_driven_steps_use_what_the_car_actually_drove(tmp_path):
+    # VGGT では 12 cm しか進んでいない（Pi は 40 cm と見積もった）→ 12 cm
     session, poses = _line(tmp_path / "a", [(0.0, None), (0.12, _step(40, False))])
-    assert backtrack(session, 1, poses, True) == [(0.0, pytest.approx(0.12, abs=0.011))]
+    ((_, moves),) = steps_driven(session, 1, poses)[1:]
+    assert moves == [(0.0, pytest.approx(0.12, abs=0.011), False)]
     # 位置が分からなければ Pi の見積もり（est_distance_cm、無ければ 秒 × speed × 1.7 cm/s）
     session, _ = _line(tmp_path / "b", [(0.0, None), (None, _step(None, False, seconds=0.5))])
-    pieces = backtrack(session, 1, {0: Pose(0, 0, 0)}, True)
-    assert pieces == [(0.0, pytest.approx(0.5 * 12 * 0.017))]
-    # どう動いたか分からなければ戻らない
+    ((_, moves),) = steps_driven(session, 1, {0: Pose(0, 0, 0)})[1:]
+    assert moves == [(0.0, pytest.approx(0.5 * 12 * 0.017), False)]
+    # どう動いたか分からなければ None
     session, poses = _line(tmp_path / "c", [(0.0, None), (0.3, None)])
-    assert backtrack(session, 1, poses, True) == []
+    assert steps_driven(session, 1, poses)[1][1] is None
 
 
-def test_old_pi_without_the_reverse_flag_uses_what_the_server_sent(tmp_path):
+def test_mixed_gear_steps_are_integrated_segment_by_segment(tmp_path):
+    """前 20 cm → 後ろ 10 cm（gear_segments）。走った区切りごとの向きで位置と床を足す。"""
+    from app import snoo_posegraph as pg
+    from app.snoo_map_server import mark_steps_driven, odom_edge_for
+
+    prev = {"steer_deg": 0.0, "speed": 12, "reverse": False, "est_distance_cm": 30.0,
+            "segments": [{"steer_deg": 0.0, "distance_cm": 20.0, "reverse": False},
+                         {"steer_deg": 0.0, "distance_cm": 10.0, "reverse": True}]}  # fmt: skip
+    session, poses = _line(tmp_path, [(0.0, None), (0.10, prev)])
+    ((_, moves),) = steps_driven(session, 1, poses)[1:]
+    assert [b for _, _, b in moves] == [False, True]
+    e = odom_edge_for(session, 1)
+    assert (e.z.x, e.z.y) == pytest.approx((0.10, 0.0), abs=1e-3)
+    assert e.z.x == pytest.approx(pg.odom_edge_moves(0, 1, moves).z.x, abs=1e-6)
+    from app.roommap import FREE, Grid
+
+    g = Grid()
+    mark_steps_driven(g, session, 1, poses)
+    assert g.state()[g.cell(0.18, 0.0)] == FREE  # 前へ 20 cm 走ったときの車の下
+
+
+def test_old_pi_without_the_reverse_flag_uses_the_reply_it_got(tmp_path):
     steps = [(0.0, None), (0.4, _step(40)), (0.2, _step(20))]
-    session, poses = _line(tmp_path, steps, sent=[1])
-    trail, backs = driven_trail(session, 2, poses)
-    assert backs == 1 and sum(m for _, m in trail) == pytest.approx(0.2, abs=0.011)
-
-
-def test_clustered_stations_force_a_random_step():
-    from app.roommap import Pose
-    from app.snoo_map_server import clustered
-
-    near = {i: Pose(0.05 * (i % 2), 0.05 * (i // 2), 0.0) for i in range(5)}
-    assert clustered(near, 4)
-    spread = {i: Pose(0.4 * i, 0.0, 0.0) for i in range(5)}
-    assert not clustered(spread, 4)
-    assert not clustered({0: Pose(0, 0, 0)}, 1)  # まだ少ない
+    session, poses = _line(tmp_path, steps, replies={1: {"action": "move", "reverse": True}})
+    out = steps_driven(session, 2, poses)
+    assert out[1][1][0][2] is False and out[2][1][0][2] is True
 
 
 def test_each_station_keeps_its_points_and_reply_and_can_be_replayed(tmp_path):
@@ -488,10 +438,6 @@ def test_each_station_keeps_its_points_and_reply_and_can_be_replayed(tmp_path):
 
 
 def test_no_floor_returns_done_instead_of_500(tmp_path, monkeypatch):
-    import app.snoo_map_server as _server
-
-    # 前の決まり（止まらずに探り続けない）での返事を見る
-    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
     import app.snoo_mapper as mapper
 
     monkeypatch.setattr(mapper, "fit_floor", lambda *a, **k: None)
@@ -546,62 +492,6 @@ def test_read_meta_rereads_when_the_station_is_resent(tmp_path):
     assert read_meta(d)["battery_v"] == 7.25
 
 
-def _stuck(steer=10.0):
-    """前へ行く 1 歩を、Pi が 1 cm も走らずに止めた prev_step（超音波が -1 のまま）。"""
-    return {"steer_deg": steer, "speed": 12.0, "reverse": False,
-            "segments": [{"steer_deg": steer, "distance_cm": 0.0}], "seconds": 0.0,
-            "est_distance_cm": 0.0, "stop_reason": "ultrasonic"}  # fmt: skip
-
-
-def test_a_stalled_forward_step_is_not_answered_with_another_forward_step(tmp_path):
-    c = _client(tmp_path)
-    can = ["reverse", "segments", "long_step"]
-    assert _post(c, _meta(0, supports=can)).json()["action"] == "move"
-    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
-    # 下がるか（下がれなければ）終える。前へのでたらめな 1 歩は出さない
-    assert a["action"] == "done" or a.get("reverse") is True
-
-
-def test_repeated_stalls_end_the_exploration(tmp_path, monkeypatch):
-    import app.snoo_map_server as _server
-
-    # 前の決まり（止まらずに探り続けない）での返事を見る
-    monkeypatch.setattr(_server, "KEEP_EXPLORING", False)
-    import app.snoo_map_server as server
-
-    # 作り物の部屋はステーション 2 つ分なので、終える回数を 1 にして確かめる
-    monkeypatch.setattr(server, "STALL_DONE", 1)
-    c = _client(tmp_path)
-    can = ["reverse", "segments", "long_step"]
-    _post(c, _meta(0, supports=can))
-    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
-    assert a == {"action": "done", "reason": "stalled"}
-
-
-def test_stalled_steps_counts_recent_stalls_only_while_still_stalled(tmp_path):
-    from app.snoo_map_server import STALL_WINDOW, stalled_steps
-
-    session = tmp_path / "explore_20261030_175740"
-    prevs = [None, _stuck(), {**_stuck(), "est_distance_cm": 20.0}, _stuck(), _stuck()]
-    for i, prev in enumerate(prevs):
-        d = session / f"{i:03d}"
-        d.mkdir(parents=True)
-        (d / "meta.json").write_text(json.dumps({"station_id": i, "prev_step": prev}))
-    assert stalled_steps(session, 2) == 0  # 最後が走れていれば 0
-    assert stalled_steps(session, 4) == 3  # 走れた 1 歩をはさんでも、窓の中の数を数える
-    assert STALL_WINDOW >= 3
-
-
-def test_a_step_that_moved_is_not_a_stall():
-    from app.snoo_map_server import _stalled
-
-    assert not _stalled({**_stuck(), "est_distance_cm": 12.0})
-    assert not _stalled({**_stuck(), "reverse": True})
-    assert not _stalled({**_stuck(), "stop_reason": None})  # 言われた長さを走りきった
-    assert not _stalled(None)
-    assert _stalled(_stuck())
-
-
 def _write_meta(session, i, prev, reply=None):
     d = session / f"{i:03d}"
     d.mkdir(parents=True, exist_ok=True)
@@ -612,80 +502,44 @@ def _write_meta(session, i, prev, reply=None):
 
 def test_a_bad_registration_retraces_the_step_just_driven(tmp_path):
     from app.snoo_map_server import retrace_after_bad
+    from app.snoo_mapper import MapParams
 
+    params = MapParams(segments=True, reverse=True)
     session = tmp_path / "explore_20261030_184931"
     driven = {
-        "steer_deg": 26.6, "speed": 12.0, "reverse": False, "est_distance_cm": 35.7,
-        "segments": [{"steer_deg": 26.6, "distance_cm": 35.7}], "stop_reason": None,
+        "steer_deg": 26.6, "speed": 12.0, "reverse": False, "est_distance_cm": 25.7,
+        "segments": [{"steer_deg": 26.6, "distance_cm": 25.7}], "stop_reason": None,
     }  # fmt: skip
     _write_meta(session, 3, None, {"action": "move"})
     _write_meta(session, 4, driven)
     bad = {"action": "done", "reason": "bad_registration:004"}
-    assert np.allclose(retrace_after_bad(session, 4, bad, "004"), [(26.6, 0.357)])
-    # ほかの理由・ほかのステーションの崩れ・下がった後・続けて崩れたら戻らない
-    assert retrace_after_bad(session, 4, {"action": "done", "reason": "no_frontier"}, "004") is None
-    assert retrace_after_bad(session, 4, {**bad, "reason": "bad_registration:002"}, "004") is None
-    _write_meta(session, 4, {**driven, "reverse": True})
-    assert retrace_after_bad(session, 4, bad, "004") is None
-    _write_meta(session, 4, driven)
+    out = retrace_after_bad(session, 4, bad, "004", params)
+    assert np.allclose([o[:2] for o in out], [(26.6, 0.257)]) and out[0][2] is True
+    # ほかの理由・ほかのステーションの崩れ・続けて崩れたら戻らない
+    nf = {"action": "done", "reason": "no_frontier"}
+    assert retrace_after_bad(session, 4, nf, "004", params) is None
+    other = {**bad, "reason": "bad_registration:002"}
+    assert retrace_after_bad(session, 4, other, "004", params) is None
     _write_meta(session, 3, None, {"action": "move", "reverse": True, "retrace": True})
-    assert retrace_after_bad(session, 4, bad, "004") is None
+    assert retrace_after_bad(session, 4, bad, "004", params) is None
 
 
-def test_a_retrace_follows_only_what_was_driven_in_reverse_order(tmp_path):
+def test_a_retrace_inverts_a_mixed_gear_step(tmp_path):
     from app.snoo_map_server import retrace_after_bad
-
-    session = tmp_path / "s"
-    segs = [{"steer_deg": 20.0, "distance_cm": 10.0}, {"steer_deg": 0.0, "distance_cm": 40.0}]
-    prev = {"steer_deg": 20.0, "speed": 12.0, "reverse": False, "est_distance_cm": 30.0,
-            "segments": segs, "stop_reason": "clear"}  # fmt: skip
-    _write_meta(session, 1, prev)
-    out = retrace_after_bad(session, 1, {"action": "done", "reason": "bad_registration:001"}, "001")
-    assert np.allclose(out, [(0.0, 0.2), (20.0, 0.1)])  # 止まった所まで、後ろから
-
-
-def test_one_stall_without_a_way_back_keeps_the_planned_step(tmp_path, monkeypatch):
-    import app.snoo_map_server as server
-
-    # 下がる道が無いとき（or_reverse が替えない）。1 回止まっただけでは終えない（18:55 の探索）
-    monkeypatch.setattr(server, "or_reverse", lambda action, *a: (action, []))
-    c = _client(tmp_path)
-    can = ["reverse", "segments", "long_step"]
-    assert _post(c, _meta(0, supports=can)).json()["action"] == "move"
-    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
-    assert a["action"] == "move" and not a.get("reverse")
-
-
-def test_keep_exploring_replaces_a_stop_with_a_step(tmp_path, monkeypatch):
-    """止まらずに探り続ける：止まったまま・行けない・上限では終えず、
-    場所と向きを変える 1 歩にする。"""
-    import app.snoo_map_server as server
-
-    monkeypatch.setattr(server, "STALL_DONE", 1)
-    c = _client(tmp_path)
-    can = ["reverse", "segments", "long_step"]
-    _post(c, _meta(0, supports=can))
-    a = _post(c, _meta(1, prev_step=_stuck(), supports=can)).json()
-    assert a["action"] == "move" and a["keep_going"] is True and a["why"] == "stalled"
-
-
-def test_keep_going_falls_back_to_a_short_blind_turn_without_a_map():
-    from app.roommap import Pose
-    from app.snoo_map_server import BLIND_TURN_M, keep_going
     from app.snoo_mapper import MapParams
 
-    # 地図が無い（床が見つからなかった）とき
-    a = keep_going(None, Pose(0.0, 0.0, 0.0), MapParams(reverse=True, segments=True), 3)
-    assert a["reverse"] is True and a["blind"] is True
-    assert a["distance_cm"] == round(BLIND_TURN_M * 100, 1)
-    # 下がれない Pi で地図も無ければ、見ないで前へは出さない
-    assert keep_going(None, Pose(0.0, 0.0, 0.0), MapParams(reverse=False), 3) is None
-
-
-def test_no_frontier_still_finishes():
-    from app.snoo_map_server import FINISHED
-
-    assert "no_frontier" in FINISHED
+    session = tmp_path / "s"
+    segs = [{"steer_deg": 20.0, "distance_cm": 10.0, "reverse": True},
+            {"steer_deg": 0.0, "distance_cm": 40.0, "reverse": False}]  # fmt: skip
+    prev = {"steer_deg": 0.0, "speed": 12.0, "reverse": False, "est_distance_cm": 30.0,
+            "segments": segs, "stop_reason": "clear"}  # fmt: skip
+    _write_meta(session, 1, prev)
+    bad = {"action": "done", "reason": "bad_registration:001"}
+    gear = MapParams(segments=True, reverse=True, gear_segments=True)
+    out = retrace_after_bad(session, 1, bad, "001", gear)
+    assert np.allclose([o[:2] for o in out], [(0.0, 0.2), (20.0, 0.1)])
+    assert [o[2] for o in out] == [True, False]  # 止まった所まで、後ろから、向きを逆に
+    assert retrace_after_bad(session, 1, bad, "001", MapParams(segments=True, reverse=True)) is None
 
 
 def test_busy_reports_the_last_reply_for_live_deploys(tmp_path):

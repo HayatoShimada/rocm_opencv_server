@@ -1,13 +1,11 @@
 """作った家（app/snoo_homes.py）・速いシミュレーター（app/snoo_gridsim.py）・学んだ選び方
-の試験。どれも GPU も torch も使わない。"""
-
-import math
+（app/snoo_explore_policy.py）の試験。どれも GPU も torch も使わない。"""
 
 import cv2
 import numpy as np
 import pytest
 
-from app.roommap import FREE, OCCUPIED, UNKNOWN, Pose, next_best_view, next_best_views
+from app.roommap import FREE, OCCUPIED, UNKNOWN, Pose
 from app.snoo_gridsim import GridSim
 from app.snoo_homes import (
     CAR_CELLS,
@@ -22,7 +20,6 @@ from app.snoo_homes import (
     make_home,
     render_home,
 )
-from app.snoo_mapper import MapParams, decide, plan_action
 
 SEEDS = (0, 1, 2, 3, 7, 11)
 
@@ -119,7 +116,7 @@ def test_scan_sees_floor_in_front_and_not_behind_a_box():
     assert s[g.cell(1.8, 0.0)] == UNKNOWN  # 箱の陰
     assert s[g.cell(1.8, 0.8)] == FREE  # 陰の外
     assert s[g.cell(-0.8, 0.0)] == UNKNOWN  # 後ろは写らない
-    # 超音波は前の端から箱まで（mark_sonar で箱の手前は床）
+    # 超音波は前の端から箱まで
     d = sim.sonar(sim.pose, 0.0)
     assert d == pytest.approx(1.0 - 0.05, abs=0.03)
 
@@ -157,31 +154,3 @@ def test_grid_sim_is_deterministic():
     b = GridSim(make_home(5, agent_t_s=400)).run(240)
     assert a.timeline == b.timeline and a.kinds == b.kinds
     assert a.covered_m2 > 1.0
-
-
-# --- 候補と点数 ---
-
-
-def _scanned(seed=3):
-    sim = GridSim(make_home(seed, agent_t_s=200))
-    sim.scan()
-    return sim
-
-
-def test_top1_of_next_best_views_is_next_best_view():
-    sim = _scanned()
-    one = next_best_view(sim.grid, sim.pose, segments=True, max_step_m=0.6)
-    many = next_best_views(sim.grid, sim.pose, 4, segments=True, max_step_m=0.6)
-    assert one is not None and many[0].target == one.target and many[0].segments == one.segments
-    for p in many[1:]:
-        assert math.hypot(p.target.x - one.target.x, p.target.y - one.target.y) >= 0.4
-
-
-def test_decide_follows_next_best_view_without_randomness():
-    sim = _scanned()
-    params = MapParams(camera_height_m=0.08, segments=True, reverse=True, random_p=0.0,
-                       plan_turns=False, max_step_m=0.6)  # fmt: skip
-    action, plan = decide(sim.grid, sim.stations, params, [0.08])
-    ref = next_best_view(sim.grid, sim.pose, segments=True, max_step_m=0.6)
-    assert plan is not None and plan.target == ref.target
-    assert action == plan_action(ref, sim.pose, params)
