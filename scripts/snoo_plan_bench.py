@@ -12,7 +12,8 @@ GPU は使わない。家ごとに、ふつうの壁と白い壁（手ざわり�
   「その場で撮り直す」
   （rescan）も unreachable に数える）
 - bumps：家具・壁にぶつかった数（--low-sofa なら、くぐれない低いソファの下に入ったのも）。
-  agent_bumps：人・snoo
+  agent_bumps：人・snoo。rev_agent_bumps：そのうち下がっていてぶつかった数（後ろにはセンサーが
+  無い。--snoo sneak で、撮るたびに snoo が後ろへ回り込む）
 - gaps：両脇に車幅 + 6 cm より狭い所を通り抜けた 1 歩の数（本当の家の格子で数える）
 - lost：位置を見失った所の数（撮った所から見えた目印（手ざわりの高い障害物）が少ない。見たものは
   地図に足さない。地図のサーバーの bad_registration と同じ）。--out の runs[].lost_events に、
@@ -80,7 +81,9 @@ def solid_cells(sim, pose, t) -> np.ndarray:
 
 
 def run_one(args: tuple) -> dict:
-    home_seed, white, planner, budget_s, low_sofa = (*args, False)[:5]
+    home_seed, white, planner, budget_s = args[:4]
+    rest = args[4:6]
+    low_sofa, snoo = (*rest, *(False, "random")[len(rest) :])
     os.environ["HIP_VISIBLE_DEVICES"] = ""
     import cv2
 
@@ -99,8 +102,9 @@ def run_one(args: tuple) -> dict:
     home = make_home(home_seed, agent_t_s=budget_s + 120, **sofa)
     tex = texture(home, white)
     kw = {"texture": tex} if "texture" in inspect.signature(gs.GridSim.__init__).parameters else {}
-    sim = gs.GridSim(home, **kw)
-    counts = {"unreachable": 0, "stuck": 0, "gaps": 0, "lost": 0, "plan_ms": []}
+    sim = gs.GridSim(home, **kw, **({"snoo": snoo} if snoo != "random" else {}))
+    counts = {"unreachable": 0, "stuck": 0, "gaps": 0, "lost": 0, "rev_agent_bumps": 0,
+              "plan_ms": []}  # fmt: skip
     if not kw:  # 前の版：見失うのはここでまねる
         real_observe = sim.observe
 
@@ -146,7 +150,10 @@ def run_one(args: tuple) -> dict:
 
     def drive(steer, speed, distance_m, reverse, *a, **k):
         r = rear_axle(sim.pose)
+        agent_bumps = sim.agent_bumps
         result, moved = real_drive(steer, speed, distance_m, reverse, *a, **k)
+        if reverse:
+            counts["rev_agent_bumps"] += sim.agent_bumps - agent_bumps
         x, y, yaw = r.x, r.y, r.yaw
         hit = False
         for _ in range(int(moved / 0.02)):
@@ -190,7 +197,8 @@ def run_one(args: tuple) -> dict:
         "home": home_seed, "white": white, "planner": planner, "coverage": ep.coverage,
         "m2": ep.covered_m2, "t_s": ep.t_s, "stations": ep.cycles, "reason": ep.reason,
         "unreachable": counts["unreachable"], "stuck": counts["stuck"], "bumps": ep.bumps,
-        "agent_bumps": ep.agent_bumps, "gaps": counts["gaps"], "lost": lost,
+        "agent_bumps": ep.agent_bumps, "rev_agent_bumps": counts["rev_agent_bumps"],
+        "gaps": counts["gaps"], "lost": lost,
         "map_acc": round(acc, 4), "wall_err_cm": round(wall_err, 2), "distance_m": ep.distance_m,
         "kinds": ep.kinds, "plan_ms_med": round(float(np.median(ms)), 1) if ms else 0.0,
         "plan_ms_max": round(float(np.max(ms)), 1) if ms else 0.0, "cpu_s": round(cpu, 1),
@@ -220,7 +228,8 @@ def lost_event(sim, tex: np.ndarray, prev: dict) -> dict:
 
 
 FIELDS = ("coverage", "m2", "t_s", "stations", "unreachable", "stuck", "bumps", "agent_bumps",
-          "gaps", "lost", "map_acc", "wall_err_cm", "plan_ms_med", "plan_ms_max")  # fmt: skip
+          "rev_agent_bumps", "gaps", "lost", "map_acc", "wall_err_cm", "plan_ms_med",
+          "plan_ms_max")  # fmt: skip
 
 
 def main() -> None:
@@ -232,11 +241,13 @@ def main() -> None:
     ap.add_argument("--planner", default="new", choices=("new", "hybrid"))
     ap.add_argument("--low-sofa", action="store_true",
                     help="下の端が 10〜18 cm の低いソファを 1 つ足した家で回す")  # fmt: skip
+    ap.add_argument("--snoo", default="random", choices=("random", "behavior", "sneak"),
+                    help="snoo の動き（sneak：撮るたびに前に出て、後ろへ回り込む）")  # fmt: skip
     ap.add_argument("--label", default=None, help="結果の名前（既定は --planner）")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     label = a.label or a.planner
-    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60, a.low_sofa)
+    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60, a.low_sofa, a.snoo)
             for i in range(a.homes) for white in (False, True)]  # fmt: skip
     with mp.get_context("spawn").Pool(min(a.workers, 4)) as pool:
         rows = []

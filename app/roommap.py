@@ -86,6 +86,10 @@ class Grid:
         # 撮った所（カメラの真下）。足もと・車の横は写らないので、そのそばの境目は行き先にしない
         # （app/snoo_maneuver.Scene。mark_station）
         self.station_poses: list[Pose] = []
+        # いまの時刻（秒）と、人・snoo を見た所 (x, y, 見た時刻)。後ろへ下がる区切りを決めるときに
+        # 使う（app/snoo_maneuver.Scene。時計は呼ぶ側のもの。地図のサーバーは Pi の時計）
+        self.now_s: float | None = None
+        self.cats: list[tuple[float, float, float]] = []
         self.res = res
         self.n = int(round(size_m / res))
         self.origin = -size_m / 2  # セル (0, 0) の角の座標（x・y とも）
@@ -612,13 +616,18 @@ DRIVEN_FREE = -1.5
 
 
 def mark_driven(
-    grid: Grid, start: Pose, pieces: list[tuple[float, float]], reverse: bool = False
+    grid: Grid,
+    start: Pose,
+    pieces: list[tuple[float, float]],
+    reverse: bool = False,
+    t: float | None = None,
 ) -> None:
     """カメラの真下が start の車が区間を走った所（外形の下）を、床にする。
 
     カメラは前しか見ず、足元も写らないので、走ってきた道（とくに車の後ろ）は見ていないことが多い。
     けれど車が通れたのだから、車の高さより低い物は無い。そこを床にすると、後ろへ下がる・
     切り返す道を地図で確かめられる。障害物と見ているセルは消さない（動く猫かもしれない）。
+    t は走った時刻（確信度の層の seen_t）。
     """
     if not pieces:
         return
@@ -638,7 +647,7 @@ def mark_driven(
     keep = lo <= 0.4  # 障害物と見ているセルはそのまま
     grid.logodds[cells[keep, 0], cells[keep, 1]] = np.minimum(lo[keep], DRIVEN_FREE)
     if getattr(grid, "confidence", None) is not None:
-        grid.confidence.mark_driven(cells[keep])
+        grid.confidence.mark_driven(cells[keep], t)
 
 
 # Pi が前で止まった（clear・stuck）とき、止まった所の前の端から先のこの長さを
@@ -672,12 +681,14 @@ def mark_blocked_ahead(grid: Grid, camera: Pose, steer_deg: float, back: bool = 
     np.clip(grid.logodds, -4, 4, out=grid.logodds)
 
 
-def mark_driven_moves(grid: Grid, start: Pose, moves: list[tuple[float, float, bool]]) -> None:
+def mark_driven_moves(
+    grid: Grid, start: Pose, moves: list[tuple[float, float, bool]], t: float | None = None
+) -> None:
     """前へ・後ろへの混じった区切り [(ハンドル°, m, 後ろへか), ...] を走った所を床にする。"""
     pose = start
     for steer, m, back in moves:
         if m > 1e-6:
-            mark_driven(grid, pose, [(steer, m)], back)
+            mark_driven(grid, pose, [(steer, m)], back, t)
             pose = camera_of(drive_moves(pose, [(steer, m, back)])[-1][1])
 
 

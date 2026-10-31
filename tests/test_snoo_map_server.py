@@ -682,3 +682,25 @@ def test_a_retrace_stops_where_the_reverse_budget_runs_out(tmp_path):
     gear = MapParams(segments=True, reverse=True, gear_segments=True)
     out = retrace_after_bad(session, 1, bad, "001", gear)
     assert np.allclose([o[:2] for o in out], [(20.0, 0.30)]) and out[0][2] is True
+
+
+def test_station_cats_puts_the_box_feet_on_the_floor(tmp_path):
+    """止まって撮ったコマの猫の箱の足もとを床に当て、セッションの座標と撮った時刻で返す
+    （後ろへ下がる区切りで、最近見た snoo のそばへ下がらないため）。走りながらのコマは使わない。"""
+    from app.roommap import Pose
+    from app.snoo_map_server import station_cats, station_time
+
+    frames = [
+        {"file": "a.jpg", "t_capture_ns": 5_000_000_000, "pan_deg": 0.0, "tilt_deg": -15.0,
+         "dets": [{"box": [0.4, 0.5, 0.6, 0.8], "cat": 0.9}, {"box": [0, 0, 1, 1], "cat": 0.1}]},
+        {"file": "b.jpg", "t_capture_ns": 6_000_000_000, "pan_deg": 30.0, "tilt_deg": -15.0},
+        {"file": "c.jpg", "t_capture_ns": 9_000_000_000, "pan_deg": 0.0, "tilt_deg": -15.0,
+         "moving": True, "dets": [{"box": [0.4, 0.5, 0.6, 0.8], "cat": 0.9}]},
+    ]  # fmt: skip
+    (tmp_path / "meta.json").write_text(json.dumps({"frames": frames, "camera_height_cm": 8}))
+    assert station_time(tmp_path) == pytest.approx(6.0)
+    cats = station_cats(tmp_path, Pose(1.0, 2.0, math.pi / 2))
+    assert cats.shape == (1, 3)
+    x, y, t = cats[0]
+    assert t == pytest.approx(5.0)
+    assert x == pytest.approx(1.0, abs=0.02) and 2.1 < y < 2.6  # 車の前（+y）に

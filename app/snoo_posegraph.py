@@ -466,7 +466,13 @@ def replace_observation(o: Observation, new: Pose) -> Observation:
     tex = None
     if o.texture is not None and len(o.texture):
         tex = np.concatenate([move(o.texture[:, :2]), o.texture[:, 2:]], 1)
-    return Observation(move(o.free), move(o.occupied), move(o.high), new, o.sonar_m, tex)
+    cats = None
+    if o.cats is not None and len(o.cats):
+        cats = np.concatenate([move(o.cats[:, :2]), o.cats[:, 2:]], 1)
+    return Observation(
+        move(o.free), move(o.occupied), move(o.high), new, o.sonar_m, tex, o.t_s,
+        cats if cats is not None else o.cats,
+    )  # fmt: skip
 
 
 # --- 地図 ---

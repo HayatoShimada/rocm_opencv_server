@@ -23,7 +23,10 @@
 - 走る長さ（後ろは W_REV 倍重い）・前後の切り替えごと W_SWITCH・区切りごと W_SEG
 - 後ろへの区切りの先の縁が、見ていないセルに入る・縁の真ん中（走った所の幅）が確信度の低い
   （1 回しか見ていない）セルに入る：W_UNK_REV（重い）。合わせて UNSEEN_REV_MAX_M を超えたら
-  使わない（後ろにはセンサーが無い）。縁の両端（走っても床にならない幅）は床と見ていればよい
+  使わない（後ろにはセンサーが無い）。縁の両端（走っても床にならない幅）は床と見ていればよい。
+  確信度は、最後に見た・走った時からの時間で下げて見る（snoo_belief.reverse_value）
+- 人・snoo を CAT_RECENT_S 秒以内に見たとき：車のそば（CAT_NEAR_M 以内）なら後ろへは走らない
+  （見た後に後ろへ回り込んでいるかもしれない）。離れていれば、見た所の CAT_NEAR_M 以内へは下がらない
 - 前への区切りの先の縁が見ていないセルに入る：W_UNK_FWD（軽い。Pi の超音波と clear_cm が見る）
 - 前への区切りで、まっすぐに近い（CLEAR_STEER_DEG 以下）のに前の端から CLEAR_STOP_M に障害物が
   入る：Pi が clear で止まるので使わない
@@ -67,7 +70,14 @@ from app.roommap import (
     drive_moves,
     rear_axle,
 )
-from app.snoo_belief import CONF_OK, LANDMARK_MIN, confidence_of, unsure_edges, visible_landmarks
+from app.snoo_belief import (
+    CONF_OK,
+    LANDMARK_MIN,
+    confidence_of,
+    reverse_value,
+    unsure_edges,
+    visible_landmarks,
+)
 
 MAX_STEER_DEG = math.degrees(math.atan(WHEELBASE_M / TURN_RADIUS_M))  # 28.3°
 # 1 歩の区切りの数の上限（Pi の MAX_SEGMENTS と同じ）
@@ -98,6 +108,10 @@ UNSEEN_REV_MAX_M = 0.03
 UNSEEN_FWD_MAX_M = 0.10
 # 後ろへ通ってよい、床の確信度の下限（1 回見ただけでは足りない。走った所は 1）
 CONF_REVERSE = 0.6
+# 人・snoo を見てからこの秒数のあいだは、そのそばへ下がらない（車の後ろにはセンサーが無く、
+# 見た後に後ろへ回り込んでいるかもしれない）。見た所がカメラからこれより近ければ、後ろへは走らない
+CAT_RECENT_S = 30.0
+CAT_NEAR_M = 1.0
 # 1 区切りを何回に分けて確かめるか
 SUB = 12
 
@@ -258,9 +272,18 @@ class Scene:
         self.occ = occ & ~self.start_cells
         self.touch = occ & self.start_cells
         self.unknown = (st == UNKNOWN) & ~self.start_cells
-        # 後ろへ通ってよくない所：縁のどこでも床と分かっていない所、縁の真ん中では確信度が低い所も
+        # 後ろへ通ってよくない所：縁のどこでも床と分かっていない所、縁の真ん中では確信度が低い所も。
+        # 確信度は、見てからの時間で下げて見る（見ていない間に snoo が来ているかもしれない）
+        now = getattr(grid, "now_s", None)
+        rev_conf = reverse_value(grid, self.conf, now)
         self.not_floor = (st != FREE) & ~self.start_cells
-        self.not_sure = self.not_floor | ((self.conf < CONF_REVERSE) & ~self.start_cells)
+        self.not_sure = self.not_floor | ((rev_conf < CONF_REVERSE) & ~self.start_cells)
+        # 最近見た人・snoo：そばに居たら後ろへは走らない。離れていれば見た所のそばへ下がらない
+        cats = [(x, y) for x, y, t in getattr(grid, "cats", None) or []
+                if now is not None and now - t <= CAT_RECENT_S]  # fmt: skip
+        self.no_reverse = any(math.hypot(x - pose.x, y - pose.y) <= CAT_NEAR_M for x, y in cats)
+        self.cat_zone = self._near([Pose(x, y, 0.0) for x, y in cats], CAT_NEAR_M)
+        self.cats = cats
         self.maybe = (st == FREE) & (self.conf > 0.0) & (self.conf < CONF_OK)
         # 障害物のセルの中心までの距離（m）。障害物の面はセルの半分だけ手前にあるとみる
         src = np.where(self.occ, 0, 255).astype(np.uint8)
@@ -444,6 +467,11 @@ class Scene:
         ix_, iy_ = self._world(REAR_INNER_PTS, x, y, yaw)
         unk_r |= self._lookup(self.not_sure, ix_, iy_, True).any(-1)
         lead = np.where(back, unk_r, unk_f)
+        # 最近見た人・snoo：そばなら後ろへは走らない。後ろの縁が見た所のそばに入っても走らない
+        if self.no_reverse:
+            hit = hit | np.asarray(back)
+        elif self.cats:
+            hit = hit | (np.asarray(back) & self._lookup(self.cat_zone, rx, ry, False).any(-1))
         maybe = self._lookup(self.maybe, fx, fy, False).mean(-1) > 0.5
         # 前の端から先の帯（Pi の clear_cm の見込み）
         k = -np.tan(np.radians(steer_deg)) / WHEELBASE_M

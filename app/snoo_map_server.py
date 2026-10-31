@@ -107,6 +107,7 @@ from app.snoo import _allowed, parse_allow
 from app.snoo_maneuver import GEAR_MAX_SEGMENTS, moves_ok
 from app.snoo_maneuver import MAX_STEER_DEG as MANEUVER_STEER_DEG
 from app.snoo_mapper import (
+    CAT_MASK_MIN,
     MAX_FRAMES,
     RECENT_STATIONS,
     FrameRef,
@@ -347,6 +348,59 @@ def camera_height_m(d: Path) -> float:
     return (h or DEFAULT_CAMERA_HEIGHT_CM) / 100
 
 
+def station_time(d: Path) -> float | None:
+    """ステーションを撮った時刻（秒）。止まって撮ったコマの t_capture_ns のいちばん遅いもの
+    （Pi の monotonic の時計。同じセッションの中で比べられる。make replay でも同じ値になる）。"""
+    try:
+        frames = read_meta(d).get("frames") or []
+    except (OSError, ValueError):  # meta.json が無い・壊れている（試験の置き場など）
+        return None
+    ts = [f.get("t_capture_ns") for f in frames if isinstance(f, dict) and not f.get("moving")]
+    ts = [float(t) for t in ts if isinstance(t, (int, float)) and math.isfinite(t)]
+    return max(ts) / 1e9 if ts else None
+
+
+# 人・snoo の箱の足もとを床に当てた所が、カメラからこれより遠ければ使わない（家具の上・遠い）
+CAT_PLACE_MAX_M = 3.0
+
+
+def station_cats(d: Path, pose: Pose) -> np.ndarray:
+    """止まって撮ったコマの検出の猫の箱（frames[].dets）の足もとを床に当てた所 (K, 3)：
+    [x, y, 撮った時刻（秒）]。pose はそのステーションの位置（カメラの真下）。箱の下の真ん中の
+    画素を、首の向きとカメラの高さで床に当てる（app/snoo_agent_api.cat_place と同じ）。
+    後ろへ下がる区切りを決めるのに使う（見た後に車の後ろへ回り込んでいるかもしれない）。"""
+    from app.clearance import Camera, floor_point
+
+    h_cm = camera_height_m(d) * 100
+    out = []
+    for f in read_meta(d).get("frames") or []:
+        dets = f.get("dets")
+        if f.get("moving") or not isinstance(dets, list):
+            continue
+        try:  # Pi から届いたもの。形が違えば使わない（500 にしない）
+            cam = Camera.from_pi(float(f["tilt_deg"]), float(f["pan_deg"]), height_cm=h_cm)
+            t = float(f["t_capture_ns"]) / 1e9
+        except (KeyError, TypeError, ValueError):
+            continue
+        for det in dets:
+            try:
+                if float(det.get("cat", 0)) < CAT_MASK_MIN:
+                    continue
+                x1, _, x2, y2 = (min(1.0, max(0.0, float(v))) for v in det["box"])
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            fx, fy = floor_point(cam, (x1 + x2) / 2 * cam.width, y2 * cam.height)
+            fx, fy = float(fx) / 100, float(fy) / 100
+            if (
+                not (math.isfinite(fx) and math.isfinite(fy))
+                or math.hypot(fx, fy) > CAT_PLACE_MAX_M
+            ):
+                continue
+            c, sn = math.cos(pose.yaw), math.sin(pose.yaw)
+            out.append((pose.x + fx * c - fy * sn, pose.y + fx * sn + fy * c, t))
+    return np.array(out, np.float64).reshape(-1, 3)
+
+
 def ultrasonic_cm(d: Path) -> float | None:
     """そのステーションの前の超音波の読み（cm）。meta の ultrasonic_cm と、止まって撮ったコマごとの
     読みの中央値にする（1 回の読みはときどき跳ねる。実走で 34 cm の中に 61 cm が混じった）。
@@ -409,6 +463,8 @@ def read_observations(
     for i in station_ids(session):
         if i <= upto and obs_path(session, i).is_file():
             o = Observation.load(obs_path(session, i))
+            if o.t_s is None:  # 前の版の obs.npz：時刻はステーションの meta から
+                o.t_s = station_time(station_dir(session, i))
             if poses is not None and i in poses and poses[i] != o.pose:
                 o = pg.replace_observation(o, poses[i])
             out.append(o)
@@ -895,6 +951,8 @@ def plan_station(
         # 見たものも 1 回だけ残す（ふつうは最後のステーション。前の版で受けたステーションも）。
         # 置いた位置も一緒に残る（Observation.pose）。グラフが位置を直したら、読むときに置き直す
         if i in poses and o is not None and i not in bad and not obs_path(session, i).is_file():
+            d = station_dir(session, i)
+            o.t_s, o.cats = station_time(d), station_cats(d, o.pose)
             o.save(obs_path(session, i))
     if graph is not None:
         # グラフで位置の決まったステーションは、グラフの位置にする（窓で崩れたものも、
@@ -923,6 +981,12 @@ def plan_station(
         if observations is None:
             observations = read_observations(session, station_id)
         r.grid, r.high = session_grid(observations)
+        # いまの時刻（後ろへ下がる区切りで、古い床と最近見た人・snoo を見る。Pi の時計）
+        r.grid.now_s = station_time(dirs[-1])
+        # 今のステーションで見えた人・snoo は、位置合わせが崩れて obs.npz を残さなくても足す
+        # （見た直後に車の後ろへ回り込んでいるかもしれない）
+        if station_id in poses:
+            r.grid.cats.extend(map(tuple, station_cats(dirs[-1], poses[station_id])))
         if params.driven_free:
             mark_steps_driven(r.grid, session, station_id, poses)
         if USE_SLAM:  # 走りながらの SLAM で見た所も足す（app/snoo_slam.py が書く）
@@ -1218,7 +1282,10 @@ def mark_steps_driven(grid, session: Path, station_id: int, poses: dict[int, Pos
     前を横切った猫で止まった所が、ずっと障害物に寄ったままにならない）。"""
     for before, moves in steps_driven(session, station_id, poses, fitted_only=True):
         if moves and before in poses:
-            mark_driven_moves(grid, poses[before], moves)
+            # 走った時刻は、走り出したステーションの時刻とする（古めに見る）
+            mark_driven_moves(
+                grid, poses[before], moves, station_time(station_dir(session, before))
+            )
     for i in station_ids(session):
         if i > station_id or i <= station_id - BLOCKED_KEEP_STATIONS or i not in poses:
             continue
