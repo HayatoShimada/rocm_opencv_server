@@ -36,6 +36,11 @@
 - 区切りの終わりから見える目印（手ざわりの高いセル）が LANDMARK_MIN 未満なら W_LOST
   （白い壁しか見えない所では VGGT・RoMa が位置を外す）
 - 直近のステーションのそばに戻る：W_REVISIT（同じ所に固まらない）
+
+安全でない重み（道のり・見えるもの・目印・戻る罰・切り替え・走る長さ・隙間・たぶん空き・確信度の低い
+縁の後回し・MPPI の温度）は Weights にまとめ、学んだ方策（app/snoo_maneuver_policy.py）が場面ごとに
+変えてよい。安全の項（ぶつかる・後ろの確かでない所・前の見ていない所・clear で止まる道・人と snoo の
+そば）は固定で、走れる列かどうか（Rollout.ok）は重みによらない。
 """
 
 from __future__ import annotations
@@ -140,6 +145,30 @@ GOAL_FIRST_M = 0.6
 SEEN_NEAR_M = 0.40
 # 行き先に行けない（つながっていない）ときの道のりの見込み
 D_FAR_M = 5.0
+# MPPI の重みの温度
+LAM = 0.15
+
+
+@dataclass(frozen=True)
+class Weights:
+    """コストの重みのうち、場面で変えてよいもの（学んだ方策 app/snoo_maneuver_policy.py が出す）。
+    既定は上の固定の値。安全の項（ぶつかる・後ろの確かでない所 W_UNK_REV・前の見ていない所
+    W_UNK_FWD・clear で止まる道・人と snoo のそば）はここに入れず、いつも固定。"""
+
+    fwd: float = W_FWD
+    rev: float = W_REV
+    switch: float = W_SWITCH
+    goal: float = W_GOAL
+    gap: float = W_GAP
+    maybe: float = W_MAYBE
+    info: float = W_INFO
+    lost: float = W_LOST
+    revisit: float = W_REVISIT
+    lowconf_offset_m: float = LOWCONF_OFFSET_M
+    lam: float = LAM
+
+
+FIXED = Weights()
 
 
 @dataclass(frozen=True)
@@ -249,11 +278,14 @@ class Scene:
         goal: Pose | None = None,
         state: np.ndarray | None = None,
         conf: np.ndarray | None = None,
+        weights: Weights | None = None,
     ):
-        """state・conf は grid.state()・confidence_of の値（もう出してあれば渡す）。"""
+        """state・conf は grid.state()・confidence_of の値（もう出してあれば渡す）。
+        weights はコストの重み（無ければ固定の FIXED）。"""
         import cv2
 
         t0 = time.perf_counter()
+        self.w = weights or FIXED
         self.wide = wide
         self.edge_pts = EDGE_PTS
         self.margin = GAP_MARGIN_M
@@ -353,7 +385,8 @@ class Scene:
             self.lowconf_targets = int(low.sum())
             extra = low & ~targets
             targets |= extra
-            offset[extra] = LOWCONF_OFFSET_M + (GOAL_FIRST_M if self.goal is not None else 0.0)
+            first = GOAL_FIRST_M if self.goal is not None else 0.0
+            offset[extra] = self.w.lowconf_offset_m + first
         self.targets = targets
         ok = (st == FREE) | self.start_cells
         occ_all = st == OCCUPIED
@@ -494,7 +527,7 @@ class Scene:
         if not self.use_landmarks:
             return np.zeros(np.shape(cam_x))
         n = visible_landmarks(self.landmarks, cam_x, cam_y, cam_yaw, HALF_VIEW_DEG, VIEW_RANGE_M)
-        return W_LOST * np.clip(1.0 - n / LANDMARK_MIN, 0.0, 1.0)
+        return self.w.lost * np.clip(1.0 - n / LANDMARK_MIN, 0.0, 1.0)
 
     def revisit(self, cam_x, cam_y):
         if not self.recent:
@@ -502,7 +535,7 @@ class Scene:
         px = np.array([p.x for p in self.recent])
         py = np.array([p.y for p in self.recent])
         d = np.hypot(np.asarray(cam_x)[..., None] - px, np.asarray(cam_y)[..., None] - py)
-        return W_REVISIT * (d < REVISIT_M).sum(-1)
+        return self.w.revisit * (d < REVISIT_M).sum(-1)
 
     def info(self, cam: Pose, rays: int = 41) -> float:
         """着いた所から首を振って見える、見ていないセル（1）と確信度の低いセル（1 - 確信度）の量。
@@ -628,16 +661,17 @@ def rollout(scene: Scene, steer: np.ndarray, dist: np.ndarray, wide: bool = Fals
     lost = (scene.lost_penalty(cx, cy, seg_end[:, :, 2]) * used).max(1)
     ex, ey = x + CAM_X_M * np.cos(yaw), y + CAM_X_M * np.sin(yaw)
     revisit = scene.revisit(ex, ey) * (WIDE_REVISIT if wide else 1.0)
+    w = scene.w
     cost = (
-        W_FWD * fwd_len
-        + W_REV * rev_len
-        + W_SWITCH * switches * (WIDE_SWITCH if wide else 1.0)
+        w.fwd * fwd_len
+        + w.rev * rev_len
+        + w.switch * switches * (WIDE_SWITCH if wide else 1.0)
         + W_SEG * used.sum(1)
         + W_UNK_REV * unk_rev
         + W_UNK_FWD * unk_fwd
-        + W_GOAL * (D_end - D0)
-        - W_GAP * gap
-        - W_MAYBE * maybe_len
+        + w.goal * (D_end - D0)
+        - w.gap * gap
+        - w.maybe * maybe_len
         + lost
         + revisit
     )
@@ -695,12 +729,13 @@ def mppi(
     rng: np.random.Generator,
     samples: int = 160,
     iters: int = 3,
-    lam: float = 0.15,
+    lam: float | None = None,
     budget_s: float = 0.8,
 ) -> list[list[tuple[float, float, bool]]]:
     """区切りの列をばらまき、コストで重みを付けて名目の列を寄せ直す。良い順に TOP_K 個の列を返す
     （着いた所から見えるものは plan_maneuver で足す）。"""
     t0 = time.perf_counter()
+    lam = scene.w.lam if lam is None else lam
     S = GEAR_MAX_SEGMENTS
     noms = [_pad(m) for m in nominals if m]
     if not noms:
@@ -795,6 +830,7 @@ def hybrid_astar(
     import heapq
 
     t0 = time.perf_counter()
+    w = scene.w
     r = scene.start
     s = MAX_STEER_DEG
     prims = [(st, back) for back in ((False, True) if lim.reverse else (False,))
@@ -867,8 +903,8 @@ def hybrid_astar(
             if unk_r > UNSEEN_REV_MAX_M + 1e-9 or unk_f > UNSEEN_FWD_MAX_M + 1e-9:
                 continue
             switch = bool(nd["moves"]) and nd["moves"][-1][2] != back
-            g = nd["g"] + (W_REV if back else W_FWD) * PRIM_M
-            g += W_SWITCH * (WIDE_SWITCH if lim.wide else 1.0) * switch
+            g = nd["g"] + (w.rev if back else w.fwd) * PRIM_M
+            g += w.switch * (WIDE_SWITCH if lim.wide else 1.0) * switch
             g += W_SEG * new_seg + (W_UNK_REV if back else W_UNK_FWD) * ul
             x, y, yaw = xs[sl.stop - 1], ys[sl.stop - 1], yaws[sl.stop - 1]
             key = (
@@ -888,12 +924,12 @@ def hybrid_astar(
             nodes.append(child)
             j = len(nodes) - 1
             cam = camera_of(Pose(x, y, yaw))
-            J = g + W_GOAL * (D - D0) - W_GAP * (narrow and D < D0 - 0.1)
+            J = g + w.goal * (D - D0) - w.gap * (narrow and D < D0 - 0.1)
             J += float(scene.lost_penalty(cam.x, cam.y, cam.yaw))
             J += float(scene.revisit(cam.x, cam.y)) * (WIDE_REVISIT if lim.wide else 1.0)
             if fwd + rev >= MIN_TOTAL_M and J < best_j:
                 best, best_j = moves, J
-            heapq.heappush(heap, (g + W_GOAL * (D - D0), j))
+            heapq.heappush(heap, (g + w.goal * (D - D0), j))
     return best
 
 
@@ -911,6 +947,7 @@ def plan_maneuver(
     mode: str = "mppi",
     goal: Pose | None = None,
     scene: Scene | None = None,
+    weights: Weights | None = None,
 ) -> Maneuver | None:
     """次の 1 歩（区切りの列）を決める。走れる列が無い・行き先が無ければ None。
 
@@ -918,11 +955,12 @@ def plan_maneuver(
     寄せ直した上位の列と合わせて、同じコストに「着いた所から見えるもの」を足して選ぶ。
     mode="hybrid" は MPPI を使わない（ベンチで比べるため）。
     scene は、同じ格子・姿勢で作った Scene（targets_conf=True）を使い回すとき（広く探し直す）。
+    weights はコストの重み（scene を渡すときは scene の重みを使う）。
     """
     t0 = time.perf_counter()
     lim = lim or Limits()
     if scene is None:
-        scene = Scene(grid, pose, True, recent, lim.wide, goal)
+        scene = Scene(grid, pose, True, recent, lim.wide, goal, weights=weights)
     if not scene.targets.any():
         return None
     rng = np.random.default_rng(seed)
@@ -952,7 +990,7 @@ def plan_maneuver(
         slots = [i for i, v in enumerate(d[0]) if abs(v) >= SEG_MIN_M]
         end = camera_of(Pose(*map(float, ro.end_rear[0])))
         gain = scene.info(end)
-        scored.append((float(ro.cost[0]) - W_INFO * gain, kind, mv, ro, gain, slots))
+        scored.append((float(ro.cost[0]) - scene.w.info * gain, kind, mv, ro, gain, slots))
     if not scored:
         return None
     total, kind, mv, ro, gain, slots = min(scored, key=lambda c: c[0])

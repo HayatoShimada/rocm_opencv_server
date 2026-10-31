@@ -21,6 +21,8 @@ GPU は使わない。家ごとに、ふつうの壁と白い壁（手ざわり�
 - map_acc：見た所のうち、床・障害物が本当の家と合っている割合。wall_err_cm：障害物と見たセルから
   本当の障害物までの平均の距離
 --planner hybrid は MPPI を使わず Hybrid A* だけにする（比べるため。地図のサーバーは使わない）。
+--policy <npz> は、計画器の重みを学んだ方策（app/snoo_maneuver_policy.py）で決める
+（地図のサーバーの SNOO_MANEUVER_POLICY と同じ）。無ければ固定の重み。
 """
 
 from __future__ import annotations
@@ -82,9 +84,14 @@ def solid_cells(sim, pose, t) -> np.ndarray:
 
 def run_one(args: tuple) -> dict:
     home_seed, white, planner, budget_s = args[:4]
-    rest = args[4:6]
-    low_sofa, snoo = (*rest, *(False, "random")[len(rest) :])
+    rest = args[4:7]
+    low_sofa, snoo, policy = (*rest, *(False, "random", None)[len(rest) :])
     os.environ["HIP_VISIBLE_DEVICES"] = ""
+    # 子のプロセスは使い回すので、1 軒ごとに決める（GridSim の MapParams がここで読む）
+    if policy:
+        os.environ["SNOO_MANEUVER_POLICY"] = str(policy)
+    else:
+        os.environ.pop("SNOO_MANEUVER_POLICY", None)
     import cv2
 
     cv2.setNumThreads(1)
@@ -243,11 +250,14 @@ def main() -> None:
                     help="下の端が 10〜18 cm の低いソファを 1 つ足した家で回す")  # fmt: skip
     ap.add_argument("--snoo", default="random", choices=("random", "behavior", "sneak"),
                     help="snoo の動き（sneak：撮るたびに前に出て、後ろへ回り込む）")  # fmt: skip
+    ap.add_argument("--policy", type=Path, default=None,
+                    help="計画器の重みを出す方策の npz（無ければ固定の重み）")  # fmt: skip
     ap.add_argument("--label", default=None, help="結果の名前（既定は --planner）")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     label = a.label or a.planner
-    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60, a.low_sofa, a.snoo)
+    policy = str(a.policy.resolve()) if a.policy else None
+    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60, a.low_sofa, a.snoo, policy)
             for i in range(a.homes) for white in (False, True)]  # fmt: skip
     with mp.get_context("spawn").Pool(min(a.workers, 4)) as pool:
         rows = []

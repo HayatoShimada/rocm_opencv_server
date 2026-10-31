@@ -61,7 +61,14 @@ from app.snoo_belief import (
     texture_png,
     unsure_edges,
 )
-from app.snoo_maneuver import GEAR_MAX_SEGMENTS, Limits, Maneuver, Scene, plan_maneuver
+from app.snoo_maneuver import (
+    GEAR_MAX_SEGMENTS,
+    Limits,
+    Maneuver,
+    Scene,
+    Weights,
+    plan_maneuver,
+)
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
 # 検出サーバーと分け合うので余裕を見る）
@@ -141,6 +148,9 @@ class MapParams:
     # roommap.LONG_STEP_M（60 cm）まで。超えた分はまっすぐの区間だけ
     max_step_m: float = MAX_STEP_M
     seed: int = 0
+    # 計画器のコストの重みを場面から出す方策（app/snoo_maneuver_policy.py）の npz。None なら
+    # 固定の重み。既定は環境変数 SNOO_MANEUVER_POLICY（無ければ使わない）
+    policy: str | None = field(default_factory=lambda: os.getenv("SNOO_MANEUVER_POLICY") or None)
 
 
 @dataclass
@@ -1000,6 +1010,7 @@ def decide(
     heights: list[float | None],
     trusted: frozenset[str] = frozenset(),
     recent: list[Pose] | None = None,
+    weights: Weights | None = None,
 ) -> tuple[dict, Maneuver | None]:
     """最後のステーションから次の 1 歩を決める。止める理由があれば done。
 
@@ -1010,6 +1021,8 @@ def decide(
     trusted は stop_reason と同じ（位置のグラフで位置が決まったステーションの名前）。
     計画器の行き先（撮った所のそばを除いた境目・確信度の低い縁の手前・next_best_view の行き先）が
     一つも無ければ done "no_frontier"（stop_reason の境目は残っていても、計画器が使えない）。
+    weights は計画器のコストの重み（学ぶときに外から渡す）。無くて params.policy があれば、
+    その方策が場面から出す（app/snoo_maneuver_policy.py）。どちらも無ければ固定の重み。
     """
     state = grid.state()
     conf = confidence_of(grid, state)
@@ -1025,8 +1038,15 @@ def decide(
     if plan is not None:
         nominal = [(st, m, False) for st, m in (plan.segments or [(plan.steer_deg, plan.step_m)])]
     goal = plan.target if plan is not None else None
+    policy_info = None
+    if weights is None and params.policy:
+        from app.snoo_maneuver_policy import explain, features, load_policy
+
+        f = features(grid, pose, recent, state, conf, len(stations))
+        weights = load_policy(params.policy).weights(f)
+        policy_info = explain(f, weights)
     # 同じ格子・姿勢なので、広く探し直すときも同じ Scene を使う
-    scene = Scene(grid, pose, True, recent[:-1], lim.wide, goal, state, conf)
+    scene = Scene(grid, pose, True, recent[:-1], lim.wide, goal, state, conf, weights)
     if not scene.targets.any():
         # 残っている境目は撮った所のそば（足もと・車の横。どこから撮っても写らない）だけ。
         # 撮り直しを続けて stuck にしない
@@ -1046,6 +1066,8 @@ def decide(
     action = maneuver_action(man, pose, params)
     if lim.wide:
         action["stuck"] = True
+    if policy_info is not None:
+        action["policy"] = policy_info
     return action, man
 
 

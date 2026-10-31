@@ -28,6 +28,7 @@ SLOW = {
     "test_next_best_view_heads_toward_the_unseen_side_without_leaving_the_floor": 9,
     "test_ultrasonic_marks_an_obstacle_the_camera_did_not_see": 8,
     "test_scale_and_floor": 8,
+    "test_short_episode_scores_and_rewards": 4,
     "test_unknown_height_station_is_measured": 8,
     "test_decide_returns_segments_only_when_asked": 8,
 }

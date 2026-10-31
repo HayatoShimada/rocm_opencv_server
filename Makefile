@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: bench-plan phase-offline phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
+.PHONY: bench-plan train-explore eval-explore phase-train phase-offline phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -14,8 +14,11 @@ help:
 	@echo "make status           両方のサーバーの様子"
 	@echo "make replay SESSION=<id>  保存したセッションの最後の 1 歩を GPU なしで決め直す"
 	@echo "make bench-plan       作った家（白い壁の部屋も）で次の 1 歩の決め方を測る（CPU 3 本）"
+	@echo "make train-explore    計画器の重みを場面から出す方策を作った家で学ぶ（続きから。CPU 3 本。SIGTERM で止まる）"
+	@echo "make eval-explore     学んだ重みを、bench-plan と同じ家・同じ数で固定の重みと比べる"
 	@echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]  家の地図を作る"
 	@echo "make sim-live [ARGS=\"--room home:3\"]  猫を手で動かすシミュレーター（http://127.0.0.1:8731/sim）"
+	@echo "make phase-train      検出・地図・SLAM・見張りを止め、CPU を学習（train-explore）に使う"
 	@echo "make phase-offline    検出・地図・SLAM・見張りを止め、GPU を 1 つの比べる仕事に使う"
 	@echo "make phase-robot      見張りを起こす（実機のターン）。make phase で今どちらか"
 
@@ -46,7 +49,19 @@ status:
 bench-plan:
 	$(PYTHON) -m scripts.snoo_plan_bench --workers 3 --out out/bench/plan.json $(ARGS)
 
-# GPU を握るプロセスを 1 つにするための切り替え（scripts/snoo_phase.sh）。学習のターンは #73 で無くなった
+# 計画器の重みを場面から出す方策（app/snoo_maneuver_policy.py）を学ぶ（data/snoo_policy/<algo>/ の
+# 続きから。CPU だけ）。scripts/snoo_phase.sh robot が pgrep -f scripts.snoo_explore_train で見つけて
+# 止めるので、名前を変えない
+train-explore:
+	$(PYTHON) -m scripts.snoo_explore_train $(ARGS)
+
+eval-explore:
+	$(PYTHON) -m scripts.snoo_explore_eval --out out/explore/eval.json $(ARGS)
+
+# 切り替え（scripts/snoo_phase.sh）。GPU を握るプロセスを 1 つにし、重い仕事を 1 つずつにする
+phase-train:
+	scripts/snoo_phase.sh train
+
 phase-offline:
 	scripts/snoo_phase.sh offline
 

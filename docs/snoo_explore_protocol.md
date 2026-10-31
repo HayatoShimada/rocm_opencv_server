@@ -53,6 +53,10 @@ Pi（snoo_trucar）が止まって首を振って撮った分（station）を `P
   `done stuck` で終える
 - `"retrace": true`：位置合わせが崩れ、位置のグラフでも決まらないとき、いま走った 1 歩を逆にたどる
   （区切りの順と向きを逆に）
+- `"policy": {"features": {...}, "scale": {...}}`：地図のサーバーが `SNOO_MANEUVER_POLICY`（学んだ
+  重みの方策、app/snoo_maneuver_policy.py）で計画器の重みを決めたときだけ付く。場面の特徴と、固定の重みへの
+  倍率（ログで見るため）。Pi は見ない。安全の項（ぶつかる・後ろの確かでない所・clear で止まる道）は
+  方策があっても固定
 
 ## done の理由
 
