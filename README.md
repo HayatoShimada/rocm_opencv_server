@@ -255,6 +255,7 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 | 地図（app/snoo_map_server.py など）を直して試す | `make deploy-map` | 約 7 秒 |
 | 両方の様子を見る | `make status` | 0.1 秒 |
 | 保存したセッションの最後の 1 歩を GPU なしで決め直す | `make replay SESSION=explore_20261029_223944` | 1 秒 |
+| 作った 30 坪の家（白い壁の部屋も）で、次の 1 歩の決め方を測る | `make bench-plan`（`ARGS="--homes 12"`） | 12 軒 × 2 通りで数分 |
 | 猫を手で動かして、車（探索）の反応をシミュレーターで見る | `make sim-live`（`ARGS="--room home:3"`） | 起動 2 秒。http://127.0.0.1:8731/sim |
 
 - **検出**: `compose.dev.yaml` が `./app` をコンテナに読み取り専用で重ねるので、app/ を直したら作り直さずに起動し直すだけで新しいコードで動く。`make deploy-detector` は、上書きの無いコンテナなら一度だけ作り直し（`docker compose -f compose.yaml -f compose.dev.yaml up -d snoo`）、あとは `restart` して「待ち受け」まで待ち、最初の p50/p95 の行を出す。起動に失敗したら Traceback を出してやめる。torch.compile の準備は torch-compile ボリュームのキャッシュが効く（検出 約 11 秒・clear_cm の深度 約 2.5 秒）。もっと速く試すときは `SNOO_CLEARANCE=0`（約 16 秒）・`SNOO_COMPILE=0`（clear も切って約 9 秒）を付けて `make deploy-detector`（作り直しになる）。pyproject.toml・uv.lock・Dockerfile を変えたときは `docker compose build snoo` が要る（`make deploy-detector` が知らせる）。本番の形（上書きなし）に戻すのは `docker compose up -d snoo`、その後に待つだけなら `.venv/bin/python -m scripts.snoo_dev wait-detector`
@@ -275,6 +276,7 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 - **猫を動かすシミュレーター**: `make sim-live` で MuJoCo の部屋（`--room synthetic`・`home:<くじ>`・`session:<セッション>`）を実機の速さで回し、`http://127.0.0.1:8731/sim` の左のスティックで猫を歩かせ、ボタン（1〜5・A・X・Y・LB・RB）で姿勢を変える。車は地図のサーバーと同じ決め方で探り続け、Pi と同じく snoo が 150 cm より近くに見えると止まって見守る（`--near-cm 0` で切る）。手を離して 5 秒で猫は自分で動く（`--fallback behavior|random|none`）。画面には車のカメラ・上から見た地図・3D と、次の 1 歩とその理由が出る。入力の JS は /drive と同じ（app/static/controller/）。別の機械から開くときは `SNOO_SIM_ALLOW`（既定は SNOO_MAP_ALLOW と同じ）
 - **エージェント**: 地図のサーバーの `/v1/snoo/agent/`（app/snoo_agent_api.py）と MCP のサーバー（scripts/snoo_robot_mcp.py）で、Claude Code などがロボットの様子・カメラ・地図を見て、印・困りごとの下書き・声・指令を残す。指令はまだ Pi が実行しない。使い方と Pi 側の仕様は docs/agent_robot.md。声を使うときは地図のサーバーの venv に `uv pip install pyopenjtalk`（main の `.venv` は `uv sync` しない）
 - **テスト**: 重いテストの印（slow）は `tests/conftest.py` の `SLOW` に名前で書く（テストのファイルは直さない）。`make test-fast` で、印が無いのに 3 秒を超えたテストは最後に名前が出る。`make test ARGS='-x'` のように pytest に引数を渡せる
+- **次の 1 歩の決め方**: 地図のサーバーが道をすべて決め、Pi はそのとおり走る（反射の安全だけ：clear_cm・guard・動かない・電池・USR）。1 歩は前へ・後ろへを区切りごとに変えられる区切りの列（最大 5。切り返し・3 点ターン・隙間へ寄せる）で、app/snoo_maneuver.py が MPPI 風に決める（名目の列は next_best_view の 1 歩・Hybrid A*・ひな形）。コストには、車の外形と占有の格子・後ろの確かでない所・前後の切り替え・行き先（境目と確信度の低い縁）までの道のり・狭い隙間を通り抜ける得・目印（手ざわり）が見えない罰・同じ所へ戻る罰を入れる。確信度と手ざわりの層は app/snoo_belief.py。プロトコルは docs/snoo_explore_protocol.md。作った家（app/snoo_homes.py）と速いシミュレーター（app/snoo_gridsim.py）で `make bench-plan` で測る。前の「学んだ探り方」（snoo_explore_policy・PPO）は、候補の作り方が前の決め方のままだったので消した（履歴に残っている）
 - **replay**: 地図のサーバーはステーションごとに VGGT の出力をセッションの `vggt.npz` に上書きするので、決め直せるのはそれを作ったステーション（ふつうは最後）の 1 歩。VGGT の代わりに `vggt.npz` を読み、サーバーと同じ `plan_station` を通す。もとのセッションには書かず、`/tmp/snoo-replay/<セッション>` に room.json・topdown.png・plan.json を作る。前に Pi に返したものと違えば終了コード 1（`ARGS=--allow-diff` で 0）
 
 ## 実機で探索する日の手順（snoo）
