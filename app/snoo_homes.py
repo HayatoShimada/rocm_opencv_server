@@ -140,6 +140,30 @@ class Home:
         return labels == labels[ix, iy]
 
 
+# 手ざわり（写真の勾配の強さ、0〜1。app/snoo_belief.py）。家具・物は高く、白い壁・白い家電は低い
+TEX_WALL = 0.45
+TEX_WHITE = 0.05
+TEX_FURNITURE = 0.8
+WHITE_ITEMS = ("kitchen", "fridge", "wardrobe", "chest")
+
+
+def home_texture(home: Home, white_walls: bool = False) -> np.ndarray:
+    """家のセルごとの手ざわり（シミュレーターで、目印が見えるか・位置を見失うかを決める）。
+    white_walls なら壁を白い（手ざわりの無い）壁にし、白い家電・たんすも低くする。"""
+    tex = np.zeros(home.kind.shape, np.float32)
+    tex[home.kind == CLOSED] = TEX_WHITE if white_walls else TEX_WALL
+    tex[(home.kind == LOW) | (home.kind == HIGH)] = TEX_FURNITURE
+    if white_walls:
+        for it in home.items:
+            if it.name in WHITE_ITEMS:
+                x0, y0, x1, y1 = it.rect
+                ix0, iy0 = home.cell(x0, y0)
+                ix1, iy1 = home.cell(x1 - 1e-6, y1 - 1e-6)
+                sl = (slice(max(ix0, 0), ix1 + 1), slice(max(iy0, 0), iy1 + 1))
+                tex[sl] = np.where(home.kind[sl] != FLOOR, TEX_WHITE, tex[sl])
+    return tex
+
+
 # --- 部屋割り ---
 
 

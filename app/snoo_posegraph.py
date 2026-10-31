@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from app.roommap import Pose, camera_of, drive_poses
+from app.roommap import Pose, camera_of, drive_moves, drive_poses
 from app.snoo_mapper import (
     MAX_STATION_SPREAD_M,
     MIN_POINTS_PER_CELL,
@@ -225,8 +225,13 @@ def odom_pose(pieces: list[tuple[float, float]], reverse: bool = False) -> Pose:
 
 def odom_edge(a: int, b: int, pieces: list[tuple[float, float]], reverse: bool) -> Edge:
     """a から b まで、区間を走った辺。区間の長さは実際に走った分（take で切ってから渡す）。"""
-    z = odom_pose(pieces, reverse)
-    length = sum(m for _, m in pieces)
+    return odom_edge_moves(a, b, [(st, m, reverse) for st, m in pieces])
+
+
+def odom_edge_moves(a: int, b: int, moves: list[tuple[float, float, bool]]) -> Edge:
+    """a から b まで、前へ・後ろへの混じった区切り [(ハンドル°, m, 後ろへか), ...] を走った辺。"""
+    z = camera_of(drive_moves(Pose(0.0, 0.0, 0.0), moves)[-1][1]) if moves else Pose(0.0, 0.0, 0.0)
+    length = sum(m for _, m, _ in moves)
     turn = abs(z.yaw)
     return Edge(
         a, b, z,
@@ -458,7 +463,10 @@ def replace_observation(o: Observation, new: Pose) -> Observation:
     def move(xy: np.ndarray) -> np.ndarray:
         return xy_to_frame(T, xy) if len(xy) else xy
 
-    return Observation(move(o.free), move(o.occupied), move(o.high), new, o.sonar_m)
+    tex = None
+    if o.texture is not None and len(o.texture):
+        tex = np.concatenate([move(o.texture[:, :2]), o.texture[:, 2:]], 1)
+    return Observation(move(o.free), move(o.occupied), move(o.high), new, o.sonar_m, tex)
 
 
 # --- 地図 ---

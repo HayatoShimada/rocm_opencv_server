@@ -67,7 +67,7 @@ MEDIA = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
 }
-MAPS = {"grid.png", "high.png", "topdown.png"}
+MAPS = {"grid.png", "high.png", "confidence.png", "texture.png", "topdown.png"}
 # 送り元の名前（app/snoo_live.py の sender_name。IP の : は - にしてある）
 _SENDER = re.compile(r"[0-9A-Za-z_-][0-9A-Za-z._-]{0,63}")
 # 車の形（画面に描く）。幅は写真から見積もった（約 19 cm。測っていない）。カメラの画角は
@@ -171,11 +171,13 @@ def step_path(reply: dict) -> dict | None:
             steer, m = float(s["steer_deg"]), float(s["distance_cm"]) / 100
         except (KeyError, TypeError, ValueError):
             return None
-        poses = [camera_of(p) for _, p in drive_poses(here, [(steer, m)], reverse=reverse)]
+        back = bool(s.get("reverse", reverse))
+        poses = [camera_of(p) for _, p in drive_poses(here, [(steer, m)], reverse=back)]
         out.append(
             {
                 "steer_deg": steer,
                 "distance_cm": round(m * 100, 1),
+                "reverse": back,
                 "path": [[round(p.x, 3), round(p.y, 3)] for p in poses],
             }
         )
@@ -232,6 +234,8 @@ def session_state(session: Path) -> dict:
             "size": room["size"],
             "origin_pose": pose_dict(anchor),
             "high": (session / "high.png").is_file(),
+            "confidence": (session / "confidence.png").is_file(),
+            "texture": (session / "texture.png").is_file(),
             "high_min_m": (high.get("legend") or {}).get("min_height_m"),
             "version": max(_mtime(session / "grid.png"), _mtime(session / "high.png")),
         }

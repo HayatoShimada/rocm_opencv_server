@@ -30,7 +30,7 @@ import numpy as np
 
 import app.snoo_map_server as server
 from app import snoo_posegraph as pg
-from app.roommap import FREE, OCCUPIED, Pose, take
+from app.roommap import FREE, OCCUPIED, Pose
 from app.snoo_mapper import session_grid
 
 
@@ -39,22 +39,14 @@ def window_of(keys: list[str]) -> list[int]:
 
 
 def odom_edges(session: Path, ids: list[int]) -> list[pg.Edge]:
-    """続く 2 か所の間を走った辺（scripts/snoo_pose_bakeoff.py と同じ）。"""
-    sent = server.read_reverses(session)
+    """続く 2 か所の間を走った辺（地図のサーバーと同じ。区切りごとの前・後ろも入れる）。"""
     have = set(ids)
     out = []
     for b in ids:
-        if b - 1 not in have:
-            continue
-        prev = json.loads((session / f"{b:03d}" / "meta.json").read_text()).get("prev_step")
-        if not isinstance(prev, dict):
-            continue
-        pieces, dist = server.step_pieces(prev), server.pi_distance_m(prev)
-        if pieces is None or dist is None:
-            continue
-        rev = prev.get("reverse")
-        rev = (b - 1) in sent if rev is None else bool(rev)
-        out.append(pg.odom_edge(b - 1, b, take(pieces, dist), rev))
+        if b - 1 in have:
+            e = server.odom_edge_for(session, b)
+            if e is not None:
+                out.append(e)
     return out
 
 

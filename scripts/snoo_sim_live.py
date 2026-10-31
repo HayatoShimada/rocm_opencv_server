@@ -4,8 +4,8 @@
     make sim-live ARGS="--room home:3"  # 作った 30 坪の家（app/snoo_homes.py）
     make sim-live ARGS="--room session:explore_20261030_190244"  # 実走の部屋
 
-車は地図のサーバーと同じ決め方（app/snoo_mapper.decide・or_reverse・keep_going。segments・reverse・
-long_step を受ける Pi として）で探り続ける。時間は実機と同じ（app/snoo_sim.REAL_PACE：10 コマの
+車は地図のサーバーと同じ決め方（app/snoo_mapper.decide。segments・reverse・gear_segments・
+long_step を受ける Pi として）で探る。時間は実機と同じ（app/snoo_sim.REAL_PACE：10 コマの
 首振りに 14.4 秒、地図の返事を 11 秒待つ）。猫は ControlledSnoo で、/sim の画面の左のスティックで
 歩かせ、ボタンで姿勢（座る・伏せる・寝る・立って見る・歩く）を決める。5 秒指令が来なければ、
 自分で動く猫（--fallback、既定は録画から作った BehaviorSnoo）に任せる。
@@ -303,6 +303,7 @@ class Live:
             camera_height_m=CAM_H_M,
             segments=True,
             reverse=True,
+            gear_segments=True,
             max_step_m=LONG_STEP_M,
             max_stations=SESSION_MAX_STATIONS,
         )
@@ -310,7 +311,6 @@ class Live:
             room, cat, rays=self.rays, params=params, seed=seed, sonar_map=True, pace=self.pace,
             lock=self.lock, stop=stop, speed=self.speed, near_cm=self.near_cm,
         )  # fmt: skip
-        sim.keep_exploring = True
         return sim
 
     def start(self) -> None:
@@ -324,8 +324,7 @@ class Live:
         try:
             sim._wall0, sim._t0 = time.monotonic(), sim.t
             while not stop.is_set():
-                # keep_going で探り続けるので、ふつうは返ってこない。返ったら（どこへも動けない）
-                # 少し待って撮り直す
+                # 調べ終えた・動けなくなったら返ってくる。少し待って撮り直す
                 sim.explore(10**9)
                 sim.advance(2.0)
         except Stopped:
@@ -491,8 +490,8 @@ class Live:
 
 
 ACTION_KEYS = {
-    "action", "reason", "steer_deg", "speed", "distance_cm", "segments", "reverse", "turn",
-    "random", "keep_going", "blind", "why", "target",
+    "action", "reason", "steer_deg", "speed", "distance_cm", "segments", "reverse", "gap",
+    "stuck", "planner", "target",
 }  # fmt: skip
 PHASE_TEXT = {
     "start": "始めるところ",
@@ -507,7 +506,7 @@ REASON_TEXT = {
     "no_frontier": "見る所（境目）がもう無い",
     "unreachable": "行ける所が無い",
     "step_limit": "ステーションの数が上限",
-    "stalled": "前へ出せないのが続いた",
+    "stuck": "動けないのが続いた",
 }
 
 
@@ -518,19 +517,17 @@ def action_text(a: dict) -> str:
     if a.get("action") != "move":
         r = str(a.get("reason", ""))
         return f"終える（{REASON_TEXT.get(r.split(':')[0], r)}）"
-    if a.get("turn"):
-        what = "見たい所が後ろなので、切り返して向きを変える"
-    elif a.get("retrace"):
-        what = "位置合わせが崩れたので、来た道を戻って撮り直す"
-    elif a.get("reverse"):
-        what = "前へ行ける所が無いので、来た道を戻る"
-    elif a.get("random"):
-        what = "同じ所に固まったので、でたらめな 1 歩で動く"
+    backs = {bool(x.get("reverse", a.get("reverse"))) for x in a.get("segments") or [a]}
+    if len(backs) == 2:
+        what = "前と後ろを切り替えて向きを変える（切り返し・3 点ターン）"
+    elif backs == {True}:
+        what = "後ろへ下がる"
     else:
-        what = "まだ見ていない所（境目）が見える位置へ向かう"
-    if a.get("keep_going"):
-        why = REASON_TEXT.get(str(a.get("why", "")), str(a.get("why", "")))
-        what = f"探り続ける（{why}）：" + ("見ないで短く切り返す" if a.get("blind") else what)
+        what = "まだ見ていない所・確かめたい所が見える位置へ向かう"
+    if a.get("gap"):
+        what += "（狭い隙間を通る）"
+    if a.get("stuck"):
+        what = "動けないのが続くので、広く探した 1 歩：" + what
     # segments があれば合わせた長さ（distance_cm は最初の区間だけ）。ハンドルは最初の区間
     segs = a.get("segments") or [{"distance_cm": a.get("distance_cm", 0)}]
     cm = sum(float(x.get("distance_cm", 0)) for x in segs)

@@ -104,14 +104,14 @@ def test_explore_runs_a_few_cycles_without_bumping_into_furniture():
     assert 0 < summary.coverage <= 1
 
 
-def test_explore_with_sonar_segments_and_retrace():
-    """地図のサーバーと同じ決め方（超音波・曲がる → まっすぐ・来た道を戻る）でも回る。"""
+def test_explore_with_sonar_and_gear_segments():
+    """地図のサーバーと同じ決め方（超音波・前へ後ろへの区切り）でも回る。"""
     params = MapParams(camera_height_m=CAM_H_M, segments=True)
     s = Sim(synthetic_room(), rays=(64, 48), params=params, seed=1, sonar_map=True)
     summary = s.explore(3, plan_frames=1, backtrack=2)
     assert summary.bumps == 0
-    assert s.driven  # 前へ走った道を覚えている
-    assert all(m > 0 for _, m in s.driven)
+    assert s.drives  # 走った道を覚えている（地図の床にする）
+    assert all(m > 0 for _, pieces, _ in s.drives for _, m in pieces)
     assert s.action.get("action") in ("move", "done")
     if s.action.get("action") == "move":
         assert "segments" in s.action

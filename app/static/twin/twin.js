@@ -18,7 +18,7 @@ const S = {
   state: null, stateKey: "", gridVer: null, grid: null,
   live: null, sender: null, liveSeq: null,
   view: { cx: 0, cy: 0, scale: 100, auto: true },
-  layers: { frontier: true, high: true, fov: true, sonar: true, plan: true, step: true, slam: true },
+  layers: { frontier: true, high: true, conf: false, landmark: false, fov: true, sonar: true, plan: true, step: true, slam: true },
   thumbStation: null, thumbAuto: true, lastOk: 0,
 };
 
@@ -123,9 +123,11 @@ function loadImage(url) {
 async function loadGrid(id, info) {
   const v = encodeURIComponent(info.version);
   const base = `/twin/api/${encodeURIComponent(id)}/map`;
-  const [gim, him] = await Promise.all([
+  const [gim, him, cim, tim] = await Promise.all([
     loadImage(`${base}/grid.png?v=${v}`),
     info.high ? loadImage(`${base}/high.png?v=${v}`).catch(() => null) : null,
+    info.confidence ? loadImage(`${base}/confidence.png?v=${v}`).catch(() => null) : null,
+    info.texture ? loadImage(`${base}/texture.png?v=${v}`).catch(() => null) : null,
   ]);
   const w = gim.width, h = gim.height;
   const read = (im) => {
@@ -184,9 +186,25 @@ async function loadGrid(id, info) {
     for (let i = 0; i < w * h; i++) if (mask[i]) d.data.set([col[0], col[1], col[2], alpha], i * 4);
     x.putImageData(d, 0, 0);
   }
+  // 確信度（低いほど赤く濃く。見ていない所は塗らない）と目印（手ざわりが 0.35 以上のセル）
+  const confc = document.createElement("canvas"), lmc = document.createElement("canvas");
+  for (const cv of [confc, lmc]) { cv.width = w; cv.height = h; }
+  if (cim) {
+    const cd = read(cim), x = confc.getContext("2d"), d = x.createImageData(w, h);
+    for (let i = 0; i < w * h; i++) {
+      const p = cd[i * 4];
+      if (p > 0) d.data.set([230, 60, 60, Math.round(200 * (1 - (p - 1) / 254))], i * 4);
+    }
+    x.putImageData(d, 0, 0);
+  }
+  if (tim) {
+    const td = read(tim), x = lmc.getContext("2d"), d = x.createImageData(w, h);
+    for (let i = 0; i < w * h; i++) if (td[i * 4] >= 90) d.data.set([200, 60, 220, 230], i * 4);
+    x.putImageData(d, 0, 0);
+  }
   // 見えている所の外枠（セッションの座標）。全体を入れる大きさを決めるのに使う
   const corners = x1 < 0 ? [] : [[x0, y0], [x1, y0], [x0, y1], [x1, y1]].map(([c, r]) => toSession(c, r));
-  return { info, w, h, base: base_, frontier: frc, high: hic, cells, corners, frontierCount: cells.frontier.length };
+  return { info, w, h, base: base_, frontier: frc, high: hic, conf: confc, landmark: lmc, cells, corners, frontierCount: cells.frontier.length };
 }
 
 // --- 座標 ---
@@ -275,6 +293,8 @@ function drawMap() {
     ctx.drawImage(G.base, 0, 0);
     if (S.layers.frontier) ctx.drawImage(G.frontier, 0, 0);
     if (S.layers.high) ctx.drawImage(G.high, 0, 0);
+    if (S.layers.conf && G.conf) ctx.drawImage(G.conf, 0, 0);
+    if (S.layers.landmark && G.landmark) ctx.drawImage(G.landmark, 0, 0);
     ctx.restore();
   }
 

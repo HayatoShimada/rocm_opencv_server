@@ -3,7 +3,7 @@ PYTHON ?= .venv/bin/python
 TEST_JOBS ?= 6
 export MUJOCO_GL ?= egl
 
-.PHONY: train-explore eval-explore phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
+.PHONY: bench-plan phase-train phase-robot phase scale-check prune run-report help test-fast test lint fmt deploy-detector deploy-map status replay home-build sim-live
 
 help:
 	@echo "make test-fast        重いテスト（slow）を飛ばす（20 秒ほど）"
@@ -13,8 +13,7 @@ help:
 	@echo "make deploy-map       地図のサービスを起動し直し、/twin を確かめる"
 	@echo "make status           両方のサーバーの様子"
 	@echo "make replay SESSION=<id>  保存したセッションの最後の 1 歩を GPU なしで決め直す"
-	@echo "make train-explore    作った家で次の 1 歩の選び方を学ぶ（続きから。SIGTERM で止まる）"
-	@echo "make eval-explore     学んだ選び方を、学んでいない家で今の決め方と比べる"
+	@echo "make bench-plan       作った家（白い壁の部屋も）で次の 1 歩の決め方を測る（CPU 3 本）"
 	@echo "make home-build OUT=<置き場> [ARGS=\"<セッション>... --anchor <セッション>\"]  家の地図を作る"
 	@echo "make sim-live [ARGS=\"--room home:3\"]  猫を手で動かすシミュレーター（http://127.0.0.1:8731/sim）"
 
@@ -41,13 +40,9 @@ deploy-map:
 status:
 	$(PYTHON) -m scripts.snoo_dev status
 
-# 学ぶ（data/snoo_policy/ の最後のチェックポイントから続ける）。scripts/snoo_phase.sh robot が
-# pgrep -f scripts.snoo_explore_train で見つけて止めるので、名前を変えない
-train-explore:
-	$(PYTHON) -m scripts.snoo_explore_train $(ARGS)
-
-eval-explore:
-	$(PYTHON) -m scripts.snoo_explore_eval --out out/explore/eval.json --plot out/explore/curve.png $(ARGS)
+# 次の 1 歩の決め方（app/snoo_maneuver.py）を、作った家で測る。GPU は使わない
+bench-plan:
+	$(PYTHON) -m scripts.snoo_plan_bench --workers 3 --out out/bench/plan.json $(ARGS)
 
 phase-train:
 	scripts/snoo_phase.sh train
