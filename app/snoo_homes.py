@@ -17,6 +17,8 @@
 FLOOR（床）・LOW（床から立つ物。車も目もさえぎる。高さ height）・HIGH（天板・座面など下を
 くぐれる物。車は通れて、低いカメラは下の床を見通せる）・CLOSED（家の外・閉まった部屋。
 見えず、数えない）。ラグ（rug）は高さ 1 cm なので床のまま（絵にだけ描く）。
+HIGH の下の端の高さは under に持つ。make_home(low_sofa=True) は、下の端が 10〜18 cm の
+低いソファを 1 つ足す（車の高さ＋余白より低ければ、車は下に入れない。ベンチの --low-sofa）。
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from app.roommap import CAR_RADIUS_M, Grid, Pose
+from app.roommap import CAR_HEIGHT_M, CAR_RADIUS_M, Grid, Pose
 
 FLOOR, LOW, HIGH, CLOSED = 0, 1, 2, 3
 RES_M = 0.05
@@ -48,6 +50,8 @@ AGENT_T_S = 1800.0
 # 人と snoo の大きさ（床に落とした円の半径、高さ）
 PERSON_R_M, PERSON_H_M = 0.20, 1.6
 SNOO_R_M, SNOO_H_M = 0.15, 0.27
+# 低いソファ（make_home(low_sofa=True)）の下の端の高さ（m）の範囲
+LOW_SOFA_Z0_M = (0.10, 0.18)
 # 車の真ん中が入れないセル（app/roommap.blocked_cells と同じく、障害物を車の半径だけ広げる）
 CAR_CELLS = int(math.ceil(CAR_RADIUS_M / RES_M))
 
@@ -113,6 +117,8 @@ class Home:
     footprint_m2: float  # 家の外形の広さ（壁を含む）
     res: float = RES_M
     meta: dict = field(default_factory=dict)
+    # (n, n) float32：HIGH の下の端（m）。HIGH でないセルは inf
+    under: np.ndarray | None = None
 
     @property
     def n(self) -> int:
@@ -130,8 +136,11 @@ class Home:
         return ix, iy
 
     def passable(self) -> np.ndarray:
-        """車が下を通れるセル（床と、下をくぐれる物）。"""
-        return (self.kind == FLOOR) | (self.kind == HIGH)
+        """車が下を通れるセル（床と、下をくぐれる物。下の端が車より低い物はくぐれない）。"""
+        high = self.kind == HIGH
+        if self.under is not None:
+            high &= self.under >= CAR_HEIGHT_M
+        return (self.kind == FLOOR) | high
 
     def reachable_floor(self) -> np.ndarray:
         """出発点から、床（とくぐれる物の下）をたどって行けるセル。調べた割合の分母。"""
@@ -329,18 +338,21 @@ def _legs(name: str, rect, z0: float, leg: float) -> list[Item]:
     return out
 
 
-def make_home(seed: int, agent_t_s: float = AGENT_T_S) -> Home:
+def make_home(seed: int, agent_t_s: float = AGENT_T_S, low_sofa: bool = False) -> Home:
     """くじ seed の家。作れなければ（部屋がつながらないなど）くじを引き直す。
-    同じ seed なら同じ家になる。"""
+    同じ seed なら同じ家になる。low_sofa なら、下の端が 10〜18 cm の低いソファを 1 つ足す
+    （別のくじで置くので、ほかの家具・出発点は low_sofa でないときと同じ）。"""
     for attempt in range(300):
-        home = _try_home(np.random.default_rng([seed, attempt]), seed, agent_t_s)
+        home = _try_home(np.random.default_rng([seed, attempt]), seed, agent_t_s, low_sofa)
         if home is not None:
             home.meta["attempt"] = attempt
             return home
     raise RuntimeError(f"家を作れなかった（seed {seed}）")
 
 
-def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | None:
+def _try_home(
+    rng: np.random.Generator, seed: int, agent_t_s: float, low_sofa: bool = False
+) -> Home | None:
     shape = "L" if rng.random() < 0.4 else "rect"
     a = b = 0.0
     if shape == "L":
@@ -382,6 +394,7 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
 
     kind = np.full((n, n), CLOSED, np.uint8)
     height = np.zeros((n, n), np.float32)
+    under = np.full((n, n), np.inf, np.float32)
     kind[house] = FLOOR
     # 壁：部屋の縁ごとに 10 cm、外は家の外形の内側 10 cm
     wall = np.zeros((n, n), bool)
@@ -512,7 +525,7 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
     rug = np.zeros((n, n), bool)
 
     def try_place(new: list[Item], clearance: float, room: int | None = None) -> bool:
-        trial_k, trial_h = kind.copy(), height.copy()
+        trial_k, trial_h, trial_u = kind.copy(), height.copy(), under.copy()
         for it in new:
             if room is not None and it.layer != "rug":
                 sl = R.idx(it.rect)
@@ -537,9 +550,10 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
             elif it.layer == "high":
                 m = trial_k[sl] == FLOOR
                 trial_k[sl][m] = HIGH
+                trial_u[sl][m] = it.z0
         if not all_doors_connected(trial_k):
             return False
-        kind[:], height[:] = trial_k, trial_h
+        kind[:], height[:], under[:] = trial_k, trial_h, trial_u
         items.extend(new)
         return True
 
@@ -548,18 +562,19 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
         h = WALL_M / 2 + 0.0
         return (x0 + h, y0 + h, x1 - h, y1 - h)
 
-    def wall_spot(r: RoomSpec, w: float, d: float):
+    def wall_spot(r: RoomSpec, w: float, d: float, g: np.random.Generator | None = None):
+        g = rng if g is None else g
         ix0, iy0, ix1, iy1 = interior(r)
-        side = int(rng.integers(4))
+        side = int(g.integers(4))
         if side in (0, 1):  # 南・北の壁ぎわ（幅が x）
             if ix1 - ix0 < w:
                 return None
-            x = _q(_u(rng, ix0, ix1 - w))
+            x = _q(_u(g, ix0, ix1 - w))
             y = iy0 if side == 0 else iy1 - d
             return (x, _q(y), x + w, _q(y) + d)
         if iy1 - iy0 < w:
             return None
-        y = _q(_u(rng, iy0, iy1 - w))
+        y = _q(_u(g, iy0, iy1 - w))
         x = ix0 if side == 2 else ix1 - d
         return (_q(x), y, _q(x) + d, y + w)
 
@@ -655,10 +670,32 @@ def _try_home(rng: np.random.Generator, seed: int, agent_t_s: float) -> Home | N
     ci, cj = spots_a[int(rng.integers(len(spots_a)))]
     sx, sy = origin + (ci + 0.5) * RES_M, origin + (cj + 0.5) * RES_M
     start = Pose(float(sx), float(sy), float(rng.uniform(-math.pi, math.pi)))
+    if low_sofa:
+        # 下の端が 10〜18 cm の低いソファ（別のくじ。ほかの家具・出発点は変えない）。車がくぐれない
+        # 高さなら、車が全部の扉へ行けて、出発点から 0.6 m 離れている所にだけ置く
+        g = np.random.default_rng([seed, 78])
+        z0 = round(float(g.uniform(*LOW_SOFA_Z0_M)), 3)
+        rooms_ok = [r for r in open_rooms if r.kind in ("ldk", "bed", "washitsu")]
+        for _ in range(200 if rooms_ok else 0):
+            r = rooms_ok[int(g.integers(len(rooms_ok)))]
+            spot = wall_spot(r, _q(g.uniform(1.4, 1.8)), _q(g.uniform(0.75, 0.9)), g)
+            if spot is None:
+                continue
+            x0, y0, x1, y1 = spot
+            if math.hypot(min(max(sx, x0), x1) - sx, min(max(sy, y0), y1) - sy) < 0.6:
+                continue
+            before = kind.copy(), height.copy(), under.copy(), len(items)
+            if not try_place(_legs("low_sofa", spot, z0, 0.05), 0.05, rooms.index(r)):
+                continue
+            low = (kind == HIGH) & (under < CAR_HEIGHT_M)
+            if all_doors_connected(np.where(low, LOW, kind).astype(np.uint8)):
+                break
+            kind[:], height[:], under[:] = before[:3]
+            del items[before[3] :]
 
     home = Home(
         seed, origin, kind, height, rug, rooms, items, doors, [], start, shape, footprint,
-        meta={**info, "W": W, "H": H, "notch": notch},
+        meta={**info, "W": W, "H": H, "notch": notch}, under=under,
     )  # fmt: skip
     home.agents = make_agents(home, rng, agent_t_s)
     return home

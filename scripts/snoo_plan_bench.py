@@ -11,7 +11,8 @@ GPU は使わない。家ごとに、ふつうの壁と白い壁（手ざわり�
   （前の版は、その後で下がる 1 歩に替えることがある。数えるのは替える前。今の版の
   「その場で撮り直す」
   （rescan）も unreachable に数える）
-- bumps：家具・壁にぶつかった数。agent_bumps：人・snoo
+- bumps：家具・壁にぶつかった数（--low-sofa なら、くぐれない低いソファの下に入ったのも）。
+  agent_bumps：人・snoo
 - gaps：両脇に車幅 + 6 cm より狭い所を通り抜けた 1 歩の数（本当の家の格子で数える）
 - lost：位置を見失った所の数（撮った所から見えた目印（手ざわりの高い障害物）が少ない。見たものは
   地図に足さない。地図のサーバーの bad_registration と同じ）
@@ -78,7 +79,7 @@ def solid_cells(sim, pose, t) -> np.ndarray:
 
 
 def run_one(args: tuple) -> dict:
-    home_seed, white, planner, budget_s = args
+    home_seed, white, planner, budget_s, low_sofa = (*args, False)[:5]
     os.environ["HIP_VISIBLE_DEVICES"] = ""
     import cv2
 
@@ -93,7 +94,8 @@ def run_one(args: tuple) -> dict:
         import app.snoo_mapper as mapper
 
         mapper.plan_maneuver = functools.partial(mapper.plan_maneuver, mode="hybrid")
-    home = make_home(home_seed, agent_t_s=budget_s + 120)
+    sofa = {"low_sofa": True} if low_sofa else {}
+    home = make_home(home_seed, agent_t_s=budget_s + 120, **sofa)
     tex = texture(home, white)
     kw = {"texture": tex} if "texture" in inspect.signature(gs.GridSim.__init__).parameters else {}
     sim = gs.GridSim(home, **kw)
@@ -193,11 +195,13 @@ def main() -> None:
     ap.add_argument("--minutes", type=float, default=15.0, help="実機の時計で何分まで")
     ap.add_argument("--workers", type=int, default=3, help="同時に回すプロセスの数（4 本まで）")
     ap.add_argument("--planner", default="new", choices=("new", "hybrid"))
+    ap.add_argument("--low-sofa", action="store_true",
+                    help="下の端が 10〜18 cm の低いソファを 1 つ足した家で回す")  # fmt: skip
     ap.add_argument("--label", default=None, help="結果の名前（既定は --planner）")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     label = a.label or a.planner
-    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60)
+    jobs = [(a.seed0 + i, white, a.planner, a.minutes * 60, a.low_sofa)
             for i in range(a.homes) for white in (False, True)]  # fmt: skip
     with mp.get_context("spawn").Pool(min(a.workers, 4)) as pool:
         rows = []
