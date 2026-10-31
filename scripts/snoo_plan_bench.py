@@ -14,7 +14,8 @@ GPU は使わない。家ごとに、ふつうの壁と白い壁（手ざわり�
 - bumps：家具・壁にぶつかった数。agent_bumps：人・snoo
 - gaps：両脇に車幅 + 6 cm より狭い所を通り抜けた 1 歩の数（本当の家の格子で数える）
 - lost：位置を見失った所の数（撮った所から見えた目印（手ざわりの高い障害物）が少ない。見たものは
-  地図に足さない。地図のサーバーの bad_registration と同じ）
+  地図に足さない。地図のサーバーの bad_registration と同じ）。--out の runs[].lost_events に、
+  見失った所ごとの何か所目か・姿勢・見えた目印の数・そこへ来た 1 歩の区切りを残す
 - map_acc：見た所のうち、床・障害物が本当の家と合っている割合。wall_err_cm：障害物と見たセルから
   本当の障害物までの平均の距離
 --planner hybrid は MPPI を使わず Hybrid A* だけにする（比べるため。地図のサーバーは使わない）。
@@ -153,6 +154,18 @@ def run_one(args: tuple) -> dict:
         return result, moved
 
     sim.drive = drive
+    lost_events = []
+    if kw:  # 見失った所の様子（目印の数・直前の 1 歩の形）を残す
+        real_scan = sim.scan
+
+        def scan(*a, **k):
+            before, prev = sim.lost, dict(sim.action)
+            out = real_scan(*a, **k)
+            if sim.lost > before:
+                lost_events.append(lost_event(sim, tex, prev))
+            return out
+
+        sim.scan = scan
     t0 = time.perf_counter()
     ep = sim.run(budget_s)
     cpu = time.perf_counter() - t0
@@ -179,6 +192,28 @@ def run_one(args: tuple) -> dict:
         "map_acc": round(acc, 4), "wall_err_cm": round(wall_err, 2), "distance_m": ep.distance_m,
         "kinds": ep.kinds, "plan_ms_med": round(float(np.median(ms)), 1) if ms else 0.0,
         "plan_ms_max": round(float(np.max(ms)), 1) if ms else 0.0, "cpu_s": round(cpu, 1),
+        "lost_events": lost_events,
+    }  # fmt: skip
+
+
+def lost_event(sim, tex: np.ndarray, prev: dict) -> dict:
+    """見失った所：何か所目か・時刻・姿勢・見えた目印の数と、そこへ来た 1 歩の形。"""
+    from app.snoo_mapper import action_moves
+
+    solid = sim.last_solid
+    solid = solid[(solid >= 0).all(1) & (solid < sim.home.n).all(1)]
+    seen = tex[solid[:, 0], solid[:, 1]] if len(solid) else np.zeros(0)
+    p = sim.pose
+    segs = [
+        {"steer_deg": round(float(s), 1), "cm": round(100 * float(m), 1), "reverse": bool(b)}
+        for s, m, b in (action_moves(prev) if prev.get("action") == "move" else [])
+    ]
+    return {
+        "station": len(sim.stations), "t_s": round(sim.t, 1),
+        "pose": [round(p.x, 2), round(p.y, 2), round(math.degrees(p.yaw), 1)],
+        "landmarks": int((seen >= LANDMARK_TEX).sum()), "solid": int(len(seen)),
+        "prev_kind": prev.get("planner") or prev.get("why") or prev.get("action"),
+        "prev_segments": segs,
     }  # fmt: skip
 
 
