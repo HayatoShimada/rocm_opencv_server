@@ -1,5 +1,5 @@
-"""作った家（app/snoo_homes.py）・速いシミュレーター（app/snoo_gridsim.py）・学んだ選び方
-（app/snoo_explore_policy.py）の試験。どれも GPU も torch も使わない。"""
+"""作った家（app/snoo_homes.py）・速いシミュレーター（app/snoo_gridsim.py）の試験。
+どれも GPU も torch も使わない。学んだ重みの方策は tests/test_snoo_maneuver_policy.py。"""
 
 import cv2
 import numpy as np
