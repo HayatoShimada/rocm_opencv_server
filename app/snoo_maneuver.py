@@ -21,8 +21,9 @@
 コスト（m で数える。小さいほど良い）
 - ぶつかる：使わない（無限大）
 - 走る長さ（後ろは W_REV 倍重い）・前後の切り替えごと W_SWITCH・区切りごと W_SEG
-- 後ろへの区切りの先の縁が、確信度の低い（見ていない・1 回しか見ていない）セルに入る：
-  W_UNK_REV（重い）。合わせて UNSEEN_REV_MAX_M を超えたら使わない（後ろにはセンサーが無い）
+- 後ろへの区切りの先の縁が、見ていないセルに入る・縁の真ん中（走った所の幅）が確信度の低い
+  （1 回しか見ていない）セルに入る：W_UNK_REV（重い）。合わせて UNSEEN_REV_MAX_M を超えたら
+  使わない（後ろにはセンサーが無い）。縁の両端（走っても床にならない幅）は床と見ていればよい
 - 前への区切りの先の縁が見ていないセルに入る：W_UNK_FWD（軽い。Pi の超音波と clear_cm が見る）
 - 前への区切りで、まっすぐに近い（CLEAR_STEER_DEG 以下）のに前の端から CLEAR_STOP_M に障害物が
   入る：Pi が clear で止まるので使わない
@@ -48,6 +49,7 @@ from app.roommap import (
     CAR_FRONT_M,
     CAR_HALF_WIDTH_M,
     CAR_REAR_M,
+    DRIVEN_SHRINK_M,
     FREE,
     HALF_VIEW_DEG,
     MAX_STEP_M,
@@ -187,6 +189,10 @@ def _footprint(margin: float = GAP_MARGIN_M, step: float = 0.025):
 
 
 EDGE_PTS, FRONT_PTS, REAR_PTS = _footprint()
+# 後ろの縁の真ん中（走った所が床になる幅、roommap.mark_driven）。両端と余裕の分は、走っても
+# 確信度が上がらない（来た道をそのまま戻っても、角は 1 回見ただけの床に入る。2026-10-31 の
+# ベンチの 910011 で、前の物に鼻先が付いたまま、どの列も走れなくなった）
+REAR_INNER_PTS = REAR_PTS[np.abs(REAR_PTS[:, 1]) <= CAR_HALF_WIDTH_M - DRIVEN_SHRINK_M + 1e-9]
 
 
 def _body(margin: float, step: float = 0.02) -> np.ndarray:
@@ -252,8 +258,9 @@ class Scene:
         self.occ = occ & ~self.start_cells
         self.touch = occ & self.start_cells
         self.unknown = (st == UNKNOWN) & ~self.start_cells
-        # 後ろへ通ってよくない所：床と分かっていない・確信度が低い
-        self.not_sure = ((st != FREE) | (self.conf < CONF_REVERSE)) & ~self.start_cells
+        # 後ろへ通ってよくない所：縁のどこでも床と分かっていない所、縁の真ん中では確信度が低い所も
+        self.not_floor = (st != FREE) & ~self.start_cells
+        self.not_sure = self.not_floor | ((self.conf < CONF_REVERSE) & ~self.start_cells)
         self.maybe = (st == FREE) & (self.conf > 0.0) & (self.conf < CONF_OK)
         # 障害物のセルの中心までの距離（m）。障害物の面はセルの半分だけ手前にあるとみる
         src = np.where(self.occ, 0, 255).astype(np.uint8)
@@ -433,7 +440,9 @@ class Scene:
             touch_r = self._lookup(self.touch, rx, ry, False).any(-1)
             hit = hit | np.where(back, touch_r, touch_f)
         unk_f = self._lookup(self.unknown, fx, fy, True).any(-1)
-        unk_r = self._lookup(self.not_sure, rx, ry, True).any(-1)
+        unk_r = self._lookup(self.not_floor, rx, ry, True).any(-1)
+        ix_, iy_ = self._world(REAR_INNER_PTS, x, y, yaw)
+        unk_r |= self._lookup(self.not_sure, ix_, iy_, True).any(-1)
         lead = np.where(back, unk_r, unk_f)
         maybe = self._lookup(self.maybe, fx, fy, False).mean(-1) > 0.5
         # 前の端から先の帯（Pi の clear_cm の見込み）

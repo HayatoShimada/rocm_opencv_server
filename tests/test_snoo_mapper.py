@@ -711,3 +711,24 @@ def test_maneuver_and_other_steps_share_one_reply_builder():
     keys = ("steer_deg", "distance_cm", "reverse")
     assert [{k: s[k] for k in keys} for s in a["segments"]] == b["segments"]
     assert a["segments"][0]["min_clear_cm"] == 30.0 and "end_pose" in a["segments"][1]
+
+
+def test_reversing_needs_sure_floor_only_under_the_driven_width():
+    """後ろの縁の真ん中（走った所の幅）は確かな床、両端は床と見ていればよい。来た道を戻るとき、
+    角が 1 回見ただけの床に入っても下がれる（ベンチの 910011 で、前の物に鼻先が付いたまま
+    どの列も走れなくなった）。見ていないセルには、角でも入らない。"""
+    from app.roommap import Pose
+    from app.snoo_maneuver import Limits, moves_ok
+
+    g = _open()
+    g.confidence.miss_free[:] = 0.6  # 1 回見ただけの床（確信度 0.4）
+    ix0, _ = g.cell(-1.0, 0.0)
+    ix1, _ = g.cell(0.1, 0.0)
+    _, iy0 = g.cell(0.0, -0.05)
+    _, iy1 = g.cell(0.0, 0.0499)
+    g.confidence.miss_free[ix0 : ix1 + 1, iy0 : iy1 + 1] = 0.0  # 走ってきた所の真ん中
+    pose = Pose(0.0, 0.0, 0.0)
+    back = [(0.0, 0.15, True)]
+    assert moves_ok(g, pose, back, Limits()) is None
+    g.logodds[g.cell(-0.325, 0.125)] = 0.0  # 後ろの角の先に、見ていないセル
+    assert moves_ok(g, pose, back, Limits()) == "後ろの確かでない所に入る"
