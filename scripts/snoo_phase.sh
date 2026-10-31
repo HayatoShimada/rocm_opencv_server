@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# 学習のターンと、実機で確かめるターンを切り替える（GPU を握るプロセスを 1 つにするため）。
-#   scripts/snoo_phase.sh train   … 検出・地図・SLAM・見張りを止め、GPU を学習だけに使う
-#   scripts/snoo_phase.sh robot   … 学習を止め（チェックポイントを書いてから）、見張りを起こす
+# 手元で GPU を使って比べるターンと、実機で確かめるターンを切り替える（GPU を握るプロセスを 1 つにするため）。
+#   scripts/snoo_phase.sh offline … 検出・地図・SLAM・見張りを止め、GPU を 1 つの比べる仕事
+#                                   （RoMa・単眼の深度・SLAM の流し直しなど）だけに使う
+#   scripts/snoo_phase.sh robot   … 見張りを起こす（比べる仕事が GPU を握っていたら起こさない）
 #   scripts/snoo_phase.sh status  … どちらのターンか・GPU を握っているプロセス
 # RX 7900 XTX は GPU を握ったプロセスが 2 つ以上あると、何もしていなくても 120 W のまま休めない。
+# 学習（PPO の scripts.snoo_explore_train）は #73 で消したので、ここでは止めない。
 set -u
 cd "$(dirname "$0")/.."
 COMPOSE=(docker compose -f compose.yaml -f compose.dev.yaml)
-TRAIN_PATTERN='scripts.snoo_explore_train'
+# 手元で GPU を使う比べる仕事（止めはしない。終わるのを待つか、手で止める）
+OFFLINE_PATTERN='scripts\.snoo_(roma_match|roma_eval|monodepth_eval|slam_replay|pose_bakeoff)'
 
 gpu_holders() {
   # kfd に GPU を開いているプロセス（pid と名前）
@@ -18,36 +21,32 @@ gpu_holders() {
   done
 }
 
-stop_training() {
-  pids=$(pgrep -f "$TRAIN_PATTERN" | grep -v "^$$\$" || true)
-  [ -z "$pids" ] && return 0
-  echo "学習を止める（チェックポイントを書いてから終わる）: $pids"
-  kill -TERM $pids
-  for _ in $(seq 120); do
-    pgrep -f "$TRAIN_PATTERN" | grep -qv "^$$\$" || return 0
-    sleep 1
-  done
-  echo "学習が 120 秒で終わらない。手で確かめる"
-  return 1
+offline_jobs() {
+  pgrep -fa "$OFFLINE_PATTERN" | grep -v -e pgrep -e snoo_phase | cut -c1-100 || true
 }
 
 case "${1:-status}" in
-  train)
+  offline)
     systemctl --user stop snoo-ondemand snoo-slam snoo-map
     "${COMPOSE[@]}" stop snoo >/dev/null 2>&1
-    echo "学習のターン：検出・地図・SLAM・見張りを止めた（画像の API の server は止めない）。GPU を使う学習を始めてよい"
+    echo "比べるターン：検出・地図・SLAM・見張りを止めた（画像の API の server は止めない）。GPU を使う比べる仕事は 1 つずつ"
     ;;
   robot)
-    stop_training || exit 1
+    jobs=$(offline_jobs)
+    if [ -n "$jobs" ]; then
+      echo "比べる仕事が動いている。終わってから（または止めてから）もう一度:"
+      echo "$jobs"
+      exit 1
+    fi
     systemctl --user start snoo-ondemand
     echo "実機のターン：見張りを起こした（Pi が見えたら検出・地図・SLAM を起こす）。make status で確かめる"
     ;;
   status)
-    if systemctl --user is-active -q snoo-ondemand; then echo "実機のターン"; else echo "学習のターン（または全部止めている）"; fi
-    pgrep -fa "$TRAIN_PATTERN" | grep -v pgrep | cut -c1-100 || true
+    if systemctl --user is-active -q snoo-ondemand; then echo "実機のターン"; else echo "比べるターン（または全部止めている）"; fi
+    offline_jobs
     echo "GPU を握っているプロセス:"
     gpu_holders
     ;;
   *)
-    echo "使い方: $0 train|robot|status"; exit 2 ;;
+    echo "使い方: $0 offline|robot|status"; exit 2 ;;
 esac

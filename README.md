@@ -256,6 +256,7 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 | 両方の様子を見る | `make status` | 0.1 秒 |
 | 保存したセッションの最後の 1 歩を GPU なしで決め直す | `make replay SESSION=explore_20261029_223944` | 1 秒 |
 | 作った 30 坪の家（白い壁の部屋も）で、次の 1 歩の決め方を測る | `make bench-plan`（`ARGS="--homes 12"`） | 12 軒 × 2 通りで数分 |
+| GPU を 1 つの比べる仕事に空ける・実機に戻す | `make phase-offline`・`make phase-robot`（今は `make phase`） | 数秒 |
 | 猫を手で動かして、車（探索）の反応をシミュレーターで見る | `make sim-live`（`ARGS="--room home:3"`） | 起動 2 秒。http://127.0.0.1:8731/sim |
 
 - **検出**: `compose.dev.yaml` が `./app` をコンテナに読み取り専用で重ねるので、app/ を直したら作り直さずに起動し直すだけで新しいコードで動く。`make deploy-detector` は、上書きの無いコンテナなら一度だけ作り直し（`docker compose -f compose.yaml -f compose.dev.yaml up -d snoo`）、あとは `restart` して「待ち受け」まで待ち、最初の p50/p95 の行を出す。起動に失敗したら Traceback を出してやめる。torch.compile の準備は torch-compile ボリュームのキャッシュが効く（検出 約 11 秒・clear_cm の深度 約 2.5 秒）。もっと速く試すときは `SNOO_CLEARANCE=0`（約 16 秒）・`SNOO_COMPILE=0`（clear も切って約 9 秒）を付けて `make deploy-detector`（作り直しになる）。pyproject.toml・uv.lock・Dockerfile を変えたときは `docker compose build snoo` が要る（`make deploy-detector` が知らせる）。本番の形（上書きなし）に戻すのは `docker compose up -d snoo`、その後に待つだけなら `.venv/bin/python -m scripts.snoo_dev wait-detector`
@@ -271,7 +272,12 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
   ```
 
   送り元（`SNOO_MAP_ALLOW`）などを変えるときは `~/.config/snoo-map.env` に書いて `make deploy-map`
-- **走っている間の SLAM**: 検出が走っている間のフレームを 4 枚/秒ほど `/run/snoo/slam` に書き（`SNOO_SLAM_TAP_DIR`、app/snoo_slam_tap.py）、ホストの app/snoo_slam.py（VGGT-SLAM 2.0）がステーションと合わせて読み、`<セッション>/slam/` に trajectory.jsonl・points.npz・status.json を書く（形は app/snoo_slam.py の先頭）。torch・gtsam は別の venv にあるので、`deploy/snoo-slam-venv.sh` で作ってから `deploy/snoo-slam.service` を地図と同じやり方で入れる（`systemctl --user enable --now snoo-slam`）。保存したセッションを流し直して poses.json と比べるのは `HSA_CU_MASK=0:0-71 ~/orca/vggt-slam-venv/bin/python -m scripts.snoo_slam_replay <セッションの置き場> --out /tmp/slam`
+- **走っている間の SLAM**（ふだんは止めておく）: 検出が走っている間のフレームを 4 枚/秒ほど `/run/snoo/slam` に書き（`SNOO_SLAM_TAP_DIR`、app/snoo_slam_tap.py）、ホストの app/snoo_slam.py（VGGT-SLAM 2.0）がステーションと合わせて読み、`<セッション>/slam/` に trajectory.jsonl・points.npz・status.json を書く（形は app/snoo_slam.py の先頭）。torch・gtsam は別の venv にあるので、`deploy/snoo-slam-venv.sh` で作ってから `deploy/snoo-slam.service` を地図と同じやり方で入れる（`systemctl --user enable --now snoo-slam`）。保存したセッションを流し直して poses.json と比べるのは `HSA_CU_MASK=0:0-71 ~/orca/vggt-slam-venv/bin/python -m scripts.snoo_slam_replay <セッションの置き場> --out /tmp/slam`
+  GPU を握るプロセスが増えるので、見張り（snoo-ondemand）は SLAM を起こさない。使う日だけ `~/.config/snoo-ondemand.env` に `SNOO_ONDEMAND_SLAM=1` を書くか、`systemctl --user start snoo-slam` で起こす（止めるのは見張りがいつも止める）。ステーションの位置は下の位置のグラフで決めるので、SLAM が無くても探索は動く
+- **位置のグラフ**（既定でオン、`SNOO_POSE_GRAPH=0` で切る）: ステーションの位置を、VGGT の窓の辺と走った 1 歩の辺を重ねたグラフで決め直す（app/snoo_posegraph.py）。窓で位置合わせが崩れても、辺ごと外れ値として外すので、探索を止めない。辺は `<セッション>/graph_edges.jsonl`、位置は graph_poses.json。保存したセッションで 1 か所ずつ流し直すのは scripts/snoo_graph_replay.py
+- **RoMa v2 の辺**（既定でオフ、`SNOO_ROMA_EDGES=1` で入れる）: 前のステーションと、近くに戻ってきた組を RoMa v2 の密な対応に通し、位置のグラフに向きの辺を足す（app/snoo_roma.py）。白い壁で VGGT が外れる所に効くが、GPU が 300 W 近くまで上がるので、組の間に休む（`SNOO_ROMA_REST`、既定 1.0 = 回した時間と同じだけ）。重みは別に clone した src（`SNOO_ROMA_SRC`）から使うときだけ読む。比べるのは別の venv（~/orca/roma-venv）の scripts/snoo_roma_match.py
+- **単眼の深度**（オフラインだけ）: metric の深度のモデルを、床の幾何（カメラの高さ 8 cm と tilt）で比べる（app/snoo_monodepth.py・scripts/snoo_monodepth_eval.py）。検出にも地図にもつないでいない。clear_cm は今のまま（相対の深度を床に合わせる）
+- **GPU の電気の決まり**: RX 7900 XTX は、GPU を握ったプロセスが 2 つ以上あると、何もしていなくても 120 W・使用率 100 % のまま休めない（1 つなら 6 W）。そこで、ずっと握るのは検出だけにし、地図のサーバーと SLAM は使うときだけ VGGT を読み、使わなければ終えて手放す（`SNOO_MAP_GPU_IDLE_S` 120 秒・`SNOO_SLAM_GPU_IDLE_S` 60 秒）。見張りは Pi が 5 分見えなければ全部止める。家のブレーカーが落ちたことがあるので、GPU の重い仕事（RoMa・単眼の深度・SLAM の流し直し）は 1 つずつ、`make phase-offline` で検出・地図・SLAM を止めてから回す。新しい GPU のサービスもこの決まりに合わせる
 - **操縦（teleop）**: 地図のサーバーの `/drive` で、ゲームパッド（左のスティック＝前後とハンドル、右＝首、A＝鳴らす、B＝止める）・キーボード（WASD・矢印・Space）・スマホの指のスティックで車を動かす（app/snoo_teleop.py）。速さは前 15（約 25 cm/s）・後ろ 10 まで、Pi は 0.3 秒新しい指令が来なければ止まる。Pi 側（モード teleop・USR 6 回）の仕様は docs/teleop.md（snoo_trucar でまだ作っていない間は、画面に「Pi：teleop ではない」と出て車は動かない）。**スマホ・別の PC から開くとき**は、その機械の IP（tailscale なら 100.x.y.z）を `~/.config/snoo-map.env` の `SNOO_MAP_ALLOW=` の終わりに `,<IP>` と足して `make deploy-map`。入っていない機械のブラウザには、足し方を書いた 403 の画面が出る
 - **猫を動かすシミュレーター**: `make sim-live` で MuJoCo の部屋（`--room synthetic`・`home:<くじ>`・`session:<セッション>`）を実機の速さで回し、`http://127.0.0.1:8731/sim` の左のスティックで猫を歩かせ、ボタン（1〜5・A・X・Y・LB・RB）で姿勢を変える。車は地図のサーバーと同じ決め方で探り続け、Pi と同じく snoo が 150 cm より近くに見えると止まって見守る（`--near-cm 0` で切る）。手を離して 5 秒で猫は自分で動く（`--fallback behavior|random|none`）。画面には車のカメラ・上から見た地図・3D と、次の 1 歩とその理由が出る。入力の JS は /drive と同じ（app/static/controller/）。別の機械から開くときは `SNOO_SIM_ALLOW`（既定は SNOO_MAP_ALLOW と同じ）
 - **エージェント**: 地図のサーバーの `/v1/snoo/agent/`（app/snoo_agent_api.py）と MCP のサーバー（scripts/snoo_robot_mcp.py）で、Claude Code などがロボットの様子・カメラ・地図を見て、印・困りごとの下書き・声・指令を残す。指令はまだ Pi が実行しない。使い方と Pi 側の仕様は docs/agent_robot.md。声を使うときは地図のサーバーの venv に `uv pip install pyopenjtalk`（main の `.venv` は `uv sync` しない）
@@ -281,12 +287,12 @@ main の置き場（`~/orca/rocm_opencv_server`）で `make` を使う（`make h
 
 ## 実機で探索する日の手順（snoo）
 
-0. **Pi 側の安全の直しを入れる**（まだなら）：snoo_trucar#21 の `review/safety-fixes`
-   （bundle は `~/orca/backups/snoo_trucar_safety_fixes.bundle`）。入れたら、走らせている間に
+0. **Pi 側の版を確かめる**：安全の直し（snoo_trucar#21）は main に入っている。計画器の区切りの列を走るには、
+   meta の supports に `gear_segments` を書く版（snoo_trucar#26 以降）が要る。新しく入れたら、走らせている間に
    `systemctl --user stop snoo-trucar` で車が止まることを一度確かめる
-1. **実機のターンにする**：学習していれば `make phase-robot`（学習を止めてから見張りを起こす）。学習に戻るときは `make phase-train`、今どちらかは `make phase`
-   **サーバーを起こす**：`systemctl --user start snoo-ondemand`（Pi が見えたら、検出・地図・SLAM を起こす）。
-   すぐ全部起こすなら `make deploy-detector && make deploy-map && systemctl --user start snoo-slam`。
+1. **実機のターンにする**：`make phase-robot`（見張りを起こす。GPU を使う比べる仕事が動いていれば起こさない）。比べるターンに戻るときは `make phase-offline`、今どちらかは `make phase`。
+   見張り（snoo-ondemand）は、Pi が見えたら検出と地図のサーバーを起こす（SLAM は `SNOO_ONDEMAND_SLAM=1` のときだけ）。
+   すぐ起こすなら `make deploy-detector && make deploy-map`（SLAM も使う日は `systemctl --user start snoo-slam`）。
    `make status` で、検出の p50/p95 と「今のフレーム」が新しいことを見る
 1.5 **縮尺を確かめる（一度だけ）**：白い A4 を車の 30〜60 cm 前の床に、縁が全部写るように置き、チルト -15° で 1 枚撮る。
    `make scale-check IMAGE=<その画像> TILT=-15` でカメラの高さが出る（今は SD カードで測った 8 cm）。
