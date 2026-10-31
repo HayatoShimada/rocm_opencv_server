@@ -633,3 +633,52 @@ def test_home_map_on_registers_sessions_and_writes_home_json(tmp_path, monkeypat
     assert png.status_code == 200 and png.headers["content-type"] == "image/png"
     plan = c.get("/v1/snoo/map/explore_20261029_203000/plan.json").json()
     assert plan["home"]["registered"] and "home" in plan["timing_s"]
+
+
+def test_blocked_ahead_uses_the_segment_the_old_pi_stopped_in(tmp_path):
+    """古い Pi は返した区切りを全部返す。止まったのは、走った長さ（10 cm）までの最後の区切り
+    （前への 1 つ目）なので、前の先に足す（後ろへの 2 つ目の先ではない）。"""
+    from app.roommap import Grid
+    from app.snoo_map_server import mark_steps_driven
+
+    prev = {"steer_deg": 0.0, "speed": 12, "reverse": False, "est_distance_cm": 10.0,
+            "stop_reason": "clear",
+            "segments": [{"steer_deg": 0.0, "distance_cm": 20.0, "reverse": False},
+                         {"steer_deg": 0.0, "distance_cm": 20.0, "reverse": True}]}  # fmt: skip
+    session, poses = _line(tmp_path, [(0.0, None), (0.10, prev)])
+    g = Grid()
+    mark_steps_driven(g, session, 1, poses)
+    assert g.logodds[g.cell(0.20, 0.0)] > 0  # 止まった所（カメラ x = 0.10）の前の端の先
+
+
+def test_blocked_ahead_expires_after_a_few_stations(tmp_path):
+    from app.roommap import Grid
+    from app.snoo_map_server import BLOCKED_KEEP_STATIONS, mark_steps_driven
+
+    stop = _step(5, False, stop_reason="clear")
+    n = BLOCKED_KEEP_STATIONS + 1
+    steps = [(0.0, None), (0.05, stop)] + [(0.05, None)] * n
+    session, poses = _line(tmp_path, steps)
+    g = Grid()
+    mark_steps_driven(g, session, 1, poses)
+    assert g.logodds[g.cell(0.15, 0.0)] > 0
+    g = Grid()
+    mark_steps_driven(g, session, 1 + BLOCKED_KEEP_STATIONS, poses)
+    assert g.logodds[g.cell(0.15, 0.0)] == 0
+
+
+def test_a_retrace_stops_where_the_reverse_budget_runs_out(tmp_path):
+    """戻る後ろへを 30 cm で切ったら、その先の区切りは足さない（走った道から外れた所から走る）。"""
+    from app.snoo_map_server import retrace_after_bad
+    from app.snoo_mapper import MapParams
+
+    session = tmp_path / "s"
+    segs = [{"steer_deg": 0.0, "distance_cm": 10.0, "reverse": True},
+            {"steer_deg": 20.0, "distance_cm": 35.0, "reverse": False}]  # fmt: skip
+    prev = {"steer_deg": 0.0, "speed": 12.0, "reverse": True, "est_distance_cm": 45.0,
+            "segments": segs, "stop_reason": None}  # fmt: skip
+    _write_meta(session, 1, prev)
+    bad = {"action": "done", "reason": "bad_registration:001"}
+    gear = MapParams(segments=True, reverse=True, gear_segments=True)
+    out = retrace_after_bad(session, 1, bad, "001", gear)
+    assert np.allclose([o[:2] for o in out], [(20.0, 0.30)]) and out[0][2] is True

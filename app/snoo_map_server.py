@@ -109,8 +109,6 @@ from app.snoo_maneuver import MAX_STEER_DEG as MANEUVER_STEER_DEG
 from app.snoo_mapper import (
     MAX_FRAMES,
     RECENT_STATIONS,
-    REVERSE_SPEED,
-    SPEED,
     FrameRef,
     MapParams,
     Observation,
@@ -120,10 +118,12 @@ from app.snoo_mapper import (
     choose_window,
     decide,
     frame_colors,
+    limits,
     load_station,
     load_vggt_model,
     mark_slam,
     mask_cats,
+    moves_action,
     pose_dict,
     registration_is_bad,
     run_vggt,
@@ -1017,7 +1017,7 @@ def take_override(root: Path, session: str, grid, pose: Pose, params: MapParams)
     elif grid is None:
         why = "地図が無い"
     else:
-        why = moves_ok(grid, pose, [(float(steer), float(cm) / 100, back)])
+        why = moves_ok(grid, pose, [(float(steer), float(cm) / 100, back)], limits(params))
     log_path = path.parent / "override_result.jsonl"
     row = {"t": time.time(), "session": session, "override": o, "used": why is None, "why": why}
     with log_path.open("a") as f:
@@ -1093,12 +1093,16 @@ def retrace_after_bad(
     out = [(st, m, not b) for st, m, b in reversed(take_moves(moves, moved)) if m > 1e-3]
     rev, kept = 0.0, []
     for st, m, b in out:
-        if b:
-            m = min(m, REVERSE_MAX_M - rev)
-            rev += m
-        if m <= 1e-3:
+        cut = b and m > REVERSE_MAX_M - rev
+        if cut:
+            m = REVERSE_MAX_M - rev
+        rev += m if b else 0.0
+        if m > 1e-3:
+            kept.append((st, m, b))
+        if cut:
+            # 後ろへを途中で切ったら、そこで終える（その先の区切りは、走った道から外れた所から
+            # 走ることになる）
             break
-        kept.append((st, m, b))
     if not kept or len(kept) > (GEAR_MAX_SEGMENTS if params.gear_segments else MAX_SEGMENTS):
         return None
     if len({b for _, _, b in kept}) > 1 and not params.gear_segments:
@@ -1106,25 +1110,6 @@ def retrace_after_bad(
     if any(b for _, _, b in kept) and not params.reverse:
         return None
     return kept
-
-
-def moves_action(moves: list[tuple[float, float, bool]], params: MapParams) -> dict:
-    """区切りの列だけの 1 歩の返事（planner を通さない：来た道を戻る・エージェントの 1 歩）。"""
-    all_back = all(b for _, _, b in moves)
-    first = moves[0]
-    action = {"action": "move", "steer_deg": round(first[0], 1) + 0.0,
-              "distance_cm": round(first[1] * 100, 1),
-              "speed": REVERSE_SPEED if all_back else SPEED}  # fmt: skip
-    if all_back:
-        action["reverse"] = True
-    if params.gear_segments:
-        action["reverse_speed"] = REVERSE_SPEED
-        action["segments"] = [{"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1),
-                               "reverse": b} for st, m, b in moves]  # fmt: skip
-    elif params.segments:
-        action["segments"] = [{"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1)}
-                              for st, m, _ in moves]  # fmt: skip
-    return action
 
 
 # --- 走った 1 歩（prev_step）を読む ---
@@ -1227,19 +1212,28 @@ def steps_driven(
 def mark_steps_driven(grid, session: Path, station_id: int, poses: dict[int, Pose]) -> None:
     """走ってきた道（車の外形の下）を、セッションの間取りの床にする（roommap.mark_driven）。
     Pi が途中で止めた（clear・stuck）1 歩は、止まった所の先をたぶん障害物にする
-    （roommap.mark_blocked_ahead。足もとは写らないので、そこにある物が地図に入らなかった）。"""
+    （roommap.mark_blocked_ahead。足もとは写らないので、そこにある物が地図に入らなかった）。
+    止まった区切りは、Pi の見積もりの長さまで走った区切りの最後（古い Pi は返した区切りを全部
+    返す）。足すのは直近 BLOCKED_KEEP_STATIONS か所で止まった分だけ（作り直すたびに足すので、
+    前を横切った猫で止まった所が、ずっと障害物に寄ったままにならない）。"""
     for before, moves in steps_driven(session, station_id, poses, fitted_only=True):
         if moves and before in poses:
             mark_driven_moves(grid, poses[before], moves)
     for i in station_ids(session):
-        if i > station_id or i not in poses:
+        if i > station_id or i <= station_id - BLOCKED_KEEP_STATIONS or i not in poses:
             continue
         prev = read_meta(station_dir(session, i)).get("prev_step")
         if isinstance(prev, dict) and prev.get("stop_reason") in ("clear", "stuck"):
             moves = step_moves(prev, sent_back(session, i - 1))
             if moves:
-                st, _, back = moves[-1]
+                moved = pi_distance_m(prev)
+                driven = take_moves(moves, moved) if moved is not None else moves
+                st, _, back = (driven or moves[:1])[-1]
                 mark_blocked_ahead(grid, poses[i], st, back)
+
+
+# Pi が止まった所の先を「たぶん障害物」にするのは、直近のこれだけのステーションで止まった分
+BLOCKED_KEEP_STATIONS = RECENT_STATIONS
 
 
 def recent_poses(session: Path, station_id: int, poses: dict[int, Pose]) -> list[Pose]:

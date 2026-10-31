@@ -544,3 +544,170 @@ def test_no_frontier_is_not_done_while_low_confidence_edges_remain():
     unsure = stop_reason(g, st, MapParams(), [CAM_H])
     if sure == {"action": "done", "reason": "no_frontier"}:
         assert unsure is None
+
+
+def _open(half: float = 1.0):
+    """真ん中の 2 half 四方だけ床と確かに見た格子（まわりは見ていない＝境目）。"""
+    from app.roommap import FREE_HIT, Grid
+    from app.snoo_belief import Confidence
+
+    g = Grid(size_m=6.0)
+    g.confidence = Confidence(g.n)
+    xs = np.arange(-half, half, 0.05) + 0.025
+    X, Y = np.meshgrid(xs, xs)
+    g.logodds[g.cell(X.ravel(), Y.ravel())] = 2 * FREE_HIT
+    sure(g)
+    return g
+
+
+def test_maneuver_ends_follow_the_segments_left_after_a_zero_length_middle_one(monkeypatch):
+    """project が真ん中の区切りを 0 にしても、区切りの終わり（ends・target）は
+    残った区切りのもの。"""
+    import app.snoo_maneuver as mn
+    from app.roommap import Pose, camera_of, drive_moves
+
+    monkeypatch.setattr(mn, "hybrid_astar", lambda *a, **k: None)
+    g = _open()
+    pose = Pose(0.0, 0.0, 0.0)
+    nominal = [(0.0, 0.10, False), (0.0, 0.01, False), (20.0, 0.15, False)]  # 1 cm は走らない
+    man = mn.plan_maneuver(g, pose, mn.Limits(), nominal, mode="hybrid")
+    assert man is not None and len(man.moves) == 2
+    for k in range(2):
+        want = camera_of(drive_moves(pose, man.moves[: k + 1])[-1][1])
+        got = man.ends[k]
+        assert (got.x, got.y, got.yaw) == pytest.approx((want.x, want.y, want.yaw), abs=1e-6)
+
+
+def test_clear_stop_band_reaches_the_distance_the_pi_stops_at():
+    """前の端から 21〜25 cm の障害物でも、Pi は clear（25 cm）で止まるので使わない。"""
+    from app.roommap import OCCUPIED_HIT, Pose, rear_axle
+    from app.snoo_maneuver import CLEAR_STOP_M, Scene
+
+    g = _open()
+    pose = Pose(-0.01, 0.0, 0.0)  # 前の端は x = 0.04。障害物のセルは x 0.25〜0.30
+    for y in np.arange(-0.15, 0.15, 0.05) + 0.025:
+        g.logodds[g.cell(0.275, y)] = OCCUPIED_HIT
+    sure(g)
+    sc = Scene(g, pose)
+    r = rear_axle(pose)
+    x, y, yaw = (np.array([v]) for v in (r.x, r.y, r.yaw))
+    _, _, blocked, _, _ = sc.check(x, y, yaw, np.array([False]), np.array([0.0]))
+    assert 0.25 - 0.04 < CLEAR_STOP_M and blocked[0]
+
+
+def test_frontiers_by_any_old_station_are_not_targets():
+    """撮った所すべて（grid.station_poses）の足もとの境目は、直近の所でなくても行き先にしない。"""
+    from app.roommap import FREE, Pose, frontiers, mark_station
+    from app.snoo_maneuver import Scene
+
+    g = _open()
+    # 前に撮った所 (0.7, 0) の足もとに、見ていない穴（3 x 3 セル）
+    i0, j0 = g.cell(0.775, -0.025)
+    g.logodds[i0 : i0 + 3, j0 : j0 + 3] = 0
+    sure(g)
+    ix, iy = g.cell(0.725, 0.025)  # 穴の縁の床
+    assert frontiers(g.state())[ix, iy] and g.state()[ix, iy] == FREE
+    here = Pose(-0.5, 0.0, 0.0)
+    assert Scene(g, here).targets[ix, iy]  # 覚えていなければ行き先になる
+    mark_station(g, Pose(0.7, 0.0, 0.0))
+    sc = Scene(g, here)
+    assert not sc.targets[ix, iy] and sc.targets.any()  # 外の境目は残る
+
+
+def test_session_grid_remembers_every_station():
+    from app.roommap import Pose
+    from app.snoo_mapper import Observation, session_grid
+
+    e = np.zeros((0, 2))
+    obs = [Observation(e, e, e, Pose(0.1 * i, 0.0, 0.0), None, None) for i in range(3)]
+    g, _ = session_grid(obs)
+    assert [p.x for p in g.station_poses] == pytest.approx([0.0, 0.1, 0.2])
+
+
+def test_decide_is_done_when_the_planner_has_no_target(monkeypatch):
+    """境目が足もとの穴だけ（どこから撮っても写らない）なら、撮り直しを続けずに
+    done no_frontier。"""
+    import app.snoo_mapper as mapper
+    from app.roommap import OCCUPIED_HIT, Pose, big_frontiers
+
+    g = _open(0.5)
+    for v in np.arange(-0.5, 0.5, 0.05) + 0.025:  # まわりは壁
+        for x, y in ((v, -0.525), (v, 0.525), (-0.525, v), (0.525, v)):
+            g.logodds[g.cell(x, y)] = OCCUPIED_HIT
+    i0, j0 = g.cell(0.125, -0.025)  # 足もとの穴（3 x 3 セル）
+    g.logodds[i0 : i0 + 3, j0 : j0 + 3] = 0
+    sure(g)
+    assert big_frontiers(g.state()).any()  # stop_reason はまだ続ける
+    monkeypatch.setattr(mapper, "next_best_view", lambda *a, **k: None)
+    st = [StationResult("000", Pose(0.0, 0.0, 0.0), CAM_H, 0.0, 8)]
+    params = MapParams(segments=True, reverse=True, gear_segments=True)
+    a, man = decide(g, st, params, [CAM_H])
+    assert a == {"action": "done", "reason": "no_frontier"} and man is None
+
+
+def test_decide_builds_the_scene_once_for_both_passes(monkeypatch):
+    import app.snoo_maneuver as mn
+    import app.snoo_mapper as mapper
+    from app.roommap import Pose
+
+    made, seen = [], []
+    real = mn.Scene.__init__
+
+    def init(self, *a, **k):
+        made.append(self)
+        real(self, *a, **k)
+
+    def plan(*a, scene=None, **k):
+        seen.append(scene)
+        return None  # 1 回目も広く探し直しても、走れる列が無い
+
+    monkeypatch.setattr(mn.Scene, "__init__", init)
+    monkeypatch.setattr(mapper, "plan_maneuver", plan)
+    g = _dead_end(1.0)
+    st = [StationResult("000", Pose(0.1, 0.0, 0.0), CAM_H, 0.0, 8)]
+    a, _ = decide(g, st, MapParams(segments=True, reverse=True, gear_segments=True), [CAM_H])
+    assert a.get("rescan") and len(seen) == 2
+    assert len(made) == 1 and seen[0] is seen[1] is made[0]
+
+
+def test_moves_ok_checks_the_same_limits_as_the_planner():
+    from app.roommap import Pose
+    from app.snoo_maneuver import Limits, moves_ok
+
+    g = _open()
+    pose = Pose(0.0, 0.0, 0.0)
+    assert moves_ok(g, pose, [(0.0, 0.25, False)], Limits()) is None
+    assert moves_ok(g, pose, [(0.0, 0.35, False)], Limits()) == "区切りが長すぎる"
+    # ハンドルを大きく切った前へは 20 cm まで（Pi の clear_skip）
+    assert moves_ok(g, pose, [(25.0, 0.25, False)], Limits()) == "区切りが長すぎる"
+    back = [(0.0, 0.10, True)]
+    assert moves_ok(g, pose, back, Limits(reverse=False)) == "この Pi は後ろへ走れない"
+    mixed = [(0.0, 0.10, False), (0.0, 0.10, True)]
+    assert "前と後ろ" in moves_ok(g, pose, mixed, Limits(gears=False))
+    rev = [(0.0, 0.20, True), (0.0, 0.05, False), (0.0, 0.15, True)]
+    assert moves_ok(g, pose, rev, Limits()) == "後ろへの合計が長すぎる"
+    many = [(0.0, 0.05, False)] * 2
+    assert moves_ok(g, pose, many, Limits(max_segments=1)) == "区切りが多すぎる"
+
+
+def test_maneuver_and_other_steps_share_one_reply_builder():
+    from app.roommap import Pose
+    from app.snoo_maneuver import Maneuver
+    from app.snoo_map_server import moves_action as server_moves_action
+    from app.snoo_mapper import maneuver_action, moves_action
+
+    assert server_moves_action is moves_action
+    gear = MapParams(segments=True, reverse=True, gear_segments=True)
+    moves = [(10.0, 0.2, False), (-10.0, 0.1, True)]
+    ends = [Pose(0.2, 0.0, 0.0), Pose(0.1, 0.0, 0.0)]
+    man = Maneuver(moves, 0.0, ends, [30.0, None], True, "mppi")
+    a = maneuver_action(man, Pose(0, 0, 0), gear)
+    b = moves_action(moves, gear)
+    extra = {"pose": a["pose"], "target": a["target"], "planner": "mppi", "gap": True}
+    assert {k: v for k, v in a.items() if k != "segments"} == {
+        **{k: v for k, v in b.items() if k != "segments"},
+        **extra,
+    }
+    keys = ("steer_deg", "distance_cm", "reverse")
+    assert [{k: s[k] for k in keys} for s in a["segments"]] == b["segments"]
+    assert a["segments"][0]["min_clear_cm"] == 30.0 and "end_pose" in a["segments"][1]

@@ -199,8 +199,8 @@ def _body(margin: float, step: float = 0.02) -> np.ndarray:
 
 # 出発した時に外形（と余裕）の下にあったセルを見るための点
 BODY_PTS = _body(GAP_MARGIN_M)
-# 前の端の帯（clear_cm の見込み）：前の端から先、左右と真ん中
-AHEAD_S = np.array([0.05, 0.10, 0.15, 0.20])
+# 前の端の帯（clear_cm の見込み）：前の端から先、Pi が止まる CLEAR_STOP_M まで。左右と真ん中
+AHEAD_S = np.arange(0.05, CLEAR_STOP_M + 1e-9, 0.05)
 AHEAD_Y = np.array([-CAR_HALF_WIDTH_M, 0.0, CAR_HALF_WIDTH_M])
 # 横の余裕を測る、車の真ん中の線の点（後ろの車軸から）
 SIDE_X = np.array([CAR_REAR_M + CAR_HALF_WIDTH_M, CAR_CENTER_M, CAR_FRONT_M - CAR_HALF_WIDTH_M])
@@ -227,7 +227,10 @@ class Scene:
         recent: list[Pose] | None = None,
         wide: bool = False,
         goal: Pose | None = None,
+        state: np.ndarray | None = None,
+        conf: np.ndarray | None = None,
     ):
+        """state・conf は grid.state()・confidence_of の値（もう出してあれば渡す）。"""
         import cv2
 
         t0 = time.perf_counter()
@@ -237,9 +240,9 @@ class Scene:
         self.grid = grid
         self.pose = pose
         self.start = rear_axle(pose)
-        st = grid.state()
+        st = grid.state() if state is None else state
         self.state = st
-        self.conf = confidence_of(grid, st)
+        self.conf = confidence_of(grid, st) if conf is None else conf
         occ = st == OCCUPIED
         # 出発した時に外形（と余裕）の下にあったセル。見ていなくてよい。そこの障害物は
         # 「触れている物」で、進む向きの先の縁（前へなら前の縁、後ろへなら後ろの縁）が入るときだけ
@@ -298,15 +301,10 @@ class Scene:
         g, st = self.grid, self.state
         front = big_frontiers(st)
         # 撮った所のすぐそばの境目は行き先にしない。カメラの足もと（画面の下の端より手前）と車の横は
-        # いつも写らないので、そこに境目が残り、「もう着いている」ことになって小さく回り続けた
-        for p in self.recent + [self.pose]:
-            ix, iy = g.cell(p.x, p.y)
-            r = int(math.ceil(SEEN_NEAR_M / g.res))
-            xs, ys = np.mgrid[-r : r + 1, -r : r + 1]
-            disk = xs**2 + ys**2 <= r * r
-            cx, cy = ix + xs[disk], iy + ys[disk]
-            ok = (cx >= 0) & (cx < g.n) & (cy >= 0) & (cy < g.n)
-            front[cx[ok], cy[ok]] = False
+        # いつも写らないので、そこに境目が残り、「もう着いている」ことになって小さく回り続けた。
+        # 直近の所だけでなく、撮った所すべて（grid.station_poses）。前の所の足もとへ戻らない
+        stations = list(getattr(g, "station_poses", None) or [])
+        front &= ~self._near(self.recent + [self.pose] + stations, SEEN_NEAR_M)
         targets = front.copy()
         offset = np.zeros(st.shape, np.float32)
         if self.goal is not None:
@@ -350,7 +348,6 @@ class Scene:
         rows, cols, wts = [], [], []
         for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
             a = sub[max(0, -dx) : h - max(0, dx), max(0, -dy) : w - max(0, dy)]
-            b = sub[max(0, dx) : h - max(0, -dx) + (h if dx >= 0 else 0), :][: a.shape[0]]
             b = sub[max(0, dx) : max(0, dx) + a.shape[0], max(0, dy) : max(0, dy) + a.shape[1]]
             pa = pas[max(0, -dx) : max(0, -dx) + a.shape[0], max(0, -dy) : max(0, -dy) + a.shape[1]]
             pb = pas[max(0, dx) : max(0, dx) + a.shape[0], max(0, dy) : max(0, dy) + a.shape[1]]
@@ -386,6 +383,22 @@ class Scene:
             e = cv2.distanceTransform(src, cv2.DIST_L2, 5).astype(np.float32) * g.res
             self.D = np.where(np.isfinite(self.D), self.D, e + 1.0)
             self.D_start = float(self.D_at(self.start.x, self.start.y, self.start.yaw))
+
+    def _near(self, poses: list[Pose], radius_m: float) -> np.ndarray:
+        """姿勢（カメラの真下）のどれかから radius_m 以内のセル。"""
+        import cv2
+
+        g = self.grid
+        out = np.zeros((g.n, g.n), np.uint8)
+        if not poses:
+            return out > 0
+        ix, iy = g.cell([p.x for p in poses], [p.y for p in poses])
+        ok = g.inside(ix, iy)
+        out[ix[ok], iy[ok]] = 1
+        r = int(math.ceil(radius_m / g.res))
+        xs, ys = np.mgrid[-r : r + 1, -r : r + 1]
+        disk = (xs**2 + ys**2 <= r * r).astype(np.uint8)
+        return cv2.dilate(out, disk) > 0
 
     def lowconf_edge(self) -> np.ndarray:
         """確信度の低い縁（snoo_belief.unsure_edges）の 0.35 m 以内の、通れる床のセル
@@ -860,16 +873,19 @@ def plan_maneuver(
     budget_s: float = 0.9,
     mode: str = "mppi",
     goal: Pose | None = None,
+    scene: Scene | None = None,
 ) -> Maneuver | None:
     """次の 1 歩（区切りの列）を決める。走れる列が無い・行き先が無ければ None。
 
     名目の列は、nominal（今の決め方 next_best_view の 1 歩）・Hybrid A* の答え・ひな形。MPPI で
     寄せ直した上位の列と合わせて、同じコストに「着いた所から見えるもの」を足して選ぶ。
     mode="hybrid" は MPPI を使わない（ベンチで比べるため）。
+    scene は、同じ格子・姿勢で作った Scene（targets_conf=True）を使い回すとき（広く探し直す）。
     """
     t0 = time.perf_counter()
     lim = lim or Limits()
-    scene = Scene(grid, pose, True, recent, lim.wide, goal)
+    if scene is None:
+        scene = Scene(grid, pose, True, recent, lim.wide, goal)
     if not scene.targets.any():
         return None
     rng = np.random.default_rng(seed)
@@ -895,15 +911,17 @@ def plan_maneuver(
         if not math.isfinite(ro.cost[0]):
             continue
         mv = _moves(s[0], d[0])
+        # 区切りの番号は、0 でない区切りの元の番号（project で真ん中の区切りが 0 になることがある）
+        slots = [i for i, v in enumerate(d[0]) if abs(v) >= SEG_MIN_M]
         end = camera_of(Pose(*map(float, ro.end_rear[0])))
         gain = scene.info(end)
-        scored.append((float(ro.cost[0]) - W_INFO * gain, kind, mv, ro, gain))
+        scored.append((float(ro.cost[0]) - W_INFO * gain, kind, mv, ro, gain, slots))
     if not scored:
         return None
-    total, kind, mv, ro, gain = min(scored, key=lambda c: c[0])
+    total, kind, mv, ro, gain, slots = min(scored, key=lambda c: c[0])
     ends, clears = [], []
     for k, (_, _, back) in enumerate(mv):
-        ends.append(camera_of(Pose(*map(float, ro.seg_end_rear[0, k]))))
+        ends.append(camera_of(Pose(*map(float, ro.seg_end_rear[0, slots[k]]))))
         clears.append(None if back else min_clear_cm(_clear_ahead_cm(scene, k, mv)))
     return Maneuver(
         mv, float(total), ends, clears, bool(ro.gap[0]), kind,
@@ -966,9 +984,16 @@ def _clear_ahead_cm(scene: Scene, k: int, moves) -> float | None:
     return round(best, 1)
 
 
-def moves_ok(grid: Grid, pose: Pose, moves: list[tuple[float, float, bool]]) -> str | None:
-    """区切りの列を、計画と同じ決まりで確かめる。走れれば None、走れなければ理由。
-    （エージェントが予約した 1 歩を確かめる。app/snoo_map_server.take_override）"""
+def moves_ok(
+    grid: Grid, pose: Pose, moves: list[tuple[float, float, bool]], lim: Limits | None = None
+) -> str | None:
+    """区切りの列を、計画と同じ決まり（Pi が走れる形 lim と、地図の上で走れるか）で確かめる。
+    走れれば None、走れなければ理由。（エージェントが予約した 1 歩を確かめる。
+    app/snoo_map_server.take_override）"""
+    lim = lim or Limits()
+    why = shape_error(moves, lim)
+    if why is not None:
+        return why
     scene = Scene(grid, pose, False, None)
     s, d = _pad(moves)
     ro = rollout(scene, s[None], d[None])
@@ -980,3 +1005,28 @@ def moves_ok(grid: Grid, pose: Pose, moves: list[tuple[float, float, bool]]) -> 
     if p["unk_fwd"][0] > UNSEEN_FWD_MAX_M:
         return "前の見ていない所に入る"
     return "車の外形が障害物に当たる・前が近い"
+
+
+def shape_error(moves: list[tuple[float, float, bool]], lim: Limits) -> str | None:
+    """区切りの列が、Pi が走れる形（project が直さずに通す形）か。違えば理由。"""
+    if not moves:
+        return "区切りが無い"
+    if len(moves) > lim.max_segments:
+        return "区切りが多すぎる"
+    if any(b for _, _, b in moves) and not lim.reverse:
+        return "この Pi は後ろへ走れない"
+    if len({b for _, _, b in moves}) > 1 and not lim.gears:
+        return "この Pi は 1 歩の中で前と後ろを変えられない"
+    for st, m, back in moves:
+        if abs(st) > MAX_STEER_DEG + 0.5:
+            return "ハンドルが大きすぎる"
+        cap = SKIP_SEG_MAX_M if (not back and abs(st) > SKIP_STEER_DEG) else SEG_MAX_M
+        if m > cap + 1e-6:
+            return "区切りが長すぎる"
+        if m < SEG_MIN_M:
+            return "区切りが短すぎる"
+    if sum(m for _, m, b in moves if not b) > lim.max_fwd_m + 1e-6:
+        return "前への合計が長すぎる"
+    if sum(m for _, m, b in moves if b) > REVERSE_MAX_M + 1e-6:
+        return "後ろへの合計が長すぎる"
+    return None

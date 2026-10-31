@@ -50,6 +50,7 @@ from app.roommap import (
     mark_blocked_ahead,
     mark_driven,
     mark_sonar,
+    mark_station,
     rear_axle,
 )
 from app.snoo_belief import LANDMARK_TEX, Confidence, Texture
@@ -283,6 +284,7 @@ class GridSim:
         if lost:
             self.lost += 1  # 位置が分からないので、見たものは足さない
         else:
+            mark_station(g, self.pose)
             for cells, v in ((free, FREE_HIT), (occ, OCCUPIED_HIT)):
                 if len(cells):
                     g.logodds[cells[:, 0], cells[:, 1]] += v
