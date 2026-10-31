@@ -141,9 +141,9 @@ def run_one(args: tuple) -> dict:
 
     real_drive = sim.drive
 
-    def drive(steer, speed, distance_m, reverse):
+    def drive(steer, speed, distance_m, reverse, *a, **k):
         r = rear_axle(sim.pose)
-        result, moved = real_drive(steer, speed, distance_m, reverse)
+        result, moved = real_drive(steer, speed, distance_m, reverse, *a, **k)
         x, y, yaw = r.x, r.y, r.yaw
         hit = False
         for _ in range(int(moved / 0.02)):

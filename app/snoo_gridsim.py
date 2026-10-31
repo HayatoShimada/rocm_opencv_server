@@ -13,8 +13,10 @@ MuJoCo の Sim（app/snoo_sim.py）は 1 回の探索に数十秒かかり、何
   app/roommap.mark_sonar で弱い証拠として足す
 - 走る：自転車モデル（app/roommap.arc）で 1 cm ずつ。外形（26 x 19 cm）が LOW・CLOSED の
   セルか人・snoo の円に重なればぶつかった（bump）としてその手前で止める。前へ走るときは、
-  Pi が clear_cm を見て止まるのをまねて、5 cm 先がふさがれば止める（stop）。走った所は
-  app/roommap.mark_driven で床にする
+  Pi が clear_cm を見て止まるのをまねて、まっすぐに近い（CLEAR_STEER_DEG 以下）区切りでは
+  前の端から CLEAR_STOP_M（25 cm。区切りの min_clear_cm があればそれ）の通り道に物があれば
+  止める（stop）。ハンドルを大きく切った区切り（Pi の clear_skip）は 5 cm 先がふさがれば止める。
+  走った所は app/roommap.mark_driven で床にする
 - 決め方：地図のサーバーと同じ（app/snoo_mapper.decide。Sim.think と同じ）。1 歩は前へ・後ろへの
   混じった区切りの列。chooser を渡せば差し替えられる
 - 確信度と手ざわり（app/snoo_belief.py）の層も、地図のサーバーと同じに足す。家に手ざわり
@@ -55,6 +57,7 @@ from app.roommap import (
 )
 from app.snoo_belief import LANDMARK_TEX, Confidence, Texture
 from app.snoo_homes import CLOSED, LOW, Home
+from app.snoo_maneuver import CLEAR_STEER_DEG, CLEAR_STOP_M
 from app.snoo_mapper import (
     RECENT_STATIONS,
     REVERSE_SPEED,
@@ -330,17 +333,48 @@ class GridSim:
                 return "agent"
         return None
 
+    def _clear_blocked(
+        self, x: float, y: float, yaw: float, steer: float, t: float, clear_m: float
+    ) -> bool:
+        """後ろの車軸が (x, y, yaw) の車の前の端から、同じハンドルで clear_m 先までの通り道
+        （左右の端と真ん中）に物（LOW・CLOSED・人・snoo）があるか。Pi の clear_cm の代わり。"""
+        h = self.home
+        lat = np.array([-CAR_HALF_W_M, 0.0, CAR_HALF_W_M])
+        agents = self.agents_at(t)
+        for s in np.arange(0.0, clear_m + 1e-9, h.res / 2):
+            ax, ay, ayaw = arc(x, y, yaw, steer, float(s))
+            c, sn = math.cos(ayaw), math.sin(ayaw)
+            px = ax + CAR_FRONT_M * c - lat * sn
+            py = ay + CAR_FRONT_M * sn + lat * c
+            ix, iy = h.cell(px, py)
+            inside = (ix >= 0) & (ix < h.n) & (iy >= 0) & (iy < h.n)
+            if not inside.all() or self.car_block[ix, iy].any():
+                return True
+            for bx, by, r, _ in agents:
+                if (((px - bx) ** 2 + (py - by) ** 2) <= r * r).any():
+                    return True
+        return False
+
     def drive(
-        self, steer_deg: float, speed: float, distance_m: float, reverse: bool
+        self,
+        steer_deg: float,
+        speed: float,
+        distance_m: float,
+        reverse: bool,
+        min_clear_m: float | None = None,
     ) -> tuple[str, float]:
-        """Pi と同じ指令で走る（app/snoo_sim.Sim.drive と同じ止まり方）。
-        ('ok'・'stop'・'bump', 走った m)。"""
+        """Pi と同じ指令で走る。('ok'・'stop'・'bump', 走った m)。
+        前へ走るとき、まっすぐに近ければ前の端から max(CLEAR_STOP_M, min_clear_m) の通り道に物が
+        入れば止める（Pi の clear_cm）。ハンドルを大きく切っていれば 5 cm 先で止める。"""
         r = rear_axle(self.pose)
         x, y, yaw = r.x, r.y, r.yaw
         steer = max(-30.0, min(30.0, steer_deg))
         v = max(speed, 1.0) * SPEED_M_S
         sign = -1.0 if reverse else 1.0
         done, result = 0.0, "ok"
+        clear_m = None
+        if not reverse and abs(steer) <= CLEAR_STEER_DEG:
+            clear_m = max(CLEAR_STOP_M, min_clear_m or 0.0)
         while done < distance_m - 1e-9:
             ds = min(0.01, distance_m - done)
             self.pose_now = Pose(x + CAM_X_M * math.cos(yaw), y + CAM_X_M * math.sin(yaw), yaw)
@@ -359,7 +393,10 @@ class GridSim:
             self.t += ds / v
             if not reverse and done < distance_m - 1e-9:
                 ax, ay, ayaw = arc(x, y, yaw, steer, STOP_CLEAR_M)
-                if self._hits(ax, ay, ayaw, self.t, wide=True):
+                stop = self._hits(ax, ay, ayaw, self.t, wide=True)
+                if not stop and clear_m is not None:
+                    stop = self._clear_blocked(x, y, yaw, steer, self.t, clear_m)
+                if stop:
                     result = "stop"
                     self.stops += 1
                     break
@@ -410,9 +447,12 @@ class GridSim:
         """返事の区切りを順に走る。前へ止まった・ぶつかったら、そこで 1 歩を終える。"""
         fwd = float(action.get("speed", SPEED))
         back_speed = float(action.get("reverse_speed", REVERSE_SPEED))
-        for steer, m, back in action_moves(action):
+        segs = action.get("segments") or [action]
+        for i, (steer, m, back) in enumerate(action_moves(action)):
             start = self.pose
-            result, moved = self.drive(steer, back_speed if back else fwd, m, back)
+            clear = segs[i].get("min_clear_cm") if i < len(segs) else None
+            clear_m = float(clear) / 100 if clear is not None else None
+            result, moved = self.drive(steer, back_speed if back else fwd, m, back, clear_m)
             if moved > 1e-6:
                 mark_driven(self.grid, start, [(steer, moved)], back)
             if result != "ok":

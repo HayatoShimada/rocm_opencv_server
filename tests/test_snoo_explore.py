@@ -137,11 +137,22 @@ def test_low_cable_hides_only_a_little_and_a_table_top_hides_nothing():
 def test_drive_stops_before_a_wall_and_bumps_when_reversing_into_a_box():
     box = ((-0.6, -0.3, -0.4, 0.3), LOW, 0.3)
     sim = GridSim(_room([box]), agents=False)
-    # 前の壁は x = 4.9 から。車の前の端はカメラの 5 cm 先、Pi は 5 cm 手前で止まる
+    # 前の壁は x = 4.9 から。車の前の端はカメラの 5 cm 先。まっすぐなら Pi は clear で 25 cm
+    # 手前で止まる
     sim.pose = Pose(3.5, 0.0, 0.0)
     result, moved = sim.drive(0.0, 12, 2.0, reverse=False)
     assert result == "stop" and sim.bumps == 0
-    assert moved == pytest.approx(4.9 - 3.55 - 0.05, abs=0.04)
+    assert moved == pytest.approx(4.9 - 3.55 - 0.25, abs=0.04)
+    # min_clear_cm（区切りの clear の下限）があれば、それだけ手前で止まる
+    sim.pose = Pose(3.5, 0.0, 0.0)
+    result, moved = sim.drive(0.0, 12, 2.0, reverse=False, min_clear_m=0.35)
+    assert result == "stop" and moved == pytest.approx(4.9 - 3.55 - 0.35, abs=0.04)
+    # ハンドルを大きく切ると clear は画角の外（clear_skip）。25 cm 手前では止まらない
+    sim.pose = Pose(4.3, 0.0, 0.0)
+    _, straight = sim.drive(0.0, 12, 0.6, reverse=False)
+    sim.pose = Pose(4.3, 0.0, 0.0)
+    _, turned = sim.drive(20.0, 12, 0.6, reverse=False)
+    assert straight == pytest.approx(4.9 - 4.35 - 0.25, abs=0.04) and turned > straight + 0.1
     sim.pose = Pose(0.0, 0.0, 0.0)
     result, moved = sim.drive(0.0, 8, 0.5, reverse=True)
     assert result == "bump" and sim.bumps == 1
