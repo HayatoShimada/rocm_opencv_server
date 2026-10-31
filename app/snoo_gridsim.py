@@ -133,6 +133,57 @@ class Episode:
         return max([c for t, c, _ in self.timeline if t <= t_s] or [0.0])
 
 
+class SneakSnoo:
+    """車の後ろへ回り込む snoo（ベンチの筋書き。GridSim(snoo="sneak")）。
+
+    車が止まって撮るたびに（on_scan）、カメラの前 SNEAK_FRONT_M に出て撮られ、撮り終わると、
+    車の後ろの縁の SNEAK_GAP_M 後ろへ SNEAK_SPEED_M_S で歩いて、そこに座る。車は後ろに
+    センサーが無いので、計画器が見た所を覚えていなければ、下がって当たる。
+    出る所が床でなければ、その所には出ない。座る所が床でなければ、前に居たまま。
+    """
+
+    name = "snoo"
+
+    def __init__(self, home: Home):
+        from app.snoo_homes import SNOO_H_M, SNOO_R_M, agent_ok
+
+        self.home, self.radius, self.height = home, SNOO_R_M, SNOO_H_M
+        self.ok = agent_ok(home, SNOO_R_M, "snoo")
+        self.park = (home.origin, home.origin)  # 出ていない間（家の外の角）
+        self.path: tuple[float, tuple[float, float], tuple[float, float] | None] | None = None
+
+    def _free(self, x: float, y: float) -> bool:
+        ix, iy = self.home.cell(x, y)
+        return 0 <= ix < self.home.n and 0 <= iy < self.home.n and bool(self.ok[ix, iy])
+
+    def on_scan(self, camera: Pose, t: float, show_s: float) -> None:
+        """車が camera で撮り始めた。前に出て、show_s 後から後ろへ歩く。"""
+        c, s = math.cos(camera.yaw), math.sin(camera.yaw)
+        front = (camera.x + SNEAK_FRONT_M * c, camera.y + SNEAK_FRONT_M * s)
+        if not self._free(*front):
+            self.path = None
+            return
+        back_m = CAM_X_M - CAR_REAR_M + SNEAK_GAP_M + self.radius
+        behind = (camera.x - back_m * c, camera.y - back_m * s)
+        self.path = (t + show_s, front, behind if self._free(*behind) else None)
+
+    def at(self, t: float) -> tuple[float, float]:
+        if self.path is None:
+            return self.park
+        t_walk, front, behind = self.path
+        if behind is None or t <= t_walk:
+            return front
+        d = math.hypot(behind[0] - front[0], behind[1] - front[1])
+        k = min(1.0, (t - t_walk) * SNEAK_SPEED_M_S / max(d, 1e-9))
+        return (front[0] + k * (behind[0] - front[0]), front[1] + k * (behind[1] - front[1]))
+
+
+# 回り込む snoo：カメラの前に出る距離・歩く速さ・車の後ろの縁からの間
+SNEAK_FRONT_M = 0.7
+SNEAK_SPEED_M_S = 0.3
+SNEAK_GAP_M = 0.08
+
+
 class GridSim:
     """家（Home）・車・作っている地図をまとめて持つ。"""
 
@@ -165,6 +216,8 @@ class GridSim:
                 behavior_snoo(home, a.at(0.0), home.seed + 7) if a.name == "snoo" else a
                 for a in self.agents
             ]
+        elif agents and snoo == "sneak":
+            self.agents = [a for a in self.agents if a.name != "snoo"] + [SneakSnoo(home)]
         elif snoo not in ("random", "behavior"):
             raise ValueError(f"snoo の種類が分からない: {snoo}")
         self.grid: Grid = home.grid()
@@ -279,6 +332,29 @@ class GridSim:
         self.last_solid = out[2]
         return out[0], out[1]
 
+    def seen_agents(self, pose: Pose, t: float) -> list[tuple[float, float]]:
+        """pose で首を振って撮ったときに見える人・snoo の位置（見える範囲・向きの中で、手前に
+        壁やカメラより高い物が無いもの）。"""
+        h, out = self.home, []
+        half = math.radians(self.pace.half_view_deg)
+        for ax, ay, r, _ in self.agents_at(t):
+            d = math.hypot(ax - pose.x, ay - pose.y)
+            a = math.atan2(ay - pose.y, ax - pose.x) - pose.yaw
+            a = (a + math.pi) % (2 * math.pi) - math.pi
+            if d > self.view_m or abs(a) > half:
+                continue
+            s = np.arange(h.res / 2, max(d - r, 0.0), h.res / 2)
+            ix, iy = h.cell(
+                pose.x + s * math.cos(pose.yaw + a), pose.y + s * math.sin(pose.yaw + a)
+            )
+            inside = (ix >= 0) & (ix < h.n) & (iy >= 0) & (iy < h.n)
+            cx, cy = np.clip(ix, 0, h.n - 1), np.clip(iy, 0, h.n - 1)
+            kind, height = h.kind[cx, cy], h.height[cx, cy]
+            wall = ~inside | (kind == CLOSED) | ((kind == LOW) & (height >= CAM_H_M))
+            if not wall.any():
+                out.append((ax, ay))
+        return out
+
     def sonar(self, pose: Pose, t: float) -> float | None:
         """前の超音波の読み（m）。SONAR_H_M より高い物（と家の外）までのいちばん近い距離。"""
         c, s = math.cos(pose.yaw), math.sin(pose.yaw)
@@ -297,6 +373,9 @@ class GridSim:
 
     def scan(self) -> StationResult:
         """止まって首を振って撮り、地図に足す（地図のサーバーと同じ足し方）。"""
+        for a in self.agents:  # 撮り始めに動く物（回り込む snoo）
+            if hasattr(a, "on_scan"):
+                a.on_scan(self.pose, self.t, self.pace.scan_s)
         t_mid = self.t + self.pace.scan_s / 2
         free, occ = self.observe(self.pose, t_mid)
         g = self.grid
@@ -306,6 +385,9 @@ class GridSim:
         if self.texture is not None and self.stations:  # 最初の所は原点なので見失わない
             seen = self.texture[solid[:, 0], solid[:, 1]] if len(solid) else np.zeros(0)
             lost = int((seen >= LANDMARK_TEX).sum()) < LOST_MIN_LANDMARKS
+        # 見えた人・snoo（地図のサーバーは検出の箱の足もとを床に当てる）。見失ったときも足す
+        # （サーバーも今のステーションの分は、位置合わせによらず足す）
+        g.cats.extend((x, y, t_mid) for x, y in self.seen_agents(self.pose, t_mid))
         if lost:
             self.lost += 1  # 位置が分からないので、見たものは足さない
         else:
@@ -314,7 +396,7 @@ class GridSim:
                 if len(cells):
                     g.logodds[cells[:, 0], cells[:, 1]] += v
                     np.clip(g.logodds, -4, 4, out=g.logodds)
-            g.confidence.add_cells(g, free, occ, self.pose)
+            g.confidence.add_cells(g, free, occ, self.pose, t=t_mid)
             if self.texture is not None and len(solid):
                 # 手ざわりの層は、見えた壁・家具の手ざわり（地図の点の色の勾配の代わり）
                 x, y = g.center(solid[:, 0], solid[:, 1])
@@ -437,6 +519,7 @@ class GridSim:
         heights = [CAM_H_M] * len(self.stations)
         params = dataclasses.replace(self.params, seed=len(self.stations) - 1)
         recent = [s.pose for s in self.stations[-RECENT_STATIONS:]]
+        self.grid.now_s = self.t
         action, _ = decide(self.grid, self.stations, params, heights, recent=recent)
         return action
 
@@ -478,7 +561,7 @@ class GridSim:
             clear_m = float(clear) / 100 if clear is not None else None
             result, moved = self.drive(steer, back_speed if back else fwd, m, back, clear_m)
             if moved > 1e-6:
-                mark_driven(self.grid, start, [(steer, moved)], back)
+                mark_driven(self.grid, start, [(steer, moved)], back, self.t)
             if result != "ok":
                 # 止まった・ぶつかった所の先は、たぶん障害物（地図のサーバーも prev_step から足す）
                 mark_blocked_ahead(self.grid, self.pose, steer, back)

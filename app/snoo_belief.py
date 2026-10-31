@@ -8,6 +8,8 @@
   少ないほうの分だけ下げる（見え方が食い違っている）
 - VGGT の確からしさ（conf）があれば p に掛ける（無ければ 1）
 - 車が走った所（mark_driven）は 1（車がそこに居た）
+- セルごとに最後に見た（走った）時刻も持つ（seen_t）。後ろへ下がるときは、確信度を時間で下げて
+  見る（reverse_value。見ていない間に snoo が来ているかもしれない）
 - 「調べ終えた」（done no_frontier）は、境目が無いだけでなく、確信度の低い縁が少ないときだけにする
   （app/snoo_mapper.stop_reason。gear_segments の決め方のとき）
 
@@ -22,6 +24,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import cv2
 import numpy as np
@@ -42,6 +45,10 @@ SONAR_AGREE = 0.2
 SONAR_CONFLICT_CAP = 0.4
 # 目印とみなす手ざわり（0〜1）
 LANDMARK_TEX = 0.35
+# 後ろへ下がるときの確信度の半減期（秒）。走った所（1）は 88 秒、2 回見た床（0.8 前後）は
+# 50 秒ほどで、下がってよい確信度（app/snoo_maneuver.CONF_REVERSE 0.6）を切る
+# SNOO_REVERSE_HALF_LIFE_S で変える（0 で下げない）
+CONF_HALF_LIFE_S = float(os.getenv("SNOO_REVERSE_HALF_LIFE_S", "120"))
 # 勾配の強さをこの値で割って 0〜1 にする（Sobel の大きさの 7x7 の平均。白い壁は 5 前後、
 # 本棚・物の多い所は 30 を超える）
 TEX_GRAD_SCALE = 30.0
@@ -54,10 +61,18 @@ class Confidence:
         self.miss_free = np.ones((n, n), np.float32)
         self.miss_occ = np.ones((n, n), np.float32)
         self.driven = np.zeros((n, n), bool)
+        # 最後に見た・走った時刻（秒。時計は呼ぶ側のもの）。見ていない・時刻の無いものは -inf
+        # （reverse_value は時刻の無いセルを下げない）
+        self.seen_t = np.full((n, n), -np.inf)
 
-    def add(self, grid, free_xy: np.ndarray, occ_xy: np.ndarray, pose, conf=None) -> None:
+    def stamp(self, cells: np.ndarray, t: float | None) -> None:
+        if t is not None and len(cells):
+            ix, iy = cells[:, 0], cells[:, 1]
+            self.seen_t[ix, iy] = np.maximum(self.seen_t[ix, iy], t)
+
+    def add(self, grid, free_xy: np.ndarray, occ_xy: np.ndarray, pose, conf=None, t=None) -> None:
         """1 回の撮影で床・障害物と見えたセル（中心の座標 (K, 2)）を足す。pose は撮った所。
-        conf は障害物・床それぞれの VGGT の確からしさ（0〜1、(K,)）か None。"""
+        conf は障害物・床それぞれの VGGT の確からしさ（0〜1、(K,)）か None。t は撮った時刻。"""
         for xy, miss in ((free_xy, self.miss_free), (occ_xy, self.miss_occ)):
             if xy is None or not len(xy):
                 continue
@@ -76,8 +91,9 @@ class Confidence:
             _, first = np.unique(cells, axis=0, return_index=True)
             cells, pv = cells[first], pv[first]
             miss[cells[:, 0], cells[:, 1]] *= (1.0 - pv).astype(np.float32)
+            self.stamp(cells, t)
 
-    def add_cells(self, grid, free_cells: np.ndarray, occ_cells: np.ndarray, pose) -> None:
+    def add_cells(self, grid, free_cells: np.ndarray, occ_cells: np.ndarray, pose, t=None) -> None:
         """セルの番号 (K, 2)（[ix, iy]）で足す（シミュレーター）。"""
         out = []
         for c in (free_cells, occ_cells):
@@ -86,7 +102,7 @@ class Confidence:
                 continue
             x, y = grid.center(c[:, 0], c[:, 1])
             out.append(np.stack([x, y], 1))
-        self.add(grid, out[0], out[1], pose)
+        self.add(grid, out[0], out[1], pose, t=t)
 
     def add_sonar(self, grid, camera, distance_m) -> None:
         """超音波の読み（地図の弱い証拠）。カメラが障害物と見たセルと合えば確信度を少し上げ、
@@ -105,9 +121,10 @@ class Confidence:
             self.miss_free[free[:, 0], free[:, 1]], 1.0 - SONAR_CONFLICT_CAP
         )
 
-    def mark_driven(self, cells: np.ndarray) -> None:
+    def mark_driven(self, cells: np.ndarray, t: float | None = None) -> None:
         if len(cells):
             self.driven[cells[:, 0], cells[:, 1]] = True
+            self.stamp(cells, t)
 
     def value(self, state: np.ndarray) -> np.ndarray:
         """いまの床・障害物の見え方の確信度（0〜1）。見ていないセルは 0。"""
@@ -121,6 +138,18 @@ class Confidence:
         out[o] = c_occ[o] * (1.0 - 0.5 * c_free[o])
         out[self.driven & f] = DRIVEN_CONF
         return out
+
+
+def reverse_value(grid, conf: np.ndarray, now: float | None) -> np.ndarray:
+    """後ろへ下がるときに見る確信度：conf を、最後に見た・走った時から CONF_HALF_LIFE_S で
+    半分になるよう下げる。now が無ければそのまま。時刻の無いセル（前の版の obs.npz・時刻を
+    渡さずに足したもの）も下げない。"""
+    c = getattr(grid, "confidence", None)
+    if now is None or c is None or CONF_HALF_LIFE_S <= 0:
+        return conf
+    known = np.isfinite(c.seen_t)
+    age = np.where(known, np.maximum(now - np.where(known, c.seen_t, now), 0.0), 0.0)
+    return (conf * np.power(0.5, age / CONF_HALF_LIFE_S)).astype(np.float32)
 
 
 def fallback_confidence(grid, state: np.ndarray) -> np.ndarray:

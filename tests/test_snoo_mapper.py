@@ -780,3 +780,85 @@ def test_sim_low_sofa_blocks_the_car_and_looks_like_an_obstacle():
     sim = GridSim(home, agents=False)
     assert bool(sim.car_block[ix, iy]) == (sofa.z0 < CAR_HEIGHT_M)
     assert home.passable()[ix, iy] == (sofa.z0 >= CAR_HEIGHT_M)
+
+
+def test_no_reversing_onto_floor_not_seen_for_a_while():
+    """後ろへ下がるときの確信度は、見てからの時間で下がる（見ていない間に snoo が来ているかも）。
+    同じ確かな床でも、長く見ていなければ下がらない。時刻の無い格子（前の版）は今までどおり。"""
+    from app.roommap import Pose
+    from app.snoo_belief import CONF_HALF_LIFE_S
+    from app.snoo_maneuver import Limits, moves_ok
+
+    g = _open()
+    pose, back = Pose(0.0, 0.0, 0.0), [(0.0, 0.15, True)]
+    assert moves_ok(g, pose, back, Limits()) is None
+    g.confidence.seen_t[:] = 100.0
+    g.now_s = 110.0
+    assert moves_ok(g, pose, back, Limits()) is None
+    g.now_s = 100.0 + 2 * CONF_HALF_LIFE_S  # 確信度は 1/4
+    assert moves_ok(g, pose, back, Limits()) == "後ろの確かでない所に入る"
+
+
+def test_no_reversing_near_where_snoo_was_seen_recently():
+    """snoo を最近（CAT_RECENT_S 秒以内）見たなら、そばに居たら後ろへは走らない（見た後に
+    後ろへ回り込んでいるかもしれない）。離れていれば、見た所のそばへだけ下がらない。"""
+    from app.roommap import Pose
+    from app.snoo_maneuver import CAT_NEAR_M, CAT_RECENT_S, Limits, moves_ok
+
+    g = _open()
+    pose, back, fwd = Pose(0.0, 0.0, 0.0), [(0.0, 0.15, True)], [(0.0, 0.15, False)]
+    g.now_s = 1000.0
+    g.cats = [(0.6, 0.0, 995.0)]  # 前 60 cm に居た
+    assert moves_ok(g, pose, back, Limits()) is not None
+    assert moves_ok(g, pose, fwd, Limits()) is None
+    g.cats = [(0.6, 0.0, 1000.0 - CAT_RECENT_S - 1)]  # 見たのは前のこと
+    assert moves_ok(g, pose, back, Limits()) is None
+    g.cats = [(-0.3 - CAT_NEAR_M, 0.0, 995.0)]  # 後ろの離れた所：下がる先の縁が近づく
+    assert moves_ok(g, pose, back, Limits()) is not None
+    g.cats = [(0.0, 0.5 + CAT_NEAR_M, 995.0)]  # 横の遠い所
+    assert moves_ok(g, pose, back, Limits()) is None
+
+
+def test_sneaking_snoo_is_seen_in_front_then_sits_behind_the_car():
+    """ベンチの筋書き（--snoo sneak）：撮るたびに前に出て見え、撮り終わると後ろへ回り込む。
+    見えた所は grid.cats に入る。"""
+    from app.roommap import CAR_REAR_M, rear_axle
+    from app.snoo_gridsim import GridSim, SneakSnoo
+    from app.snoo_homes import make_home
+
+    sim = GridSim(make_home(910_000, agent_t_s=60), snoo="sneak")
+    cat = next(a for a in sim.agents if isinstance(a, SneakSnoo))
+    sim.scan()
+    assert cat.path is not None and sim.grid.cats
+    x, y, t = sim.grid.cats[-1]
+    p = sim.pose
+    assert math.hypot(x - p.x, y - p.y) == pytest.approx(0.7, abs=0.01)
+    bx, by = cat.at(sim.t + 30.0)
+    r = rear_axle(p)
+    behind = (bx - r.x) * math.cos(p.yaw) + (by - r.y) * math.sin(p.yaw)
+    if cat.path[2] is not None:
+        assert behind < CAR_REAR_M - cat.radius
+
+
+def test_observation_keeps_time_and_cats_and_moves_them_with_the_pose(tmp_path):
+    """obs.npz に撮った時刻と見えた人・snoo を残し、位置のグラフで置き直すと一緒に動く。
+    session_grid は時刻を確信度の層に付け、見えた所を grid.cats に足す。"""
+    from app.roommap import Pose
+    from app.snoo_mapper import Observation, session_grid
+    from app.snoo_posegraph import replace_observation
+
+    e = np.zeros((0, 2))
+    o = Observation(np.array([[0.5, 0.0]]), e, e, Pose(0, 0, 0), None, None, 12.0,
+                    np.array([[0.6, 0.0, 11.5]]))  # fmt: skip
+    o.save(tmp_path / "obs.npz")
+    back = Observation.load(tmp_path / "obs.npz")
+    assert back.t_s == 12.0 and back.cats.tolist() == [[0.6, 0.0, 11.5]]
+    moved = replace_observation(back, Pose(1.0, 0.0, math.pi / 2))
+    assert moved.t_s == 12.0
+    assert moved.cats[0] == pytest.approx([1.0, 0.6, 11.5])
+    g, _ = session_grid([moved])
+    assert g.cats == [pytest.approx((1.0, 0.6, 11.5))]
+    assert g.confidence.seen_t.max() == 12.0
+    old = Observation(np.array([[0.5, 0.0]]), e, e, Pose(0, 0, 0))
+    old.save(tmp_path / "old.npz")
+    assert Observation.load(tmp_path / "old.npz").cats is None

@@ -578,10 +578,18 @@ class Observation:
     # 障害物と「上」の層のセルの手ざわり (K, 3)：[x, y, 0〜1]（app/snoo_belief.Texture）。
     # 前の版の obs.npz には無い（None）
     texture: np.ndarray | None = None
+    # 撮った時刻（秒。Pi の時計）と、見えた人・snoo の足もと (K, 3)：[x, y, 見た時刻]。
+    # 後ろへ下がる区切りを決めるのに使う（app/snoo_maneuver.Scene）。前の版の obs.npz には無い
+    t_s: float | None = None
+    cats: np.ndarray | None = None
 
     def save(self, path: Path) -> None:
         p = self.pose
         extra = {} if self.texture is None else {"texture": self.texture.astype(np.float32)}
+        if self.t_s is not None:
+            extra["t_s"] = np.array(self.t_s)
+        if self.cats is not None:
+            extra["cats"] = np.asarray(self.cats, np.float64).reshape(-1, 3)
         np.savez(
             path,
             free=self.free.astype(np.float32),
@@ -600,6 +608,8 @@ class Observation:
             d["free"], d["occupied"], d["high"], Pose(*map(float, d["pose"])),
             None if math.isnan(sonar) else sonar,
             d["texture"] if "texture" in d.files else None,
+            float(d["t_s"]) if "t_s" in d.files else None,
+            d["cats"] if "cats" in d.files else None,
         )  # fmt: skip
 
 
@@ -616,15 +626,18 @@ def session_grid(observations: list[Observation]) -> tuple[Grid, np.ndarray]:
 
 
 def add_observation(grid: Grid, high: np.ndarray, o: Observation) -> None:
-    """1 ステーションで見たものを格子と層に足す。超音波は弱い証拠だけ（roommap.mark_sonar）。"""
+    """1 ステーションで見たものを格子と層に足す。超音波は弱い証拠だけ（roommap.mark_sonar）。
+    撮った時刻があれば、確信度の層に時刻を付け、見えた人・snoo を grid.cats に足す。"""
     mark_station(grid, o.pose)
+    if o.cats is not None:
+        grid.cats.extend((float(x), float(y), float(t)) for x, y, t in o.cats)
     grid.mark_free(o.free[:, 0], o.free[:, 1])
     grid.mark_occupied(o.occupied[:, 0], o.occupied[:, 1])
     hix, hiy = grid.cell(o.high[:, 0], o.high[:, 1])
     ok = grid.inside(hix, hiy)
     high[hix[ok], hiy[ok]] += 1
     if grid.confidence is not None:
-        grid.confidence.add(grid, o.free, o.occupied, o.pose)
+        grid.confidence.add(grid, o.free, o.occupied, o.pose, t=o.t_s)
     if grid.texture is not None and o.texture is not None:
         grid.texture.add(grid, o.texture)
     if o.sonar_m is not None:
