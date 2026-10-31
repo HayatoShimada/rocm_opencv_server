@@ -33,8 +33,9 @@ BOX = (1.0, 1.2, -0.6, -0.4, 0.08)  # x0, x1, y0, y1, 高さ。床に置いた�
 TABLE = (1.5, 2.2, 0.3, 0.9, 0.7)  # 机の天板（車は下をくぐれる）
 
 
-def _room_points(rng) -> np.ndarray:
-    """4 m x 3 m の部屋（x -1..3、y -1.5..1.5）の床・壁・箱・天板の点（m、z が上）。"""
+def _room_points(rng, slabs=()) -> np.ndarray:
+    """4 m x 3 m の部屋（x -1..3、y -1.5..1.5）の床・壁・箱・天板の点（m、z が上）。
+    slabs は足す水平の板（x0, x1, y0, y1, 高さ）。ソファの下の端の作り物。"""
     s = 0.0125
     gx, gy = np.meshgrid(np.arange(-1, 3, s), np.arange(-1.5, 1.5, s), indexing="ij")
     parts = [np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], 1)]
@@ -48,9 +49,9 @@ def _room_points(rng) -> np.ndarray:
     a, b = np.meshgrid(np.arange(x0, x1, s), np.arange(y0, y1, s), indexing="ij")
     for z in np.arange(0.03, h + 1e-9, 0.025):
         parts.append(np.stack([a.ravel(), b.ravel(), np.full(a.size, z)], 1))
-    x0, x1, y0, y1, h = TABLE
-    a, b = np.meshgrid(np.arange(x0, x1, s), np.arange(y0, y1, s), indexing="ij")
-    parts.append(np.stack([a.ravel(), b.ravel(), np.full(a.size, h)], 1))
+    for x0, x1, y0, y1, h in (TABLE, *slabs):
+        a, b = np.meshgrid(np.arange(x0, x1, s), np.arange(y0, y1, s), indexing="ij")
+        parts.append(np.stack([a.ravel(), b.ravel(), np.full(a.size, h)], 1))
     pts = np.concatenate(parts)
     return pts + rng.normal(0, 0.002, pts.shape)
 
@@ -64,12 +65,12 @@ def _cam_rotation(yaw: float, tilt: float) -> np.ndarray:
     return np.stack([r, np.cross(f, r), f])
 
 
-def _scene(stations=STATIONS):
+def _scene(stations=STATIONS, slabs=()):
     """VGGT が返しそうなもの。最初のコマのカメラを世界にし、大きさを 1/TRUE_SCALE にした
     点とカメラ。
     """
     rng = np.random.default_rng(1)
-    world = _room_points(rng)
+    world = _room_points(rng, slabs)
     refs, rots, centers = [], [], []
     for si, st in enumerate(stations):
         for tilt in TILTS:
@@ -732,3 +733,50 @@ def test_reversing_needs_sure_floor_only_under_the_driven_width():
     assert moves_ok(g, pose, back, Limits()) is None
     g.logodds[g.cell(-0.325, 0.125)] = 0.0  # 後ろの角の先に、見ていないセル
     assert moves_ok(g, pose, back, Limits()) == "後ろの確かでない所に入る"
+
+
+def test_low_overhead_is_an_obstacle_and_far_ones_need_a_closer_look():
+    """ソファの下の端（作り物の点）が車の高さ＋余白（12 + 3 cm）より低ければ障害物。18 cm は
+    近くで見れば下をくぐれる（上の層）。遠くから見た 18 cm は高さが確かでないので障害物にする。"""
+    from app.snoo_mapper import overhead_top_m
+
+    slabs = {
+        "12": (0.5, 0.7, -0.3, -0.1, 0.12),
+        "14": (0.5, 0.7, -0.75, -0.55, 0.14),
+        "18": (0.5, 0.7, 0.15, 0.35, 0.18),
+        "18_far": (2.4, 2.6, -0.9, -0.7, 0.18),
+    }
+    stations, refs, ext, points, conf = _scene(slabs=tuple(slabs.values()))
+    r = build_map(stations, refs, ext, points, conf, MapParams(camera_height_m=CAM_H))
+    g, state = r.grid, r.grid.state()
+
+    def at(name):
+        x0, x1, y0, y1, _ = slabs[name]
+        return g.cell((x0 + x1) / 2, (y0 + y1) / 2)
+
+    assert MapParams().car_height_m == pytest.approx(0.12)
+    assert state[at("12")] == OCCUPIED and state[at("14")] == OCCUPIED
+    assert state[at("18")] != OCCUPIED and r.high[at("18")] > 0
+    assert state[at("18_far")] == OCCUPIED
+    assert float(overhead_top_m(0.12, 0.03, 2.4)) > 0.18 > float(overhead_top_m(0.12, 0.03, 0.6))
+
+
+def test_sim_low_sofa_blocks_the_car_and_looks_like_an_obstacle():
+    """作った家の低いソファ（make_home(low_sofa=True)）：下の端が車より低ければ車は入れない。
+    ほかの家具と出発点は low_sofa でないときと同じ。"""
+    from app.roommap import CAR_HEIGHT_M
+    from app.snoo_gridsim import GridSim
+    from app.snoo_homes import HIGH, make_home
+
+    for seed in range(910_000, 910_012):
+        home = make_home(seed, agent_t_s=10, low_sofa=True)
+        if any(it.name == "low_sofa_top" for it in home.items):
+            break
+    plain = make_home(seed, agent_t_s=10)
+    assert (plain.start.x, plain.start.y) == (home.start.x, home.start.y)
+    sofa = next(it for it in home.items if it.name == "low_sofa_top")
+    ix, iy = home.cell((sofa.rect[0] + sofa.rect[2]) / 2, (sofa.rect[1] + sofa.rect[3]) / 2)
+    assert home.kind[ix, iy] == HIGH and home.under[ix, iy] == pytest.approx(sofa.z0)
+    sim = GridSim(home, agents=False)
+    assert bool(sim.car_block[ix, iy]) == (sofa.z0 < CAR_HEIGHT_M)
+    assert home.passable()[ix, iy] == (sofa.z0 >= CAR_HEIGHT_M)

@@ -39,6 +39,7 @@ from app.roommap import (
     CAM_X_M,
     CAR_CENTER_M,
     CAR_FRONT_M,
+    CAR_HEIGHT_M,
     CAR_REAR_M,
     FREE,
     FREE_HIT,
@@ -56,7 +57,7 @@ from app.roommap import (
     rear_axle,
 )
 from app.snoo_belief import LANDMARK_TEX, Confidence, Texture
-from app.snoo_homes import CLOSED, LOW, Home
+from app.snoo_homes import CLOSED, HIGH, LOW, Home
 from app.snoo_maneuver import CLEAR_STEER_DEG, CLEAR_STOP_M
 from app.snoo_mapper import (
     RECENT_STATIONS,
@@ -66,6 +67,7 @@ from app.snoo_mapper import (
     StationResult,
     action_moves,
     decide,
+    overhead_top_m,
 )
 
 # app/snoo_sim.py と同じ値（あちらは mujoco を読み込むので、ここでは読まない。試験で同じか確かめる）
@@ -184,7 +186,10 @@ class GridSim:
         self.reach = home.reachable_floor()
         self.reach_m2 = float(self.reach.sum() * home.res**2)
         # 車がぶつかるセル（下をくぐれる物は通れる）
-        self.car_block = (home.kind == LOW) | (home.kind == CLOSED)
+        self.car_block = (home.kind == LOW) | (home.kind == CLOSED) | ~self._can_go_under()
+        # Pi が止まる物（clear_cm は床の通り道を見る）。下の端の低いソファは床の上に物が無いので
+        # 止まらず、首（カメラの台）が当たる（ぶつかる）
+        self.stop_block = (home.kind == LOW) | (home.kind == CLOSED)
         # 光線の向きと距離（撮るたびに同じ）
         half = math.radians(pace.half_view_deg)
         self._da = np.linspace(-half, half, int(round(2 * pace.half_view_deg / ray_deg)) + 1)
@@ -199,6 +204,13 @@ class GridSim:
         self._gx, self._gy = (a.ravel() for a in np.meshgrid(xs, ys2))
 
     # --- 家の様子 ---
+
+    def _can_go_under(self) -> np.ndarray:
+        """上の物の下を車がくぐれるか（下の端が車の高さ以上。上の物でないセルは True）。"""
+        h = self.home
+        if h.under is None:
+            return np.ones(h.kind.shape, bool)
+        return (h.kind != HIGH) | (h.under >= CAR_HEIGHT_M)
 
     def agents_at(self, t: float) -> list[tuple[float, float, float, float]]:
         """時刻 t の人・snoo の (x, y, 半径, 高さ)。車に反応する物には、いまの車を見せてから。"""
@@ -245,9 +257,19 @@ class GridSim:
         prev = np.concatenate([np.zeros((len(a), 1)), shadow[:, :-1]], axis=1)
         hmax = np.maximum.accumulate(np.where(low, height, 0.0), axis=1)
         hprev = np.concatenate([np.zeros((len(a), 1)), hmax[:, :-1]], axis=1)
-        floorish = (kind != LOW) & (kind != CLOSED)
+        # 下の端が低い上の物（低いソファ）：地図のサーバーと同じく、下の端が車の高さ＋余白＋
+        # 遠さのずれ（snoo_mapper.overhead_top_m）より低ければ障害物に見える。カメラは下を見通す
+        lowtop = np.zeros(kind.shape, bool)
+        if h.under is not None:
+            inside = (ix >= 0) & (ix < h.n) & (iy >= 0) & (iy < h.n)
+            under = np.where(
+                inside, h.under[np.clip(ix, 0, h.n - 1), np.clip(iy, 0, h.n - 1)], np.inf
+            )
+            top = overhead_top_m(self.params.car_height_m, self.params.obstacle_margin_m, dd)
+            lowtop = (kind == HIGH) & (under <= top)
+        floorish = (kind != LOW) & (kind != CLOSED) & ~lowtop
         floor_vis = floorish & open_ & (dd > prev) & (dd >= self.pace.near_m)
-        obst_vis = low & open_ & ((dd > prev) | (height > hprev))
+        obst_vis = (low & open_ & ((dd > prev) | (height > hprev))) | (lowtop & open_ & (dd > prev))
         # 見えた固い物（壁・家具。光線ごとの最初の壁も）：目印が見えたかを数える（見失うか）
         solid_vis = (full & open_) | obst_vis
         out = []
@@ -315,14 +337,16 @@ class GridSim:
     # --- 走る ---
 
     def _hits(self, x: float, y: float, yaw: float, t: float, wide: bool = False) -> str | None:
-        """後ろの車軸が (x, y, yaw) の車の外形が重なる物。'wall'・'agent'・None。"""
+        """後ろの車軸が (x, y, yaw) の車の外形が重なる物。'wall'・'agent'・None。
+        wide（Pi が止まるかを見る）なら、下の端の低い物は数えない（stop_block）。"""
         fx, fy = (self._gx, self._gy) if wide else (self._fx, self._fy)
         c, s = math.cos(yaw), math.sin(yaw)
         px, py = x + c * fx - s * fy, y + s * fx + c * fy
         ix, iy = self.home.cell(px, py)
         h = self.home
         inside = (ix >= 0) & (ix < h.n) & (iy >= 0) & (iy < h.n)
-        if not inside.all() or self.car_block[ix, iy].any():
+        block = self.stop_block if wide else self.car_block
+        if not inside.all() or block[ix, iy].any():
             return "wall"
         for ax, ay, r, _ in self.agents_at(t):
             # 外形の真ん中から近ければ、点で確かめる
@@ -348,7 +372,7 @@ class GridSim:
             py = ay + CAR_FRONT_M * sn + lat * c
             ix, iy = h.cell(px, py)
             inside = (ix >= 0) & (ix < h.n) & (iy >= 0) & (iy < h.n)
-            if not inside.all() or self.car_block[ix, iy].any():
+            if not inside.all() or self.stop_block[ix, iy].any():
                 return True
             for bx, by, r, _ in agents:
                 if (((px - bx) ** 2 + (py - by) ** 2) <= r * r).any():

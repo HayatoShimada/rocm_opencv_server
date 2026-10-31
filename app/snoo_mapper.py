@@ -35,6 +35,7 @@ import cv2
 import numpy as np
 
 from app.roommap import (
+    CAR_HEIGHT_M,
     FREE,
     MAX_SEGMENTS,
     MAX_STEP_M,
@@ -92,13 +93,26 @@ def _env_float(name: str, default: float | None) -> float | None:
     return None if v.strip().lower() in ("", "none", "off") else float(v)
 
 
+# 上の層（車の高さ＋余白より上の点）の高さの見込みのずれ。VGGT の点は遠いほどずれるので、
+# 物の下の端が「車の高さ＋余白＋ずれ」より低ければ障害物にする（ソファ・ベッドの下に首が挟まる）。
+# 遠くから見た低い隙間は通れない側に倒し、近くで見直して高さが確かなら通す
+OVERHEAD_SIGMA_M = 0.01
+OVERHEAD_SIGMA_PER_M = 0.02
+
+
+def overhead_top_m(car_height_m: float, margin_m: float, dist_m):
+    """これより低い点は障害物、高い点は上の層（下をくぐれる）とする高さ（m）。dist_m は撮った
+    所からの距離（配列でもよい）。"""
+    return car_height_m + margin_m + OVERHEAD_SIGMA_M + OVERHEAD_SIGMA_PER_M * np.asarray(dist_m)
+
+
 @dataclass
 class MapParams:
     # 床からカメラの中心まで。ステーションごとに変えてもよい。None のステーションは
     # 大きさを決めるのに使わず、ほかのステーションで決めた大きさで高さを測る
     # （机の上から撮ったときなど）
     camera_height_m: float | list[float | None] = 0.08  # SD カード 2.5 枚分と測った
-    car_height_m: float = 0.12
+    car_height_m: float = CAR_HEIGHT_M  # 測っていない（SNOO_CAR_HEIGHT_CM）
     floor_tol_m: float = 0.02  # 床と見る高さの幅（±）
     obstacle_margin_m: float = 0.03  # 車の高さに足す余裕
     conf_percentile: float = 50.0  # VGGT の確からしさの下から何 % を捨てるか
@@ -655,7 +669,8 @@ def mark_slam(grid: Grid, high: np.ndarray, slam_dir: Path, params: MapParams) -
         return {"used": False, "reason": type(e).__name__}
     xyz = xyz[count >= SLAM_MIN_COUNT]
     z = xyz[:, 2]
-    top = params.car_height_m + params.obstacle_margin_m
+    # 撮った所からの距離は分からないので、近い所のずれだけ足す
+    top = float(overhead_top_m(params.car_height_m, params.obstacle_margin_m, 0.0))
     floor = xyz[np.abs(z) <= params.floor_tol_m]
     obst = xyz[(z > params.floor_tol_m) & (z <= top)]
     above = xyz[z > top]
@@ -798,7 +813,6 @@ def build_map(
     cams_w = world.apply(cams)
     grid = Grid()
     high = np.zeros_like(grid.logodds, np.int32)
-    top = params.car_height_m + params.obstacle_margin_m
     results: list[StationResult] = []
     observations: list[Observation | None] = []
     keep_pts, keep_cols = [], []
@@ -824,12 +838,15 @@ def build_map(
         if registration_is_bad(res, heights[s]):
             continue  # 位置の合っていない点は地図に入れない（decide で止める）
         p = world.apply(pts[idx][good[idx]])
-        near = np.hypot(p[:, 0] - pose.x, p[:, 1] - pose.y) <= params.max_range_m
-        p = p[near]
+        dist = np.hypot(p[:, 0] - pose.x, p[:, 1] - pose.y)
+        near = dist <= params.max_range_m
+        p, dist = p[near], dist[near]
         z = p[:, 2]
+        # 車の高さ＋余白より下は障害物。遠い点ほど高さがずれるので、余白を足す（overhead_top_m）
+        top_p = overhead_top_m(params.car_height_m, params.obstacle_margin_m, dist)
         is_floor = np.abs(z) <= params.floor_tol_m
-        is_obst = (z > params.floor_tol_m) & (z <= top)
-        is_high = z > top
+        is_obst = (z > params.floor_tol_m) & (z <= top_p)
+        is_high = z > top_p
         fx, fy = _cells_with(grid, p[is_floor, 0], p[is_floor, 1], MIN_POINTS_PER_CELL)
         mark_station(grid, pose)
         grid.mark_free(fx, fy)

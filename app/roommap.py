@@ -36,9 +36,12 @@ WHEELBASE_M = 0.14
 CAR_REAR_M = -0.05
 CAR_FRONT_M = 0.21
 CAM_X_M = 0.16
-# 車の幅と高さ（見積もり。測っていない）。app/clearance.py・app/snoo_twin.py もここの値を使う
+# 車の幅と高さ（見積もり。測っていない）。app/clearance.py・app/snoo_twin.py もここの値を使う。
+# 高さは車のいちばん高い所（首を上げた時のカメラの台）。まだ測っていないので、測ったら
+# SNOO_CAR_HEIGHT_CM（cm）で渡す。この高さ＋余白（MapParams.obstacle_margin_m）より下に物の
+# 下の端がある所（低いソファ・ベッドの下）は通れない（app/snoo_mapper.overhead_top_m）
 CAR_WIDTH_M = 0.19
-CAR_HEIGHT_M = 0.12
+CAR_HEIGHT_M = float(os.getenv("SNOO_CAR_HEIGHT_CM", "12")) / 100
 # 前の超音波（バンパーの真ん中）。±15° の円すいで、3 m まで測れる
 SONAR_HALF_DEG = 15.0
 SONAR_RANGE_M = 3.0
