@@ -842,6 +842,7 @@ class HomeMap:
         occ = home_lo > OCC_LO
         merged = np.where(occ, np.maximum(merged, home_lo), merged)
         out.logodds[:] = merged.astype(np.float32)
+        out.station_poses = list(session.station_poses)  # 撮った所のそばの境目は行き先にしない
         return out
 
     # --- 絵 ---

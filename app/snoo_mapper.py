@@ -46,6 +46,7 @@ from app.roommap import (
     camera_of,
     drive_moves,
     mark_sonar,
+    mark_station,
     next_best_view,
 )
 from app.snoo_belief import (
@@ -59,7 +60,7 @@ from app.snoo_belief import (
     texture_png,
     unsure_edges,
 )
-from app.snoo_maneuver import GEAR_MAX_SEGMENTS, Limits, Maneuver, plan_maneuver
+from app.snoo_maneuver import GEAR_MAX_SEGMENTS, Limits, Maneuver, Scene, plan_maneuver
 
 # 1 回に VGGT に入れるコマの数の上限（24 GB の GPU で 60 枚ほどまで。
 # 検出サーバーと分け合うので余裕を見る）
@@ -602,6 +603,7 @@ def session_grid(observations: list[Observation]) -> tuple[Grid, np.ndarray]:
 
 def add_observation(grid: Grid, high: np.ndarray, o: Observation) -> None:
     """1 ステーションで見たものを格子と層に足す。超音波は弱い証拠だけ（roommap.mark_sonar）。"""
+    mark_station(grid, o.pose)
     grid.mark_free(o.free[:, 0], o.free[:, 1])
     grid.mark_occupied(o.occupied[:, 0], o.occupied[:, 1])
     hix, hiy = grid.cell(o.high[:, 0], o.high[:, 1])
@@ -829,6 +831,7 @@ def build_map(
         is_obst = (z > params.floor_tol_m) & (z <= top)
         is_high = z > top
         fx, fy = _cells_with(grid, p[is_floor, 0], p[is_floor, 1], MIN_POINTS_PER_CELL)
+        mark_station(grid, pose)
         grid.mark_free(fx, fy)
         ox, oy = _cells_with(grid, p[is_obst, 0], p[is_obst, 1], MIN_POINTS_PER_CELL)
         grid.mark_occupied(ox, oy)
@@ -918,24 +921,28 @@ def stop_reason(
     params: MapParams,
     heights: list[float | None],
     trusted: frozenset[str] = frozenset(),
+    state: np.ndarray | None = None,
+    conf: np.ndarray | None = None,
 ) -> dict | None:
     """探るのをやめる返事（done）か、続けるなら None。決め方（今まで・学んだもの）によらない。
 
     trusted のステーション（名前）は、この窓で位置合わせが崩れても止めない。地図のサーバーが
     位置のグラフ（app/snoo_posegraph.py）で、走った辺とほかの窓から位置を決めたもの。
+    state・conf は grid.state()・confidence_of の値（decide が一度だけ出して渡す）。
     """
     if len(stations) >= params.max_stations:
         return {"action": "done", "reason": "step_limit"}
     for st, H in zip(stations, heights, strict=True):
         if st.name not in trusted and registration_is_bad(st, H):
             return {"action": "done", "reason": f"bad_registration:{st.name}"}
-    if int((grid.state() == FREE).sum()) < MIN_FREE_CELLS:
+    state = grid.state() if state is None else state
+    if int((state == FREE).sum()) < MIN_FREE_CELLS:
         return {"action": "done", "reason": "too_little_floor"}
     # 次に撮る位置と同じ境目で見る（床の中の小さな穴だけが残ったら、調べ終えたとする）。
     # 境目が無くても、確信度の低い縁（近づいて確かめる行き先）が残っていれば続ける
-    state = grid.state()
     if not big_frontiers(state).any():
-        unsure = int(unsure_edges(grid, state, confidence_of(grid, state)).sum())
+        conf = confidence_of(grid, state) if conf is None else conf
+        unsure = int(unsure_edges(grid, state, conf).sum())
         if unsure < CONF_DONE_MAX_CELLS:
             return {"action": "done", "reason": "no_frontier"}
     return None
@@ -971,8 +978,12 @@ def decide(
     recent は直近のステーションの位置（同じ所へ戻らない・動けていないかを見る）。動けていなければ
     広く探し（区切りを長く・前後の切り替えを安く）、それでも無ければ done "stuck"。
     trusted は stop_reason と同じ（位置のグラフで位置が決まったステーションの名前）。
+    計画器の行き先（撮った所のそばを除いた境目・確信度の低い縁の手前・next_best_view の行き先）が
+    一つも無ければ done "no_frontier"（stop_reason の境目は残っていても、計画器が使えない）。
     """
-    stop = stop_reason(grid, stations, params, heights, trusted)
+    state = grid.state()
+    conf = confidence_of(grid, state)
+    stop = stop_reason(grid, stations, params, heights, trusted, state, conf)
     if stop is not None:
         return stop, None
     pose = stations[-1].pose
@@ -984,11 +995,17 @@ def decide(
     if plan is not None:
         nominal = [(st, m, False) for st, m in (plan.segments or [(plan.steer_deg, plan.step_m)])]
     goal = plan.target if plan is not None else None
-    man = plan_maneuver(grid, pose, lim, nominal, params.seed, recent[:-1], goal=goal)
+    # 同じ格子・姿勢なので、広く探し直すときも同じ Scene を使う
+    scene = Scene(grid, pose, True, recent[:-1], lim.wide, goal, state, conf)
+    if not scene.targets.any():
+        # 残っている境目は撮った所のそば（足もと・車の横。どこから撮っても写らない）だけ。
+        # 撮り直しを続けて stuck にしない
+        return {"action": "done", "reason": "no_frontier"}, None
+    man = plan_maneuver(grid, pose, lim, nominal, params.seed, scene=scene)
     if man is None and not lim.wide:
         # 行ける列が見つからない：切り返しを安くして広く探し直す
         lim = limits(params, True)
-        man = plan_maneuver(grid, pose, lim, nominal, params.seed + 1, recent[:-1], goal=goal)
+        man = plan_maneuver(grid, pose, lim, nominal, params.seed + 1, scene=scene)
     if stuck and (man is None or not man.info.get("connected", True)):
         # 動けていないのに、行き先までつながる道が無い：同じ所で切り返し続けない
         return {"action": "done", "reason": "stuck"}, None
@@ -1039,38 +1056,52 @@ def is_still(recent: list[Pose]) -> bool:
 
 
 def maneuver_action(man: Maneuver, pose: Pose, params: MapParams) -> dict:
-    """Pi に返す 1 歩（docs/snoo_explore_protocol.md）。上の steer_deg・distance_cm・reverse は
-    最初の区切り（segments を知らない Pi でも同じに動く）。gear_segments の Pi には、区切りごとに
-    reverse・着く姿勢（end_pose）・前の区切りの clear_cm の下限（min_clear_cm）を付ける。"""
-    first = man.moves[0]
-    all_back = all(b for _, _, b in man.moves)
+    """Pi に返す 1 歩（docs/snoo_explore_protocol.md）。形は moves_action。gear_segments の
+    Pi には、区切りごとに着く姿勢（end_pose）・前の区切りの clear_cm の下限（min_clear_cm）も
+    付ける。"""
+    action = moves_action(man.moves, params, man.ends, man.min_clear_cm)
+    action["pose"] = pose_dict(pose)
+    action["target"] = pose_dict(man.end)
+    action["planner"] = man.kind
+    if man.gap:
+        action["gap"] = True
+    return action
+
+
+def moves_action(
+    moves: list[tuple[float, float, bool]],
+    params: MapParams,
+    ends: list[Pose] | None = None,
+    clears: list[float | None] | None = None,
+) -> dict:
+    """区切りの列 [(ハンドル°, m, 後ろへか), ...] の 1 歩の返事（計画器の 1 歩・来た道を戻る・
+    エージェントの 1 歩で同じ形）。上の steer_deg・distance_cm・reverse は最初の区切り
+    （segments を知らない Pi でも同じに動く）。gear_segments の Pi には、区切りごとに reverse と、
+    ends・clears があれば end_pose・min_clear_cm を付ける。"""
+    first = moves[0]
+    all_back = all(b for _, _, b in moves)
     action = {
         "action": "move",
         "steer_deg": round(first[0], 1) + 0.0,
         "speed": REVERSE_SPEED if all_back else SPEED,
         "distance_cm": round(first[1] * 100, 1),
-        "pose": pose_dict(pose),
-        "target": pose_dict(man.end),
-        "planner": man.kind,
     }
     if all_back:
         action["reverse"] = True
-    if man.gap:
-        action["gap"] = True
     if params.gear_segments:
         action["reverse_speed"] = REVERSE_SPEED
-        action["segments"] = [
-            {
-                "steer_deg": round(st, 1) + 0.0,
-                "distance_cm": round(m * 100, 1),
-                "reverse": back,
-                "end_pose": pose_dict(end),
-                "min_clear_cm": clear,
-            }
-            for (st, m, back), end, clear in zip(man.moves, man.ends, man.min_clear_cm, strict=True)
-        ]
+        segs = []
+        for i, (st, m, back) in enumerate(moves):
+            seg = {"steer_deg": round(st, 1) + 0.0, "distance_cm": round(m * 100, 1),
+                   "reverse": back}  # fmt: skip
+            if ends is not None:
+                seg["end_pose"] = pose_dict(ends[i])
+            if clears is not None:
+                seg["min_clear_cm"] = clears[i]
+            segs.append(seg)
+        action["segments"] = segs
     elif params.segments:
-        action["segments"] = segments_json([(st, m) for st, m, _ in man.moves])
+        action["segments"] = segments_json([(st, m) for st, m, _ in moves])
     return action
 
 

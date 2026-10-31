@@ -59,6 +59,7 @@ from app.roommap import (
     arc,
     mark_driven,
     mark_sonar,
+    mark_station,
 )
 from app.snoo_belief import Confidence
 from app.snoo_body import JOINT_NAMES, SnooAnimator, assets_xml, body_xml, default_xml
@@ -1311,6 +1312,7 @@ class Sim:
         high = np.zeros_like(g.logodds, np.int32)
         for i in ids:
             o = self.obs[i]
+            mark_station(g, o.pose)
             for c, v in ((o.free, FREE_HIT), (o.occupied, OCCUPIED_HIT)):
                 if len(c):
                     g.logodds[c[:, 0], c[:, 1]] += v

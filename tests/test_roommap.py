@@ -335,3 +335,20 @@ def test_clip_pieces_keeps_the_front_edge_off_a_wall_near_the_start():
     run = sum(m for _, m in pieces)
     front = rear_axle(pose).x + run + CAR_FRONT_M  # 走った後の前の端
     assert front < 0.27 - 0.025  # 壁のセルの手前の縁より前に出ない
+
+
+def test_blocked_ahead_is_weak_and_keeps_the_seen_floor():
+    """Pi が止まった所の先は弱い証拠だけ：1 回では障害物にならず、2 回で障害物。床と見たセルは
+    変えない（前を横切った猫で障害物を作らない）。"""
+    from app.roommap import FREE_HIT, mark_blocked_ahead
+
+    g = Grid(size_m=4.0)
+    cam = Pose(0.0, 0.0, 0.0)  # 前の端は x = 0.05。その先 10 cm
+    seen = g.cell(0.125, 0.075)
+    g.logodds[seen] = FREE_HIT
+    ahead = g.cell(0.075, 0.025)
+    mark_blocked_ahead(g, cam, 0.0)
+    assert g.state()[ahead] == UNKNOWN and g.logodds[ahead] > 0
+    assert g.logodds[seen] == pytest.approx(FREE_HIT)
+    mark_blocked_ahead(g, cam, 0.0)
+    assert g.state()[ahead] == OCCUPIED and g.state()[seen] == FREE

@@ -72,7 +72,9 @@ Pi（snoo_trucar）が止まって首を振って撮った分（station）を `P
 - サーバーは区切りごとの向きで、位置のグラフの走った辺（`snoo_posegraph.odom_edge_moves`）・走った所の床
   （`roommap.mark_driven_moves`）・VGGT の位置に合わせた走った長さ（`roommap.fit_moves`）を出す
 - `stop_reason` が `clear`・`stuck` なら、止まった所の先を「たぶん障害物」にする（`roommap.mark_blocked_ahead`。
-  カメラの足もとは写らないので、そこにある物が地図に入らず、同じ 1 歩を出し続けていた）
+  カメラの足もとは写らないので、そこにある物が地図に入らず、同じ 1 歩を出し続けていた）。足すのは超音波と同じ
+  弱い証拠（log-odds +0.3。1 回では障害物にならない）で、床と見たセルは変えない。止まった区切りは、
+  `est_distance_cm` までに走った区切りの最後。直近 6 か所で止まった分だけ足す
 - 区切りに `reverse` が無い（前の版の Pi）なら `prev_step.reverse`、それも無ければ、そのとき返した
   返事（`reply.json`）の `reverse` で決める
 

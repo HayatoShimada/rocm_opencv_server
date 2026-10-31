@@ -80,6 +80,9 @@ class Grid:
     def __init__(self, size_m: float = 12.0, res: float = RES_M):
         self.confidence = None
         self.texture = None
+        # 撮った所（カメラの真下）。足もと・車の横は写らないので、そのそばの境目は行き先にしない
+        # （app/snoo_maneuver.Scene。mark_station）
+        self.station_poses: list[Pose] = []
         self.res = res
         self.n = int(round(size_m / res))
         self.origin = -size_m / 2  # セル (0, 0) の角の座標（x・y とも）
@@ -153,6 +156,12 @@ def mark_sonar(grid: Grid, camera: Pose, distance_m: float | None) -> None:
     if len(cells):
         grid.logodds[cells[:, 0], cells[:, 1]] += SONAR_HIT
         np.clip(grid.logodds, -4, 4, out=grid.logodds)
+
+
+def mark_station(grid: Grid, camera: Pose) -> None:
+    """撮った所を覚える。カメラの足もとと車の横はどの撮り方でも写らないので、そのそばに残る
+    境目を、後で行き先にしない（app/snoo_maneuver.Scene。直近の所だけでなく、前の所も）。"""
+    grid.station_poses.append(camera)
 
 
 def inflate(occupied: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -629,16 +638,18 @@ def mark_driven(
         grid.confidence.mark_driven(cells[keep])
 
 
-# Pi が前で止まった（clear・stuck）とき、止まった所の前の端から先のこの長さを「たぶん障害物」にする
+# Pi が前で止まった（clear・stuck）とき、止まった所の前の端から先のこの長さを
+# 「たぶん障害物」にする。足すのは超音波と同じ弱い証拠（1 回では障害物にならない。
+# 同じ所で 2 回止まれば障害物）
 BLOCKED_AHEAD_M = (0.0, 0.10)
-BLOCKED_HIT = 1.0
+BLOCKED_HIT = SONAR_HIT
 
 
 def mark_blocked_ahead(grid: Grid, camera: Pose, steer_deg: float, back: bool = False) -> None:
     """走っていて止まった所（camera はカメラの真下）の進む向きの先を、たぶん障害物にする。
     カメラの足もと（画面の下の端より手前）と車の後ろは写らないので、そこにある物は地図に入らず、
-    同じ 1 歩を出し続けていた。障害物と見ているセルはそのまま、床と見たセルも 1 回で障害物に
-    はしない。"""
+    同じ 1 歩を出し続けていた。足すのは BLOCKED_HIT（1 回では障害物にならない）だけ。床と見た
+    セル（カメラで見た・走った）は変えない（前を横切った猫で、ずっと残る障害物を作らない）。"""
     r = rear_axle(camera)
     out_x, out_y = [], []
     edge = CAR_REAR_M if back else CAR_FRONT_M
@@ -651,9 +662,11 @@ def mark_blocked_ahead(grid: Grid, camera: Pose, steer_deg: float, back: bool = 
     ix, iy = grid.cell(np.array(out_x), np.array(out_y))
     ok = grid.inside(ix, iy)
     cells = np.unique(np.stack([ix[ok], iy[ok]], 1), axis=0)
-    if len(cells):
-        grid.logodds[cells[:, 0], cells[:, 1]] += BLOCKED_HIT
-        np.clip(grid.logodds, -4, 4, out=grid.logodds)
+    if not len(cells):
+        return
+    cells = cells[grid.logodds[cells[:, 0], cells[:, 1]] >= -0.4]  # 床のセル（< -0.4）はそのまま
+    grid.logodds[cells[:, 0], cells[:, 1]] += BLOCKED_HIT
+    np.clip(grid.logodds, -4, 4, out=grid.logodds)
 
 
 def mark_driven_moves(grid: Grid, start: Pose, moves: list[tuple[float, float, bool]]) -> None:
