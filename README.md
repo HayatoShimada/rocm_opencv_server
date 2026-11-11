@@ -171,6 +171,29 @@ uv run --env-file .env --group clip --group clef-local python -m scripts.shopify
 uv run --env-file .env python -m scripts.shopify_product_attributes --all --export data/product-attributes/search-attributes.json
 ```
 
+## 着用イメージを、服の実寸どおりの大きさで作る（PoC）
+
+スタッフの写真に古着の正面の写真を着せた「着用イメージ」を、AI（Qwen-Image-Edit-2509。Apache 2.0）で作る。
+85-Store の原則（タグではなく、測った尺度で服を見せる）に合わせて、服の大きさは AI に決めさせない。
+
+1. `prepare`：人物の写真から骨格の点（ViTPose）と人の形（SAM2）を取り、身長から px/cm を出す。
+   服の実寸（`custom.measurements`）から、首の付け根・肩の縫い目・袖口・裾の位置を決め、
+   服が来るべき範囲を灰色で塗った下敷きを作る（`app/garment_scale.py`）
+2. `generate`：下敷きと服の写真を Qwen-Image-Edit に渡し、灰色の範囲にちょうど服を着せる。範囲の外は元の写真に戻す
+3. `check`：できた画像の服の形から、裾と袖口の位置を測りなおし、ずれが 2cm 以内のものだけを「使える」とする
+
+```bash
+uv sync --inexact --group clip --group clef-local --group vton
+uv run --no-sync --env-file .env python -m scripts.vton_tryon --handles <ハンドル>,<ハンドル>
+uv run --no-sync python -m scripts.vton_contact_sheet   # data/vton/index.html（評価用の一覧）
+```
+
+- 人物は `data/vton/people/people.json` に書く（写真を使う同意を取った人だけ）：`{"名前": {"file": "a.jpg", "height": 170, "shoulder": 44}}`
+- 写真は、無地の背景・正面・全身。**腕はまっすぐ少し開く**（曲がっている・カメラを向いている腕は、写真の上で短く写り、袖口の位置を決められない。その場合は notes に理由が出る）
+- モデル：`~/models/qwen-image-edit-2509`（本体以外）、`~/models/qwen-image-edit-2509-gguf`（本体の Q4_K_M）、`~/models/qwen-image-lightning`（8 ステップの LoRA）。設定は `VTON_*`
+- GPU は 24GB なので、段階ごとにモデルを入れ替える。Clef・snoo と同時に動かさない（`scripts/snoo_phase.sh offline`）
+- Shopify・CMS には書き込まない（PoC）。研究の VTON（VITON-HD・IDM-VTON・CatVTON など）は重みが商用不可なので使わない
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |

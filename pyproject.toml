@@ -41,6 +41,11 @@ sim = [
 agent = [
     "pyopenjtalk>=0.4.1",
 ]
+vton = [
+    "diffusers>=0.35",
+    "gguf>=0.10",
+    "peft>=0.17",
+]
 
 [tool.ruff]
 # サブエージェントの作業ツリー（.claude/worktrees）は見ない
