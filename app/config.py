@@ -33,6 +33,19 @@ class Settings:
     cloudflare_account_id: str = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
     cloudflare_api_token: str = os.getenv("CLOUDFLARE_API_TOKEN", "")
     clef_model: str = os.getenv("CLEF_MODEL", "@cf/cloudflare/clef-flash")
+    # 着用イメージ（AI の合成。app/vton.py）。
+    # Qwen-Image-Edit-2509 の本体以外・GGUF の本体・Lightning の LoRA
+    vton_model_path: str = os.getenv("VTON_MODEL_PATH", "~/models/qwen-image-edit-2509")
+    vton_gguf: str = os.getenv(
+        "VTON_GGUF", "~/models/qwen-image-edit-2509-gguf/Qwen-Image-Edit-2509-Q4_K_M.gguf"
+    )
+    vton_lora: str = os.getenv(
+        "VTON_LORA",
+        "~/models/qwen-image-lightning/Qwen-Image-Edit-2509/"
+        "Qwen-Image-Edit-2509-Lightning-8steps-V1.0-fp32.safetensors",
+    )
+    vton_steps: int = int(os.getenv("VTON_STEPS", "8"))
+    vton_sam_path: str = os.getenv("VTON_SAM_PATH", "~/models/sam2.1-hiera-large")
 
 
 settings = Settings()
