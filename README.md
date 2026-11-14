@@ -176,11 +176,16 @@ uv run --env-file .env python -m scripts.shopify_product_attributes --all --expo
 商品タイプの下の細分類（シャツならドレス・ネル・コーデュロイなど）を、ブランドではなく写真の見た目で判定する（`app/item_subtype.py`）。語彙の正は CRM なので、`--subtypes` で JSON（商品タイプ → `[{code, label, default}]`）を渡す。写真だけの条件（photo）と、題名・説明・素材・採寸も渡す条件（text。ブランドは渡さない）を比べられる。Shopify には読むだけ。
 
 ```bash
-uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_item_subtype --subtypes subtypes.json --guess rule-guess.json
-uv run python -m scripts.item_subtype_report --subtypes subtypes.json --guess rule-guess.json
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_item_subtype [--subtypes subtypes.json]
+uv run python -m scripts.item_subtype_report [--subtypes subtypes.json]
 ```
 
 判定は `data/item-subtype/predictions.json`（落ちても再開できる）、集計は `report.json`、店主が見る一覧は `index.html`。
+
+流れ: 判定（キャッシュがあれば判定し直さない）→ 確認だけ（`data/item-subtype/candidates.json` と、細分類 × 確からしさの帯の件数）→ `--apply` で CMS の `POST /api/products/item-subtype-candidates` へ（50 件ずつ）→ CMS で人が確かめる。毎回、販売中で細分類のある品目の全商品を対象にし、新しく出品された商品の分だけ判定する。`--subtypes` を省くと CMS の `GET /api/products/product-types` から語彙を読む（読めなければ JSON を渡す）。
+
+送る線引き（最終的に使うのは CMS）: 写真だけ（photo）の判定だけを送る（題名の語で決まる物は CMS・CRM の規則が優先）。確からしさ 0.5 未満・判定できなかった商品・細分類の無い品目は送らない。0.5 以上は全部送り、0.8 以上を自動の候補にするかは CMS が決める。送る JSON の形は `app/item_subtype.py` の `candidates_payload` 1か所で作り、`tests/test_item_subtype.py` で固定している。
+
 
 ## 設定（環境変数）
 

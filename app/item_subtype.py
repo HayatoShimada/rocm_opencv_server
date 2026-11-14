@@ -131,3 +131,53 @@ def summarize(answers: dict) -> dict:
         else:
             out[qid] = {"score": round(a["score"], 2), "confidence": round(a["confidence"], 3)}
     return out
+
+
+# CMS に候補として送る確からしさの下限（0.5 以上は全部送る。自動か人が確かめるかは CMS が決める）
+MIN_CONFIDENCE = 0.5
+# 帯（確認だけの出力用）。下限, 上限
+BANDS = ((MIN_CONFIDENCE, 0.8), (0.8, 1.01))
+SEND_MODE = "photo"
+
+
+def candidate_item(product_id: str, pred: dict) -> dict | None:
+    """送る1件。写真だけ（photo）の判定を使い、確からしさが下限未満・判定なしなら None。"""
+    judged = (pred.get(SEND_MODE) or {}).get("answers") or {}
+    top = judged.get(CHOICE)
+    if not top or top["confidence"] < MIN_CONFIDENCE:
+        return None
+    aux = {
+        qid: (a["score"] if isinstance(a, dict) else a)
+        for qid, a in judged.items()
+        if qid != CHOICE
+    }
+    return {
+        "productId": product_id,
+        "handle": pred["handle"],
+        "code": top["choice"],
+        "confidence": top["confidence"],
+        "mode": SEND_MODE,
+        "aux": aux,
+    }
+
+
+def candidates_payload(predictions: dict, product_ids) -> dict:
+    """CMS の POST /api/products/item-subtype-candidates の本文。形が変わったらここだけ直す。"""
+    items = [
+        item
+        for pid in product_ids
+        if pid in predictions and (item := candidate_item(pid, predictions[pid]))
+    ]
+    return {"source": "clef", "version": VERSION, "items": items}
+
+
+def band_counts(items: list[dict], product_types: dict[str, str]) -> dict:
+    """細分類ごとの、確からしさの帯ごとの件数。product_types は productId → 品目。"""
+    out: dict = {}
+    for it in items:
+        key = f"{product_types.get(it['productId'], '?')}/{it['code']}"
+        for lo, hi in BANDS:
+            if lo <= it["confidence"] < hi:
+                label = f"{lo}以上{hi}未満" if hi < 1 else f"{lo}以上"
+                out.setdefault(key, {})[label] = out.get(key, {}).get(label, 0) + 1
+    return out
