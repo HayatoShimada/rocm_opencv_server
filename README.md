@@ -187,6 +187,20 @@ uv run python -m scripts.item_subtype_report [--subtypes subtypes.json]
 送る線引き（最終的に使うのは CMS）: 写真だけ（photo）の判定だけを送る（題名の語で決まる物は CMS・CRM の規則が優先）。確からしさ 0.5 未満・判定できなかった商品・細分類の無い品目は送らない。0.5 以上は全部送り、0.8 以上を自動の候補にするかは CMS が決める。送る JSON の形は `app/item_subtype.py` の `candidates_payload` 1か所で作り、`tests/test_item_subtype.py` で固定している。
 
 
+## 写真をまとめて商品ごとに分ける（85store-cms の「写真から下書きを作る」・Clef）
+
+85store-cms に何着分かの写真（1 着ずつ続けて撮ったもの）をまとめて上げ、「Clef に分けてもらう」を押すと、まとまりが「分け待ち」になる。`scripts/cms_photo_batches.py` がそれを取り、写真ごとに区分（正面・背面・タグのアップ…）を判定して、商品ごとに分けた案を CMS に返す。人が CMS の画面で案を確かめて直し、商品ごとに保留の下書きを作る。
+
+- 分け方: 撮影時刻の順に並べ、「人が写っていない全体の正面（向きの確からしさ 0.6 以上）が、すでに正面のある商品のあとに来た」か「前の写真から 5 分以上あいた」ところで次の商品にする。全体の正面が無い商品は、CMS の画面で目立たせる
+- 品目は 85crm の品目の一覧（CMS が渡す）から選ぶ。状態メモの候補は `scripts/shopify_condition_drafts.py` と同じ質問と文の型。ブランドは `--brand` のときだけ（`--eval-brands N` で当たり方を測ってから）
+- 写真は CMS の縮小版（`/api/photoSources/:id/preview`）で受け取るので、DNG もそのまま読める
+- 1 分ごとに systemd のユーザーのタイマーで起こす（`deploy/cms-photo-batches.{service,timer}`。入れ方は service の先頭）。分け待ちが無ければ Clef を読み込まずに終わり、GPU の空きが 21GB 未満ならその回は見送る（終わったらプロセスごと GPU を手放す）
+
+```bash
+# 取らずに、先頭の分け待ちを判定して表示するだけ（CMS は変えない。data/photo-batches/ に保存）
+uv run --env-file .env --group clip --group clef-local python -m scripts.cms_photo_batches --dry-run
+```
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |

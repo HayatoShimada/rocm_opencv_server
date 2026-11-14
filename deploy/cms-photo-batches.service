@@ -1,0 +1,23 @@
+# 85store-cms の「写真から下書きを作る」の分け待ちを、Clef で商品ごとに分ける（scripts/cms_photo_batches.py）。
+# 1 回動いて終わる（分け待ちが無ければ Clef を読み込まずにすぐ終わる）。cms-photo-batches.timer が 1 分ごとに起こす。
+# 入れ方（sudo は要らない）:
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/orca/rocm_opencv_server/deploy/cms-photo-batches.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cms-photo-batches.timer
+#   journalctl --user -u cms-photo-batches -f
+# ~/orca/rocm_opencv_server が、このスクリプトのあるブランチ（main）になっていること
+[Unit]
+Description=85store-cms の撮影のまとまりを Clef で商品ごとに分ける
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/orca/rocm_opencv_server
+ExecStart=%h/orca/rocm_opencv_server/.venv/bin/python -m scripts.cms_photo_batches
+EnvironmentFile=-%h/orca/rocm_opencv_server/.env
+Environment=PYTHONUNBUFFERED=1
+# Clef の重みは手元にあるので、Hugging Face に問い合わせない
+Environment=HF_HUB_OFFLINE=1
+# 112 枚で数分。縮小版を初めて作る（DNG）ときは 1 枚 2 秒ほど増える
+TimeoutStartSec=45min
