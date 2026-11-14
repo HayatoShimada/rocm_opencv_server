@@ -171,6 +171,17 @@ uv run --env-file .env --group clip --group clef-local python -m scripts.shopify
 uv run --env-file .env python -m scripts.shopify_product_attributes --all --export data/product-attributes/search-attributes.json
 ```
 
+## 商品の細分類（ドレスシャツなど）を写真の雰囲気で判定する（試作・Clef）
+
+商品タイプの下の細分類（シャツならドレス・ネル・コーデュロイなど）を、ブランドではなく写真の見た目で判定する（`app/item_subtype.py`）。語彙の正は CRM なので、`--subtypes` で JSON（商品タイプ → `[{code, label, default}]`）を渡す。写真だけの条件（photo）と、題名・説明・素材・採寸も渡す条件（text。ブランドは渡さない）を比べられる。Shopify には読むだけ。
+
+```bash
+uv run --env-file .env --group clip --group clef-local python -m scripts.shopify_item_subtype --subtypes subtypes.json --guess rule-guess.json
+uv run python -m scripts.item_subtype_report --subtypes subtypes.json --guess rule-guess.json
+```
+
+判定は `data/item-subtype/predictions.json`（落ちても再開できる）、集計は `report.json`、店主が見る一覧は `index.html`。
+
 ## 設定（環境変数）
 
 | 変数 | 既定値 | 説明 |
@@ -215,6 +226,7 @@ scripts/shopify_classify_photos.py # 全商品の画像を Clef で分類する
 scripts/photo_review.py # 分類が正しいかを確かめる画面
 scripts/shopify_photo_alts.py # 写真の区分を付けた alt にする
 scripts/shopify_product_attributes.py # 商品の属性を判定し、AI 検索用に書き出す
+scripts/shopify_item_subtype.py # 商品の細分類を写真から判定する（試作）。集計は item_subtype_report.py
 ```
 
 新しい処理を足すときは `processing.py` に `_to_device` → OpenCV 関数 → `_to_host` の形で関数を書き、`main.py` にエンドポイントを追加する。
