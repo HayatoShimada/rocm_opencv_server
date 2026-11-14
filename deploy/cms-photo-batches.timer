@@ -1,0 +1,12 @@
+# cms-photo-batches.service を 1 分ごとに起こす（入れ方は service の先頭）。
+# 前の回が終わっていなければ、その回は起こさない（oneshot なので重ならない）
+[Unit]
+Description=85store-cms の撮影のまとまりを 1 分ごとに見る
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
